@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
                 }),
                 ..Default::default()
             },
-            |_window, app| {
+            |window, app| {
                 let fs_entity = app.new(|_| FileSystemModel {
                     left_panel: PanelState {
                         current_path: cur_dir.clone(),
@@ -43,10 +43,17 @@ fn main() -> anyhow::Result<()> {
                     );
                 });
 
-                app.new(|cx| FileManagerView {
+                let view = app.new(|cx| FileManagerView {
                     model: fs_entity,
-                    focus_handle: cx.focus_handle().clone(),
-                })
+                    focus_handle: {
+                        window.focus(&cx.focus_handle());
+                        cx.focus_handle().clone()
+                    },
+                });
+
+                window.activate_window();
+                app.activate(true);
+                view
             },
         )
         .unwrap();
@@ -81,6 +88,7 @@ struct FileSystemModel {
 }
 
 impl FileSystemModel {
+    #[profiling::function]
     fn load_directory(
         &mut self,
         path: path::PathBuf,
@@ -107,6 +115,7 @@ impl FileSystemModel {
         }
     }
 
+    #[profiling::function]
     fn read_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
         let mut entries = Vec::new();
 
@@ -129,11 +138,7 @@ impl FileSystemModel {
         }
 
         // Sort directories first, then files
-        dir_entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
-        });
+        dir_entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
 
         // Add parent directory entry if not at root
         if path.parent().is_some() {
@@ -217,6 +222,7 @@ impl gpui::Focusable for FileManagerView {
 impl gpui::EventEmitter<gpui::DismissEvent> for FileManagerView {}
 
 impl gpui::Render for FileManagerView {
+    #[profiling::function]
     fn render(
         &mut self,
         _window: &mut gpui::Window,
@@ -239,26 +245,27 @@ impl gpui::Render for FileManagerView {
                     .h_full(),
             )
             .child(self.render_panel(ActivePanel::Right, cx))
+            .key_context("parent")
+            .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(
                 |this: &mut Self,
                  event: &gpui::KeyDownEvent,
                  _window,
                  cx: &mut gpui::Context<Self>| {
-                    //TODO: match on proper types
                     let handled = match event.keystroke.key.as_str() {
-                        "Tab" => {
+                        "tab" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
                                 model.switch_panel();
                             });
                             true
                         }
-                        "Enter" => {
+                        "enter" => {
                             this.model.update(cx, |model: &mut FileSystemModel, cx| {
                                 model.open_selected(cx);
                             });
                             true
                         }
-                        "ArrowDown" => {
+                        "down" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
                                 let panel = model.get_active_panel();
                                 let next_index = match panel.selected_index {
@@ -281,7 +288,7 @@ impl gpui::Render for FileManagerView {
                             });
                             true
                         }
-                        "ArrowUp" => {
+                        "up" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
                                 let panel = model.get_active_panel();
                                 let next_index = match panel.selected_index {
@@ -308,6 +315,7 @@ impl gpui::Render for FileManagerView {
                     };
 
                     if handled {
+                        cx.notify();
                         cx.stop_propagation();
                     }
                 },
@@ -316,6 +324,7 @@ impl gpui::Render for FileManagerView {
 }
 
 impl FileManagerView {
+    #[profiling::function]
     fn render_panel(
         &self,
         active_panel: ActivePanel,
@@ -396,6 +405,7 @@ impl FileManagerView {
                                             model.open_selected(cx);
                                         }
                                     });
+                                    cx.notify();
                                 })
                             )
                     }))
