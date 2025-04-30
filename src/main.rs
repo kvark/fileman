@@ -8,6 +8,7 @@ fn main() -> anyhow::Result<()> {
     gpui::Application::new().run(move |cx| {
         cx.open_window(
             gpui::WindowOptions {
+                focus: true,
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("Dual Panel File Manager".into()),
                     ..Default::default()
@@ -18,12 +19,12 @@ fn main() -> anyhow::Result<()> {
                 let fs_entity = app.new(|_| FileSystemModel {
                     left_panel: PanelState {
                         current_path: cur_dir.clone(),
-                        selected_index: None,
+                        selected_index: 0,
                         entries: Vec::new(),
                     },
                     right_panel: PanelState {
                         current_path: cur_dir,
-                        selected_index: None,
+                        selected_index: 0,
                         entries: Vec::new(),
                     },
                     active_panel: ActivePanel::Left,
@@ -70,7 +71,7 @@ enum ActivePanel {
 
 struct PanelState {
     current_path: path::PathBuf,
-    selected_index: Option<usize>,
+    selected_index: usize,
     entries: Vec<DirEntry>,
 }
 
@@ -106,7 +107,7 @@ impl FileSystemModel {
             Ok(entries) => {
                 panel_state.current_path = path;
                 panel_state.entries = entries;
-                panel_state.selected_index = None;
+                panel_state.selected_index = 0;
             }
             Err(e) => {
                 // Handle error (could display in UI)
@@ -180,23 +181,20 @@ impl FileSystemModel {
     fn select_entry(&mut self, index: usize) {
         let panel = self.get_active_panel_mut();
         if index < panel.entries.len() {
-            panel.selected_index = Some(index);
+            panel.selected_index = index;
+        } else {
+            log::error!("Unable to select entry at index {}", index);
         }
     }
 
     fn open_selected(&mut self, cx: &mut gpui::Context<Self>) {
         let panel = self.get_active_panel();
-        let active_panel = self.active_panel.clone();
-
-        if let Some(index) = panel.selected_index {
-            if index < panel.entries.len() {
-                let entry = &panel.entries[index];
-                if entry.is_dir {
-                    self.navigate_to(entry.path.clone(), active_panel, cx);
-                }
-                // For files, you could implement a file viewer or other action
-            }
+        let entry = &panel.entries[panel.selected_index];
+        if entry.is_dir {
+            let active_panel = self.active_panel.clone();
+            self.navigate_to(entry.path.clone(), active_panel, cx);
         }
+        // For files, you could implement a file viewer or other action
     }
 
     fn switch_panel(&mut self) {
@@ -268,46 +266,18 @@ impl gpui::Render for FileManagerView {
                         "down" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
                                 let panel = model.get_active_panel();
-                                let next_index = match panel.selected_index {
-                                    Some(index) => {
-                                        if index + 1 < panel.entries.len() {
-                                            index + 1
-                                        } else {
-                                            index
-                                        }
-                                    }
-                                    None => {
-                                        if !panel.entries.is_empty() {
-                                            0
-                                        } else {
-                                            return;
-                                        }
-                                    }
-                                };
-                                model.select_entry(next_index);
+                                if panel.selected_index + 1 < panel.entries.len() {
+                                    model.select_entry(panel.selected_index + 1);
+                                }
                             });
                             true
                         }
                         "up" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
                                 let panel = model.get_active_panel();
-                                let next_index = match panel.selected_index {
-                                    Some(index) => {
-                                        if index > 0 {
-                                            index - 1
-                                        } else {
-                                            index
-                                        }
-                                    }
-                                    None => {
-                                        if !panel.entries.is_empty() {
-                                            0
-                                        } else {
-                                            return;
-                                        }
-                                    }
-                                };
-                                model.select_entry(next_index);
+                                if panel.selected_index > 0 {
+                                    model.select_entry(panel.selected_index - 1);
+                                }
                             });
                             true
                         }
@@ -336,7 +306,7 @@ impl FileManagerView {
             ActivePanel::Right => &model.right_panel,
         };
         let is_active = model.active_panel == active_panel;
-        let path_display = panel.current_path.to_string_lossy().to_string();
+        let path_display = panel.current_path.to_string_lossy().into_owned();
 
         gpui::div()
             .flex()
@@ -352,7 +322,7 @@ impl FileManagerView {
                 // Path header
                 gpui::div()
                     .p_2()
-                    .bg(gpui::Rgba { r: 0.15, g: 0.15, b: 0.15, a: 1.0 })
+                    .bg(gpui::Rgba { r: 0.75, g: 0.75, b: 0.75, a: 1.0 })
                     .w_full()
                     .child(path_display)
             )
@@ -364,8 +334,7 @@ impl FileManagerView {
                     .p_2()
                     .w_full()
                     .children(panel.entries.iter().enumerate().map(|(index, entry)| {
-                        let is_selected = panel.selected_index == Some(index);
-                        let entry_text = entry.name.clone();
+                        let is_selected = panel.selected_index == index;
                         let is_directory = entry.is_dir;
 
                         gpui::div()
@@ -389,7 +358,7 @@ impl FileManagerView {
                             })
                             .child(format!("{}{}",
                                 if is_directory { "📁 " } else { "📄 " },
-                                entry_text
+                                entry.name
                             ))
                             .on_mouse_down(gpui::MouseButton::Left,
                                 cx.listener(move |this: &mut Self, event: &gpui::MouseDownEvent, _window, cx: &mut gpui::Context<Self>| {
