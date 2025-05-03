@@ -308,13 +308,89 @@ impl FileManagerView {
         let is_active = model.active_panel == active_panel;
         let path_display = panel.current_path.to_string_lossy().into_owned();
 
+        let mut file_list = gpui::div().flex_1().p_2().h_full().w_full().children(
+            panel.entries.iter().enumerate().map(|(index, entry)| {
+                let is_selected = panel.selected_index == index;
+                let is_directory = entry.is_dir;
+
+                gpui::div()
+                    .py_1()
+                    .px_2()
+                    .w_full()
+                    .bg(if is_selected {
+                        gpui::Hsla::from(gpui::Rgba {
+                            r: 0.2,
+                            g: 0.4,
+                            b: 0.7,
+                            a: 1.0,
+                        })
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .text_color(if is_selected {
+                        gpui::white()
+                    } else {
+                        gpui::Hsla::from(gpui::Rgba {
+                            r: 0.9,
+                            g: 0.9,
+                            b: 0.9,
+                            a: 1.0,
+                        })
+                    })
+                    .font_weight(if is_directory {
+                        gpui::FontWeight::BOLD
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
+                    .child(format!(
+                        "{}{}",
+                        if is_directory { "📁 " } else { "📄 " },
+                        entry.name
+                    ))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(
+                            move |this: &mut Self,
+                                  event: &gpui::MouseDownEvent,
+                                  _window,
+                                  cx: &mut gpui::Context<Self>| {
+                                if !is_active {
+                                    this.model.update(cx, |model: &mut FileSystemModel, _| {
+                                        model.switch_panel();
+                                    });
+                                };
+
+                                this.model
+                                    .update(cx, move |model: &mut FileSystemModel, cx| {
+                                        model.select_entry(index);
+                                        if event.click_count > 1 {
+                                            model.open_selected(cx);
+                                        }
+                                    });
+                                cx.notify();
+                            },
+                        ),
+                    )
+            }),
+        );
+        file_list.style().overflow = gpui::PointRefinement {
+            x: Some(gpui::Overflow::Hidden),
+            y: Some(gpui::Overflow::Scroll),
+        };
+        file_list.style().scrollbar_width = Some(30.0);
+
         gpui::div()
             .flex()
             .flex_col()
             .size_full()
             .border_1()
             .border_color(if is_active {
-                gpui::Hsla::from(gpui::Rgba { r: 0.2, g: 0.6, b: 0.9, a: 1.0 })
+                gpui::Hsla::from(gpui::Rgba {
+                    r: 0.2,
+                    g: 0.6,
+                    b: 0.9,
+                    a: 1.0,
+                })
             } else {
                 gpui::transparent_black()
             })
@@ -322,62 +398,15 @@ impl FileManagerView {
                 // Path header
                 gpui::div()
                     .p_2()
-                    .bg(gpui::Rgba { r: 0.75, g: 0.75, b: 0.75, a: 1.0 })
+                    .bg(gpui::Rgba {
+                        r: 0.75,
+                        g: 0.75,
+                        b: 0.75,
+                        a: 1.0,
+                    })
                     .w_full()
-                    .child(path_display)
+                    .child(path_display),
             )
-            .child(
-                // File list
-                gpui::div()
-                    .flex_1()
-                    .overflow_y_hidden()
-                    .p_2()
-                    .w_full()
-                    .children(panel.entries.iter().enumerate().map(|(index, entry)| {
-                        let is_selected = panel.selected_index == index;
-                        let is_directory = entry.is_dir;
-
-                        gpui::div()
-                            .py_1()
-                            .px_2()
-                            .w_full()
-                            .bg(if is_selected {
-                                gpui::Hsla::from(gpui::Rgba { r: 0.2, g: 0.4, b: 0.7, a: 1.0 })
-                            } else {
-                                gpui::transparent_black()
-                            })
-                            .text_color(if is_selected {
-                                gpui::white()
-                            } else {
-                                gpui::Hsla::from(gpui::Rgba { r: 0.9, g: 0.9, b: 0.9, a: 1.0 })
-                            })
-                            .font_weight(if is_directory {
-                                gpui::FontWeight::BOLD
-                            } else {
-                                gpui::FontWeight::NORMAL
-                            })
-                            .child(format!("{}{}",
-                                if is_directory { "📁 " } else { "📄 " },
-                                entry.name
-                            ))
-                            .on_mouse_down(gpui::MouseButton::Left,
-                                cx.listener(move |this: &mut Self, event: &gpui::MouseDownEvent, _window, cx: &mut gpui::Context<Self>| {
-                                    if !is_active {
-                                        this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                            model.switch_panel();
-                                        });
-                                    };
-
-                                    this.model.update(cx, move |model: &mut FileSystemModel, cx| {
-                                        model.select_entry(index);
-                                        if event.click_count > 1 {
-                                            model.open_selected(cx);
-                                        }
-                                    });
-                                    cx.notify();
-                                })
-                            )
-                    }))
-            )
+            .child(file_list)
     }
 }
