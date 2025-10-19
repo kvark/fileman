@@ -583,6 +583,9 @@ impl FileSystemModel {
             } else if panel.selected_index >= panel.top_index + window_rows {
                 panel.top_index = panel.selected_index + 1 - window_rows;
             }
+            if self.preview.is_some() {
+                self.update_preview_for_current_selection();
+            }
         } else {
             log::error!("Unable to select entry at index {}", index);
         }
@@ -710,34 +713,70 @@ impl FileSystemModel {
         }
     }
 
+    fn update_preview_for_current_selection(&mut self) {
+        let panel = self.get_active_panel();
+        if panel.entries.is_empty() {
+            self.preview = None;
+            return;
+        }
+        let entry = &panel.entries[panel.selected_index];
+        if entry.is_dir {
+            self.preview = None;
+            return;
+        }
+        const MAX_BYTES: usize = 64 * 1024;
+        match &entry.location {
+            EntryLocation::Fs(path) => {
+                if is_image_path(path) {
+                    self.preview = Some(PreviewContent::Image(Arc::from(path.clone())));
+                } else {
+                    match read_bytes_prefix(path, MAX_BYTES) {
+                        Ok(bytes) => {
+                            if is_probably_text(&bytes) {
+                                let text = String::from_utf8_lossy(&bytes).into_owned();
+                                self.preview = Some(PreviewContent::Text(text));
+                            } else {
+                                let dump = hexdump(&bytes);
+                                self.preview = Some(PreviewContent::Text(dump));
+                            }
+                        }
+                        Err(e) => {
+                            self.preview =
+                                Some(PreviewContent::Text(format!("Failed to read file: {e}")));
+                        }
+                    }
+                }
+            }
+            EntryLocation::Zip {
+                archive_path,
+                inner_path,
+            } => {
+                match read_zip_bytes_prefix(archive_path, inner_path, MAX_BYTES) {
+                    Ok(bytes) => {
+                        if is_probably_text(&bytes) {
+                            let text = String::from_utf8_lossy(&bytes).into_owned();
+                            self.preview = Some(PreviewContent::Text(text));
+                        } else {
+                            let dump = hexdump(&bytes);
+                            self.preview = Some(PreviewContent::Text(dump));
+                        }
+                    }
+                    Err(e) => {
+                        self.preview = Some(PreviewContent::Text(format!(
+                            "Failed to read zip entry: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     fn toggle_preview(&mut self) {
         if self.preview.is_some() {
             self.preview = None;
             return;
         }
-        let panel = self.get_active_panel();
-        if panel.entries.is_empty() {
-            return;
-        }
-        let entry = &panel.entries[panel.selected_index];
-        match &entry.location {
-            EntryLocation::Fs(path) => {
-                if entry.is_dir {
-                    return;
-                }
-                if is_image_path(path) {
-                    self.preview = Some(PreviewContent::Image(Arc::from(path.clone())));
-                } else if is_text_path(path) {
-                    let content = read_text_preview(path, 2 * 1024 * 1024);
-                    if let Ok(text) = content {
-                        self.preview = Some(PreviewContent::Text(text));
-                    }
-                }
-            }
-            EntryLocation::Zip { .. } => {
-                // For now, skip preview for zipped entries for simplicity
-            }
-        }
+        self.update_preview_for_current_selection();
     }
 
     fn enqueue_copy_selected(&mut self) {
@@ -816,6 +855,93 @@ fn read_text_preview(path: &Path, max_bytes: usize) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+fn read_bytes_prefix(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.by_ref().take(max_bytes as u64).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_zip_bytes_prefix(
+    archive_path: &Path,
+    inner_path: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let file = fs::File::open(archive_path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let normalized = inner_path.trim_start_matches('/');
+    let mut data = Vec::new();
+    let mut found = None;
+    for i in 0..zip.len() {
+        let name = zip.by_index(i)?.name().to_string();
+        if name == normalized {
+            found = Some(i);
+            break;
+        }
+    }
+    if let Some(idx) = found {
+        let mut zf = zip.by_index(idx)?;
+        zf.by_ref().take(max_bytes as u64).read_to_end(&mut data)?;
+        Ok(data)
+    } else {
+        Err(anyhow::anyhow!(format!(
+            "Entry not found in zip: {}",
+            inner_path
+        )))
+    }
+}
+
+fn hexdump(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut offset = 0usize;
+    for chunk in bytes.chunks(16) {
+        out.push_str(&format!("{:08x}: ", offset));
+        for i in 0..16 {
+            if i < chunk.len() {
+                out.push_str(&format!("{:02x} ", chunk[i]));
+            } else {
+                out.push_str("   ");
+            }
+            if i == 7 {
+                out.push(' ');
+            }
+        }
+        out.push(' ');
+        for &b in chunk {
+            let ch = if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '.'
+            };
+            out.push(ch);
+        }
+        out.push('\n');
+        offset += 16;
+    }
+    out
+}
+
+fn is_probably_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    // If any NUL bytes, it's likely binary
+    if bytes.iter().any(|&b| b == 0) {
+        return false;
+    }
+    // Count printable bytes plus common whitespace
+    let mut printable = 0usize;
+    for &b in bytes {
+        match b {
+            0x09 | 0x0A | 0x0D => printable += 1, // tab, LF, CR
+            0x20..=0x7E => printable += 1,        // visible ASCII
+            _ => {}
+        }
+    }
+    let ratio = printable as f32 / bytes.len().max(1) as f32;
+    ratio > 0.85
+}
+
 // Views
 struct FileManagerView {
     model: gpui::Entity<FileSystemModel>,
@@ -838,10 +964,17 @@ impl gpui::Render for FileManagerView {
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
         gpui::div()
+            .relative()
             .flex()
             .flex_row()
             .size_full()
-            .child(self.render_panel(ActivePanel::Left, cx))
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .size_full()
+                    .min_w(gpui::px(0.0))
+                    .child(self.render_panel(ActivePanel::Left, cx))
+            )
             .child(
                 gpui::div()
                     .w(gpui::px(2.0))
@@ -853,7 +986,13 @@ impl gpui::Render for FileManagerView {
                     })
                     .h_full(),
             )
-            .child(self.render_panel(ActivePanel::Right, cx))
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .size_full()
+                    .min_w(gpui::px(0.0))
+                    .child(self.render_panel(ActivePanel::Right, cx))
+            )
             .key_context("parent")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(
@@ -866,6 +1005,9 @@ impl gpui::Render for FileManagerView {
                         "tab" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
                                 model.switch_panel();
+                                if model.preview.is_some() {
+                                    model.update_preview_for_current_selection();
+                                }
                             });
                             true
                         }
@@ -1046,7 +1188,7 @@ impl FileManagerView {
             }
         };
 
-        let mut file_list = gpui::div().flex_1().p_2().h_full().w_full().children(
+        let mut file_list = gpui::div().flex_1().p_2().h_full().w_full().min_w(gpui::px(0.0)).children(
             panel
                 .entries
                 .iter()
@@ -1065,7 +1207,7 @@ impl FileManagerView {
                     gpui::div()
                     .py_1()
                     .px_2()
-                    .h(gpui::px(24.0))
+                    .h(gpui::px(24.0)).min_w(gpui::px(0.0))
                     .w_full()
                     .bg(if is_selected {
                         if is_active {
@@ -1204,6 +1346,7 @@ impl FileManagerView {
             .flex_col()
             .relative()
             .size_full()
+            .min_w(gpui::px(0.0))
             .border_1()
             .border_color(if is_active {
                 gpui::Hsla::from(gpui::Rgba {
@@ -1230,7 +1373,7 @@ impl FileManagerView {
                         b: 0.75,
                         a: 1.0,
                     })
-                    .w_full()
+                    .w_full().min_w(gpui::px(0.0))
                     .child(format!(
                         "{}    {}/{}",
                         path_display,
@@ -1242,14 +1385,23 @@ impl FileManagerView {
                         panel.entries.len()
                     )),
             )
-            .child(file_list.id("list").track_scroll(&panel.scroll))
-            .child(if is_active {
-                gpui::div()
-                    .w(gpui::px(0.0))
-                    .h(gpui::px(0.0))
-                    .into_any_element()
-            } else {
-                self.render_preview(cx).into_any_element()
+            .child({
+                if !is_active {
+                    let model = self.model.read(cx);
+                    if model.preview.is_some() {
+                        self.render_preview(cx).into_any_element()
+                    } else {
+                        file_list
+                            .id("list")
+                            .track_scroll(&panel.scroll)
+                            .into_any_element()
+                    }
+                } else {
+                    file_list
+                        .id("list")
+                        .track_scroll(&panel.scroll)
+                        .into_any_element()
+                }
             })
     }
 
@@ -1258,40 +1410,51 @@ impl FileManagerView {
         if let Some(preview) = &model.preview {
             let content = match preview {
                 PreviewContent::Text(text) => {
-                    let mut area = gpui::div().p_2().w_full().h_full().child(text.clone());
+                    let mut area = gpui::div()
+                        .p_2()
+                        .w_full()
+                        .h_full()
+                        .text_color(gpui::Hsla::from(gpui::Rgba {
+                            r: 0.95,
+                            g: 0.95,
+                            b: 0.95,
+                            a: 1.0,
+                        }))
+                        .child(text.clone());
                     area.style().overflow = gpui::PointRefinement {
                         x: Some(gpui::Overflow::Hidden),
                         y: Some(gpui::Overflow::Scroll),
                     };
+                    area.style().scrollbar_width = Some(gpui::px(30.0).into());
                     gpui::div().flex_1().p_2().child(area)
                 }
-                PreviewContent::Image(path) => gpui::div()
-                    .flex_1()
-                    .p_2()
-                    .child(gpui::img(path.clone()).w_full().h_full()),
+                PreviewContent::Image(path) => {
+                    let mut area = gpui::div()
+                        .p_2()
+                        .w_full()
+                        .h_full()
+                        .child(gpui::img(path.clone()).w_full().h_full());
+                    area.style().overflow = gpui::PointRefinement {
+                        x: Some(gpui::Overflow::Hidden),
+                        y: Some(gpui::Overflow::Scroll),
+                    };
+                    area.style().scrollbar_width = Some(gpui::px(30.0).into());
+                    gpui::div().flex_1().p_2().child(area)
+                }
             };
 
             gpui::div()
-                .absolute()
-                .top(gpui::px(0.0))
-                .right(gpui::px(0.0))
-                .bottom(gpui::px(0.0))
-                .w(gpui::px(420.0))
-                .border_l_1()
-                .border_color(gpui::Hsla::from(gpui::Rgba {
-                    r: 0.3,
-                    g: 0.3,
-                    b: 0.3,
-                    a: 1.0,
-                }))
-                .bg(gpui::Hsla::from(gpui::Rgba {
-                    r: 0.1,
-                    g: 0.1,
-                    b: 0.1,
-                    a: 1.0,
-                }))
                 .flex()
                 .flex_col()
+                .w_full()
+                .h_full()
+                .min_w(gpui::px(0.0))
+                .bg(gpui::Hsla::from(gpui::Rgba {
+                    r: 0.08,
+                    g: 0.08,
+                    b: 0.08,
+                    a: 1.0,
+                }))
                 .child(
                     gpui::div()
                         .p_2()
