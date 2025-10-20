@@ -1,4 +1,5 @@
 use gpui::prelude::*;
+use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -8,6 +9,481 @@ use std::{
     thread,
 };
 const VIEW_ROWS: usize = 40;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeKind {
+    Dark,
+    Light,
+}
+
+#[derive(Clone)]
+struct Theme {
+    kind: ThemeKind,
+    external: Vec<(String, ThemeColors)>,
+    selected_external: Option<usize>,
+}
+
+#[derive(Clone)]
+struct ThemeColors {
+    divider: gpui::Hsla,
+    row_bg_selected_active: gpui::Hsla,
+    row_bg_selected_inactive: gpui::Hsla,
+    row_fg_selected: gpui::Hsla,
+    row_fg_active: gpui::Hsla,
+    row_fg_inactive: gpui::Hsla,
+    panel_border_active: gpui::Hsla,
+    panel_border_inactive: gpui::Hsla,
+    header_bg: gpui::Hsla,
+    header_fg: gpui::Hsla,
+    footer_bg: gpui::Hsla,
+    footer_fg: gpui::Hsla,
+    preview_bg: gpui::Hsla,
+    preview_header_bg: gpui::Hsla,
+    preview_header_fg: gpui::Hsla,
+    preview_text: gpui::Hsla,
+}
+
+impl Theme {
+    fn dark() -> Self {
+        Self {
+            kind: ThemeKind::Dark,
+            external: Vec::new(),
+            selected_external: None,
+        }
+    }
+    fn light() -> Self {
+        Self {
+            kind: ThemeKind::Light,
+            external: Vec::new(),
+            selected_external: None,
+        }
+    }
+    fn set_external(&mut self, themes: Vec<(String, ThemeColors)>) {
+        self.external = themes;
+        self.selected_external = if self.external.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+    fn toggle(&mut self) {
+        if !self.external.is_empty() {
+            let next = match self.selected_external {
+                None => 0,
+                Some(i) => (i + 1) % self.external.len(),
+            };
+            self.selected_external = Some(next);
+            return;
+        }
+        self.kind = match self.kind {
+            ThemeKind::Dark => ThemeKind::Light,
+            ThemeKind::Light => ThemeKind::Dark,
+        };
+    }
+    fn colors(&self) -> ThemeColors {
+        if let Some(i) = self.selected_external {
+            return self.external[i].1.clone();
+        }
+        match self.kind {
+            ThemeKind::Dark => ThemeColors {
+                divider: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.2,
+                    g: 0.2,
+                    b: 0.2,
+                    a: 1.0,
+                }),
+                row_bg_selected_active: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.2,
+                    g: 0.4,
+                    b: 0.7,
+                    a: 1.0,
+                }),
+                row_bg_selected_inactive: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.15,
+                    g: 0.3,
+                    b: 0.5,
+                    a: 1.0,
+                }),
+                row_fg_selected: gpui::Hsla::from(gpui::Rgba {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                }),
+                row_fg_active: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.9,
+                    g: 0.9,
+                    b: 0.9,
+                    a: 1.0,
+                }),
+                row_fg_inactive: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.7,
+                    g: 0.7,
+                    b: 0.7,
+                    a: 1.0,
+                }),
+                panel_border_active: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.2,
+                    g: 0.6,
+                    b: 0.9,
+                    a: 1.0,
+                }),
+                panel_border_inactive: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.1,
+                    g: 0.1,
+                    b: 0.1,
+                    a: 1.0,
+                }),
+                header_bg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.75,
+                    g: 0.75,
+                    b: 0.75,
+                    a: 1.0,
+                }),
+                header_fg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }),
+                footer_bg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.15,
+                    g: 0.15,
+                    b: 0.15,
+                    a: 1.0,
+                }),
+                footer_fg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.8,
+                    g: 0.8,
+                    b: 0.8,
+                    a: 1.0,
+                }),
+                preview_bg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.08,
+                    g: 0.08,
+                    b: 0.08,
+                    a: 1.0,
+                }),
+                preview_header_bg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.2,
+                    g: 0.2,
+                    b: 0.2,
+                    a: 1.0,
+                }),
+                preview_header_fg: gpui::Hsla::from(gpui::Rgba {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                }),
+                preview_text: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.95,
+                    g: 0.95,
+                    b: 0.95,
+                    a: 1.0,
+                }),
+            },
+            ThemeKind::Light => ThemeColors {
+                divider: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.85,
+                    g: 0.85,
+                    b: 0.85,
+                    a: 1.0,
+                }),
+                row_bg_selected_active: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.75,
+                    g: 0.85,
+                    b: 1.0,
+                    a: 1.0,
+                }),
+                row_bg_selected_inactive: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.85,
+                    g: 0.9,
+                    b: 1.0,
+                    a: 1.0,
+                }),
+                row_fg_selected: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }),
+                row_fg_active: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.1,
+                    g: 0.1,
+                    b: 0.1,
+                    a: 1.0,
+                }),
+                row_fg_inactive: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.3,
+                    g: 0.3,
+                    b: 0.3,
+                    a: 1.0,
+                }),
+                panel_border_active: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.2,
+                    g: 0.6,
+                    b: 0.9,
+                    a: 1.0,
+                }),
+                panel_border_inactive: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.8,
+                    g: 0.8,
+                    b: 0.8,
+                    a: 1.0,
+                }),
+                header_bg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.95,
+                    g: 0.95,
+                    b: 0.95,
+                    a: 1.0,
+                }),
+                header_fg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.05,
+                    g: 0.05,
+                    b: 0.05,
+                    a: 1.0,
+                }),
+                footer_bg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.92,
+                    g: 0.92,
+                    b: 0.92,
+                    a: 1.0,
+                }),
+                footer_fg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.2,
+                    g: 0.2,
+                    b: 0.2,
+                    a: 1.0,
+                }),
+                preview_bg: gpui::Hsla::from(gpui::Rgba {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                }),
+                preview_header_bg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.92,
+                    g: 0.92,
+                    b: 0.92,
+                    a: 1.0,
+                }),
+                preview_header_fg: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.1,
+                    g: 0.1,
+                    b: 0.1,
+                    a: 1.0,
+                }),
+                preview_text: gpui::Hsla::from(gpui::Rgba {
+                    r: 0.1,
+                    g: 0.1,
+                    b: 0.1,
+                    a: 1.0,
+                }),
+            },
+        }
+    }
+
+    fn load_external_from_dir(&mut self, dir: &std::path::Path) {
+        let themes = load_themes_from_dir(dir);
+        if !themes.is_empty() {
+            self.set_external(themes);
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Default)]
+struct SerializableColor {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
+
+#[derive(Deserialize, Default)]
+struct ThemeFileColors {
+    divider: Option<SerializableColor>,
+    row_bg_selected_active: Option<SerializableColor>,
+    row_bg_selected_inactive: Option<SerializableColor>,
+    row_fg_selected: Option<SerializableColor>,
+    row_fg_active: Option<SerializableColor>,
+    row_fg_inactive: Option<SerializableColor>,
+    panel_border_active: Option<SerializableColor>,
+    panel_border_inactive: Option<SerializableColor>,
+    header_bg: Option<SerializableColor>,
+    header_fg: Option<SerializableColor>,
+    footer_bg: Option<SerializableColor>,
+    footer_fg: Option<SerializableColor>,
+    preview_bg: Option<SerializableColor>,
+    preview_header_bg: Option<SerializableColor>,
+    preview_header_fg: Option<SerializableColor>,
+    preview_text: Option<SerializableColor>,
+}
+
+#[derive(Deserialize, Default)]
+struct ThemeFile {
+    name: Option<String>,
+    colors: Option<ThemeFileColors>,
+}
+
+fn rgba_from(c: &SerializableColor) -> gpui::Hsla {
+    gpui::Hsla::from(gpui::Rgba {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+        a: c.a,
+    })
+}
+
+fn merge_colors(base: &ThemeColors, patch: &ThemeFileColors) -> ThemeColors {
+    ThemeColors {
+        divider: patch
+            .divider
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.divider),
+        row_bg_selected_active: patch
+            .row_bg_selected_active
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.row_bg_selected_active),
+        row_bg_selected_inactive: patch
+            .row_bg_selected_inactive
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.row_bg_selected_inactive),
+        row_fg_selected: patch
+            .row_fg_selected
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.row_fg_selected),
+        row_fg_active: patch
+            .row_fg_active
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.row_fg_active),
+        row_fg_inactive: patch
+            .row_fg_inactive
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.row_fg_inactive),
+        panel_border_active: patch
+            .panel_border_active
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.panel_border_active),
+        panel_border_inactive: patch
+            .panel_border_inactive
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.panel_border_inactive),
+        header_bg: patch
+            .header_bg
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.header_bg),
+        header_fg: patch
+            .header_fg
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.header_fg),
+        footer_bg: patch
+            .footer_bg
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.footer_bg),
+        footer_fg: patch
+            .footer_fg
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.footer_fg),
+        preview_bg: patch
+            .preview_bg
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.preview_bg),
+        preview_header_bg: patch
+            .preview_header_bg
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.preview_header_bg),
+        preview_header_fg: patch
+            .preview_header_fg
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.preview_header_fg),
+        preview_text: patch
+            .preview_text
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or_else(|| base.preview_text),
+    }
+}
+
+fn parse_theme_bytes(name_hint: &str, bytes: &[u8]) -> Option<(String, ThemeColors)> {
+    let dark_base = Theme::dark().colors();
+    // Try JSON
+    if let Ok(tf) = serde_json::from_slice::<ThemeFile>(bytes) {
+        let name = tf.name.unwrap_or_else(|| name_hint.to_string());
+        let colors = tf
+            .colors
+            .map(|c| merge_colors(&dark_base, &c))
+            .unwrap_or(dark_base.clone());
+        return Some((name, colors));
+    }
+    // Try YAML
+    if let Ok(tf) = serde_yaml::from_slice::<ThemeFile>(bytes) {
+        let name = tf.name.unwrap_or_else(|| name_hint.to_string());
+        let colors = tf
+            .colors
+            .map(|c| merge_colors(&dark_base, &c))
+            .unwrap_or(dark_base.clone());
+        return Some((name, colors));
+    }
+    // Try TOML
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if let Ok(tf) = toml::from_str::<ThemeFile>(s) {
+            let name = tf.name.unwrap_or_else(|| name_hint.to_string());
+            let colors = tf
+                .colors
+                .map(|c| merge_colors(&dark_base, &c))
+                .unwrap_or(dark_base.clone());
+            return Some((name, colors));
+        }
+    }
+    None
+}
+
+fn load_themes_from_dir(dir: &std::path::Path) -> Vec<(String, ThemeColors)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name_hint = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("theme")
+                .to_string();
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !matches!(ext.as_str(), "json" | "yaml" | "yml" | "toml") {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Some((name, colors)) = parse_theme_bytes(&name_hint, &bytes) {
+                    out.push((name, colors));
+                }
+            }
+        }
+    }
+    out
+}
 
 #[derive(Clone)]
 enum EntryLocation {
@@ -79,6 +555,9 @@ struct FileSystemModel {
     // remember last selected entry name per directory
     fs_last_selected_name: HashMap<path::PathBuf, String>,
     zip_last_selected_name: HashMap<(path::PathBuf, String), String>,
+    theme: Theme,
+    theme_picker_open: bool,
+    theme_picker_selected: Option<usize>,
 }
 
 fn start_io_worker() -> mpsc::Sender<IOTask> {
@@ -166,10 +645,18 @@ fn main() -> anyhow::Result<()> {
                     io_tx: io_tx_clone.clone(),
                     fs_last_selected_name: HashMap::new(),
                     zip_last_selected_name: HashMap::new(),
+                    theme: Theme::dark(),
+                    theme_picker_open: false,
+                    theme_picker_selected: None,
                 });
 
                 // Load initial directories
                 app.update_entity(&fs_entity, |model: &mut FileSystemModel, cx| {
+                    // Load external themes from ./themes (if present)
+                    model
+                        .theme
+                        .load_external_from_dir(std::path::Path::new("./themes"));
+
                     model.load_fs_directory_async(
                         model.left_panel.current_path.clone(),
                         ActivePanel::Left,
@@ -750,24 +1237,22 @@ impl FileSystemModel {
             EntryLocation::Zip {
                 archive_path,
                 inner_path,
-            } => {
-                match read_zip_bytes_prefix(archive_path, inner_path, MAX_BYTES) {
-                    Ok(bytes) => {
-                        if is_probably_text(&bytes) {
-                            let text = String::from_utf8_lossy(&bytes).into_owned();
-                            self.preview = Some(PreviewContent::Text(text));
-                        } else {
-                            let dump = hexdump(&bytes);
-                            self.preview = Some(PreviewContent::Text(dump));
-                        }
-                    }
-                    Err(e) => {
-                        self.preview = Some(PreviewContent::Text(format!(
-                            "Failed to read zip entry: {e}"
-                        )));
+            } => match read_zip_bytes_prefix(archive_path, inner_path, MAX_BYTES) {
+                Ok(bytes) => {
+                    if is_probably_text(&bytes) {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        self.preview = Some(PreviewContent::Text(text));
+                    } else {
+                        let dump = hexdump(&bytes);
+                        self.preview = Some(PreviewContent::Text(dump));
                     }
                 }
-            }
+                Err(e) => {
+                    self.preview = Some(PreviewContent::Text(format!(
+                        "Failed to read zip entry: {e}"
+                    )));
+                }
+            },
         }
     }
 
@@ -819,6 +1304,59 @@ impl FileSystemModel {
                 src.to_string_lossy(),
                 dst_dir.to_string_lossy()
             );
+        }
+    }
+    fn switch_theme(&mut self) {
+        // If external themes exist and picker is open, apply selected; otherwise toggle
+        if self.theme.selected_external.is_some() && self.theme_picker_open {
+            self.apply_selected_theme();
+        } else {
+            self.theme.toggle();
+        }
+    }
+
+    fn open_theme_picker(&mut self) {
+        self.theme_picker_open = true;
+        // initialize selection to current external selection or first
+        self.theme_picker_selected = self.theme.selected_external.or(Some(0));
+    }
+
+    fn close_theme_picker(&mut self) {
+        self.theme_picker_open = false;
+    }
+
+    fn select_next_theme(&mut self) {
+        if self.theme.external.is_empty() {
+            return;
+        }
+        let len = self.theme.external.len();
+        let cur = self.theme_picker_selected.unwrap_or(0);
+        self.theme_picker_selected = Some((cur + 1) % len);
+    }
+
+    fn select_prev_theme(&mut self) {
+        if self.theme.external.is_empty() {
+            return;
+        }
+        let len = self.theme.external.len();
+        let cur = self.theme_picker_selected.unwrap_or(0);
+        self.theme_picker_selected = Some((cur + len - 1) % len);
+    }
+
+    fn apply_selected_theme(&mut self) {
+        if let Some(i) = self.theme_picker_selected {
+            if i < self.theme.external.len() {
+                self.theme.selected_external = Some(i);
+            }
+        }
+        self.theme_picker_open = false;
+    }
+
+    fn theme_names(&self) -> Vec<String> {
+        if self.theme.external.is_empty() {
+            vec!["Dark".to_string(), "Light".to_string()]
+        } else {
+            self.theme.external.iter().map(|(n, _)| n.clone()).collect()
         }
     }
 }
@@ -973,17 +1511,12 @@ impl gpui::Render for FileManagerView {
                     .flex_1()
                     .size_full()
                     .min_w(gpui::px(0.0))
-                    .child(self.render_panel(ActivePanel::Left, cx))
+                    .child(self.render_panel(ActivePanel::Left, cx)),
             )
             .child(
                 gpui::div()
                     .w(gpui::px(2.0))
-                    .bg(gpui::Rgba {
-                        r: 0.2,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    })
+                    .bg(self.model.read(cx).theme.colors().divider)
                     .h_full(),
             )
             .child(
@@ -991,8 +1524,9 @@ impl gpui::Render for FileManagerView {
                     .flex_1()
                     .size_full()
                     .min_w(gpui::px(0.0))
-                    .child(self.render_panel(ActivePanel::Right, cx))
+                    .child(self.render_panel(ActivePanel::Right, cx)),
             )
+            .child(self.render_theme_picker(cx))
             .key_context("parent")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(
@@ -1013,24 +1547,36 @@ impl gpui::Render for FileManagerView {
                         }
                         "enter" => {
                             this.model.update(cx, |model: &mut FileSystemModel, cx| {
-                                model.open_selected(cx);
+                                if model.theme_picker_open {
+                                    model.apply_selected_theme();
+                                } else {
+                                    model.open_selected(cx);
+                                }
                             });
                             true
                         }
                         "down" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                let panel = model.get_active_panel();
-                                if panel.selected_index + 1 < panel.entries.len() {
-                                    model.select_entry(panel.selected_index + 1);
+                                if model.theme_picker_open {
+                                    model.select_next_theme();
+                                } else {
+                                    let panel = model.get_active_panel();
+                                    if panel.selected_index + 1 < panel.entries.len() {
+                                        model.select_entry(panel.selected_index + 1);
+                                    }
                                 }
                             });
                             true
                         }
                         "up" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                let panel = model.get_active_panel();
-                                if panel.selected_index > 0 {
-                                    model.select_entry(panel.selected_index - 1);
+                                if model.theme_picker_open {
+                                    model.select_prev_theme();
+                                } else {
+                                    let panel = model.get_active_panel();
+                                    if panel.selected_index > 0 {
+                                        model.select_entry(panel.selected_index - 1);
+                                    }
                                 }
                             });
                             true
@@ -1043,13 +1589,29 @@ impl gpui::Render for FileManagerView {
                         }
                         "escape" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                model.preview = None;
+                                if model.theme_picker_open {
+                                    model.close_theme_picker();
+                                } else {
+                                    model.preview = None;
+                                }
                             });
                             true
                         }
                         "f5" => {
                             this.model.update(cx, |model: &mut FileSystemModel, _| {
                                 model.enqueue_copy_selected();
+                            });
+                            true
+                        }
+                        "f9" => {
+                            this.model.update(cx, |model: &mut FileSystemModel, _| {
+                                model.switch_theme();
+                            });
+                            true
+                        }
+                        "f10" => {
+                            this.model.update(cx, |model: &mut FileSystemModel, _| {
+                                model.open_theme_picker();
                             });
                             true
                         }
@@ -1168,6 +1730,7 @@ impl FileManagerView {
             }
         });
         let model = self.model.read(cx);
+        let colors = model.theme.colors();
         let panel = match panel_side {
             ActivePanel::Left => &model.left_panel,
             ActivePanel::Right => &model.right_panel,
@@ -1188,43 +1751,49 @@ impl FileManagerView {
             }
         };
 
-        let mut file_list = gpui::div().flex_1().p_2().h_full().w_full().min_w(gpui::px(0.0)).children(
-            panel
-                .entries
-                .iter()
-                .skip(panel.top_index.min(panel.entries.len().saturating_sub(1)))
-                .take({
-                    let start = panel.top_index.min(panel.entries.len().saturating_sub(1));
-                    let remain = panel.entries.len().saturating_sub(start);
-                    remain.min(visible_cap).max(1)
-                })
-                .enumerate()
-                .map(|(index, entry)| {
-                    let real_index = panel.top_index + index;
-                    let is_selected = panel.selected_index == real_index;
-                    let is_directory = entry.is_dir;
+        let mut file_list = gpui::div()
+            .flex_1()
+            .p_2()
+            .h_full()
+            .w_full()
+            .min_w(gpui::px(0.0))
+            .children(
+                panel
+                    .entries
+                    .iter()
+                    .skip(panel.top_index.min(panel.entries.len().saturating_sub(1)))
+                    .take({
+                        let start = panel.top_index.min(panel.entries.len().saturating_sub(1));
+                        let remain = panel.entries.len().saturating_sub(start);
+                        remain.min(visible_cap).max(1)
+                    })
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let real_index = panel.top_index + index;
+                        let is_selected = panel.selected_index == real_index;
+                        let is_directory = entry.is_dir;
 
-                    gpui::div()
+                        gpui::div()
                     .py_1()
                     .px_2()
                     .h(gpui::px(24.0)).min_w(gpui::px(0.0))
                     .w_full()
                     .bg(if is_selected {
                         if is_active {
-                            gpui::Hsla::from(gpui::Rgba { r: 0.2, g: 0.4, b: 0.7, a: 1.0 })
+                            colors.row_bg_selected_active
                         } else {
-                            gpui::Hsla::from(gpui::Rgba { r: 0.15, g: 0.3, b: 0.5, a: 1.0 })
+                            colors.row_bg_selected_inactive
                         }
                     } else {
                         gpui::transparent_black()
                     })
                     .text_color(
                         if is_selected {
-                            gpui::white()
+                            colors.row_fg_selected
                         } else if is_active {
-                            gpui::Hsla::from(gpui::Rgba { r: 0.9, g: 0.9, b: 0.9, a: 1.0 })
+                            colors.row_fg_active
                         } else {
-                            gpui::Hsla::from(gpui::Rgba { r: 0.7, g: 0.7, b: 0.7, a: 1.0 })
+                            colors.row_fg_inactive
                         }
                     )
                     .font_weight(if is_directory {
@@ -1264,8 +1833,8 @@ impl FileManagerView {
                             },
                         ),
                     )
-                }),
-        );
+                    }),
+            );
         file_list = file_list.on_scroll_wheel(cx.listener(
             move |this: &mut Self,
                   event: &gpui::ScrollWheelEvent,
@@ -1325,18 +1894,8 @@ impl FileManagerView {
                     .py_1()
                     .px_2()
                     .w_full()
-                    .bg(gpui::Hsla::from(gpui::Rgba {
-                        r: 0.15,
-                        g: 0.15,
-                        b: 0.15,
-                        a: 1.0,
-                    }))
-                    .text_color(gpui::Hsla::from(gpui::Rgba {
-                        r: 0.8,
-                        g: 0.8,
-                        b: 0.8,
-                        a: 1.0,
-                    }))
+                    .bg(colors.footer_bg)
+                    .text_color(colors.footer_fg)
                     .child(format!("Showing {} of {} items", visible_cap, total_items)),
             );
         }
@@ -1349,31 +1908,19 @@ impl FileManagerView {
             .min_w(gpui::px(0.0))
             .border_1()
             .border_color(if is_active {
-                gpui::Hsla::from(gpui::Rgba {
-                    r: 0.2,
-                    g: 0.6,
-                    b: 0.9,
-                    a: 1.0,
-                })
+                colors.panel_border_active
             } else {
-                gpui::Hsla::from(gpui::Rgba {
-                    r: 0.1,
-                    g: 0.1,
-                    b: 0.1,
-                    a: 1.0,
-                })
+                colors.panel_border_inactive
             })
             .child(
                 // Path header
                 gpui::div()
                     .p_2()
-                    .bg(gpui::Rgba {
-                        r: 0.75,
-                        g: 0.75,
-                        b: 0.75,
-                        a: 1.0,
-                    })
-                    .w_full().min_w(gpui::px(0.0))
+                    .bg(colors.header_bg)
+                    .text_color(colors.header_fg)
+                    .w_full()
+                    .w_full()
+                    .min_w(gpui::px(0.0))
                     .child(format!(
                         "{}    {}/{}",
                         path_display,
@@ -1388,6 +1935,7 @@ impl FileManagerView {
             .child({
                 if !is_active {
                     let model = self.model.read(cx);
+
                     if model.preview.is_some() {
                         self.render_preview(cx).into_any_element()
                     } else {
@@ -1414,12 +1962,7 @@ impl FileManagerView {
                         .p_2()
                         .w_full()
                         .h_full()
-                        .text_color(gpui::Hsla::from(gpui::Rgba {
-                            r: 0.95,
-                            g: 0.95,
-                            b: 0.95,
-                            a: 1.0,
-                        }))
+                        .text_color(model.theme.colors().preview_text)
                         .child(text.clone());
                     area.style().overflow = gpui::PointRefinement {
                         x: Some(gpui::Overflow::Hidden),
@@ -1449,22 +1992,12 @@ impl FileManagerView {
                 .w_full()
                 .h_full()
                 .min_w(gpui::px(0.0))
-                .bg(gpui::Hsla::from(gpui::Rgba {
-                    r: 0.08,
-                    g: 0.08,
-                    b: 0.08,
-                    a: 1.0,
-                }))
+                .bg(model.theme.colors().preview_bg)
                 .child(
                     gpui::div()
                         .p_2()
-                        .bg(gpui::Rgba {
-                            r: 0.2,
-                            g: 0.2,
-                            b: 0.2,
-                            a: 1.0,
-                        })
-                        .text_color(gpui::white())
+                        .bg(model.theme.colors().preview_header_bg)
+                        .text_color(model.theme.colors().preview_header_fg)
                         .child("Preview (F3 to close, Esc to close)"),
                 )
                 .child(content)
@@ -1472,6 +2005,59 @@ impl FileManagerView {
             // zero-width placeholder to keep layout simple
             gpui::div().w(gpui::px(0.0)).h_full()
         }
+    }
+
+    fn render_theme_picker(&self, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let model = self.model.read(cx);
+        if !model.theme_picker_open {
+            return gpui::div().w(gpui::px(0.0)).h(gpui::px(0.0)).into_any_element();
+        }
+        let names = model.theme_names();
+        let selected = model.theme_picker_selected.unwrap_or(0);
+        let colors = model.theme.colors();
+
+        let list = gpui::div()
+            .flex()
+            .flex_col()
+            .w(gpui::px(480.0))
+            .max_h(gpui::px(400.0))
+            .bg(colors.preview_bg)
+            .border_1()
+            .border_color(colors.panel_border_active)
+            .rounded(gpui::px(6.0))
+            .shadow_lg()
+            .children(
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let is_sel = i == selected;
+                        gpui::div()
+                            .px_3()
+                            .py_2()
+                            .bg(if is_sel { colors.row_bg_selected_active } else { gpui::transparent_black() })
+                            .text_color(if is_sel { colors.row_fg_selected } else { colors.row_fg_active })
+                            .child(name.clone())
+                    }),
+            );
+
+        gpui::div()
+            .absolute()
+            .top(gpui::px(0.0))
+            .left(gpui::px(0.0))
+            .right(gpui::px(0.0))
+            .bottom(gpui::px(0.0))
+            .bg(gpui::Hsla::from(gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.35,
+            }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(list)
+            .into_any_element()
     }
 }
 

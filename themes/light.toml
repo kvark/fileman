@@ -1,0 +1,23 @@
+name = "Light Example"
+
+[colors]
+divider = { r = 0.90, g = 0.90, b = 0.90, a = 1.0 }
+row_bg_selected_active = { r = 0.75, g = 0.85, b = 1.00, a = 1.0 }
+row_bg_selected_inactive = { r = 0.85, g = 0.90, b = 1.00, a = 1.0 }
+row_fg_selected = { r = 0.00, g = 0.00, b = 0.00, a = 1.0 }
+row_fg_active = { r = 0.10, g = 0.10, b = 0.10, a = 1.0 }
+row_fg_inactive = { r = 0.30, g = 0.30, b = 0.30, a = 1.0 }
+
+panel_border_active = { r = 0.20, g = 0.60, b = 0.90, a = 1.0 }
+panel_border_inactive = { r = 0.80, g = 0.80, b = 0.80, a = 1.0 }
+
+header_bg = { r = 0.96, g = 0.96, b = 0.96, a = 1.0 }
+header_fg = { r = 0.10, g = 0.10, b = 0.10, a = 1.0 }
+
+footer_bg = { r = 0.94, g = 0.94, b = 0.94, a = 1.0 }
+footer_fg = { r = 0.20, g = 0.20, b = 0.20, a = 1.0 }
+
+preview_bg = { r = 1.00, g = 1.00, b = 1.00, a = 1.0 }
+preview_header_bg = { r = 0.92, g = 0.92, b = 0.92, a = 1.0 }
+preview_header_fg = { r = 0.10, g = 0.10, b = 0.10, a = 1.0 }
+preview_text = { r = 0.12, g = 0.12, b = 0.12, a = 1.0 }
