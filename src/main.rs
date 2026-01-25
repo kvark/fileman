@@ -501,6 +501,11 @@ struct DirEntry {
     location: EntryLocation,
 }
 
+enum DirBatch {
+    Append(Vec<DirEntry>),
+    Replace(Vec<DirEntry>),
+}
+
 #[derive(Clone, PartialEq)]
 enum ActivePanel {
     Left,
@@ -521,7 +526,7 @@ struct PanelState {
     selected_index: usize,
     entries: Vec<DirEntry>,
     // async population
-    entries_rx: Option<mpsc::Receiver<Vec<DirEntry>>>,
+    entries_rx: Option<mpsc::Receiver<DirBatch>>,
     // selection restoration by name
     prefer_select_name: Option<String>,
     // virtual scrolling: first visible row index
@@ -550,6 +555,8 @@ struct FileSystemModel {
     right_panel: PanelState,
     active_panel: ActivePanel,
     preview: Option<PreviewContent>,
+    preview_rx: Option<mpsc::Receiver<(u64, PreviewContent)>>,
+    preview_request_id: u64,
     io_tx: mpsc::Sender<IOTask>,
 
     // remember last selected entry name per directory
@@ -642,6 +649,8 @@ fn main() -> anyhow::Result<()> {
                     },
                     active_panel: ActivePanel::Left,
                     preview: None,
+                    preview_rx: None,
+                    preview_request_id: 0,
                     io_tx: io_tx_clone.clone(),
                     fs_last_selected_name: HashMap::new(),
                     zip_last_selected_name: HashMap::new(),
@@ -711,7 +720,7 @@ impl FileSystemModel {
         }
 
         // create channel and start background loader
-        let (tx, rx) = mpsc::channel::<Vec<DirEntry>>();
+        let (tx, rx) = mpsc::channel::<DirBatch>();
         let path_clone = path.clone();
 
         // Immediately populate UI with a quick snapshot so the list isn't empty
@@ -736,61 +745,95 @@ impl FileSystemModel {
             }
             if !snapshot.is_empty() {
                 // Send the initial snapshot synchronously
-                let _ = tx.send(snapshot);
+                let _ = tx.send(DirBatch::Append(snapshot));
             }
-            // Continue streaming the rest in background
+            // Continue streaming the rest in background from the same iterator
             thread::spawn(move || {
                 // Stream directory entries in chunks to avoid blocking on huge folders
                 let chunk = 500usize;
-                let mut buf: Vec<DirEntry> = Vec::with_capacity(chunk);
-                // Continue from where snapshot loop left off
-                if let Ok(mut read_dir) = fs::read_dir(&path_clone) {
-                    while let Some(entry_res) = read_dir.next() {
-                        if let Ok(entry) = entry_res {
-                            let file_name = entry.file_name().to_string_lossy().to_string();
-                            if let Ok(file_type) = entry.file_type() {
-                                let is_dir = file_type.is_dir();
-                                buf.push(DirEntry {
-                                    name: file_name,
-                                    is_dir,
-                                    location: EntryLocation::Fs(entry.path()),
-                                });
-                            }
-                            if buf.len() >= chunk {
-                                let _ = tx.send(std::mem::take(&mut buf));
-                            }
+                let mut all: Vec<DirEntry> = Vec::new();
+                for entry_res in rd {
+                    if let Ok(entry) = entry_res {
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        if let Ok(file_type) = entry.file_type() {
+                            let is_dir = file_type.is_dir();
+                            all.push(DirEntry {
+                                name: file_name,
+                                is_dir,
+                                location: EntryLocation::Fs(entry.path()),
+                            });
                         }
                     }
                 }
-                if !buf.is_empty() {
-                    let _ = tx.send(buf);
+                all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+                let mut sorted: Vec<DirEntry> = Vec::new();
+                if let Some(parent) = path_clone.parent() {
+                    sorted.push(DirEntry {
+                        name: "..".to_string(),
+                        is_dir: true,
+                        location: EntryLocation::Fs(parent.to_path_buf()),
+                    });
+                }
+                sorted.extend(all);
+
+                if sorted.is_empty() {
+                    return;
+                }
+                let mut start = 0usize;
+                while start < sorted.len() {
+                    let end = (start + chunk).min(sorted.len());
+                    let batch = sorted[start..end].to_vec();
+                    if start == 0 {
+                        let _ = tx.send(DirBatch::Replace(batch));
+                    } else {
+                        let _ = tx.send(DirBatch::Append(batch));
+                    }
+                    start = end;
                 }
             });
         } else {
             // Fallback to background streaming if we couldn't read_dir immediately
             thread::spawn(move || {
                 let chunk = 500usize;
-                let mut buf: Vec<DirEntry> = Vec::with_capacity(chunk);
+                let mut all: Vec<DirEntry> = Vec::new();
                 if let Ok(mut read_dir) = fs::read_dir(&path_clone) {
                     while let Some(entry_res) = read_dir.next() {
                         if let Ok(entry) = entry_res {
                             let file_name = entry.file_name().to_string_lossy().to_string();
                             if let Ok(file_type) = entry.file_type() {
                                 let is_dir = file_type.is_dir();
-                                buf.push(DirEntry {
+                                all.push(DirEntry {
                                     name: file_name,
                                     is_dir,
                                     location: EntryLocation::Fs(entry.path()),
                                 });
                             }
-                            if buf.len() >= chunk {
-                                let _ = tx.send(std::mem::take(&mut buf));
-                            }
                         }
                     }
                 }
-                if !buf.is_empty() {
-                    let _ = tx.send(buf);
+                all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+                let mut sorted: Vec<DirEntry> = Vec::new();
+                if let Some(parent) = path_clone.parent() {
+                    sorted.push(DirEntry {
+                        name: "..".to_string(),
+                        is_dir: true,
+                        location: EntryLocation::Fs(parent.to_path_buf()),
+                    });
+                }
+                sorted.extend(all);
+                if sorted.is_empty() {
+                    return;
+                }
+                let mut start = 0usize;
+                while start < sorted.len() {
+                    let end = (start + chunk).min(sorted.len());
+                    let batch = sorted[start..end].to_vec();
+                    if start == 0 {
+                        let _ = tx.send(DirBatch::Replace(batch));
+                    } else {
+                        let _ = tx.send(DirBatch::Append(batch));
+                    }
+                    start = end;
                 }
             });
         }
@@ -848,7 +891,7 @@ impl FileSystemModel {
             }
         }
 
-        let (tx, rx) = mpsc::channel::<Vec<DirEntry>>();
+        let (tx, rx) = mpsc::channel::<DirBatch>();
         let ap = archive_path.clone();
         let cwd_clone = cwd.clone();
 
@@ -860,7 +903,7 @@ impl FileSystemModel {
                 }
                 let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
                 if !initial.is_empty() {
-                    let _ = tx.send(initial);
+                    let _ = tx.send(DirBatch::Append(initial));
                 }
                 // Stream the remaining in background
                 thread::spawn(move || {
@@ -868,7 +911,7 @@ impl FileSystemModel {
                     let mut start = 128.min(all.len());
                     while start < all.len() {
                         let end = (start + chunk).min(all.len());
-                        let _ = tx.send(all[start..end].to_vec());
+                        let _ = tx.send(DirBatch::Append(all[start..end].to_vec()));
                         start = end;
                     }
                 });
@@ -1201,64 +1244,78 @@ impl FileSystemModel {
     }
 
     fn update_preview_for_current_selection(&mut self) {
-        let panel = self.get_active_panel();
-        if panel.entries.is_empty() {
-            self.preview = None;
+        let (is_dir, location) = {
+            let panel = self.get_active_panel();
+            if panel.entries.is_empty() {
+                self.clear_preview();
+                return;
+            }
+            let entry = &panel.entries[panel.selected_index];
+            (entry.is_dir, entry.location.clone())
+        };
+        if is_dir {
+            self.clear_preview();
             return;
         }
-        let entry = &panel.entries[panel.selected_index];
-        if entry.is_dir {
-            self.preview = None;
-            return;
-        }
+        self.preview_request_id = self.preview_request_id.wrapping_add(1);
+        let request_id = self.preview_request_id;
         const MAX_BYTES: usize = 64 * 1024;
-        match &entry.location {
+        match location {
             EntryLocation::Fs(path) => {
-                if is_image_path(path) {
-                    self.preview = Some(PreviewContent::Image(Arc::from(path.clone())));
-                } else {
-                    match read_bytes_prefix(path, MAX_BYTES) {
+                if is_image_path(&path) {
+                    self.preview = Some(PreviewContent::Image(Arc::from(path)));
+                    self.preview_rx = None;
+                    return;
+                }
+                let (tx, rx) = mpsc::channel();
+                self.preview_rx = Some(rx);
+                self.preview = Some(PreviewContent::Text("Loading...".to_string()));
+                thread::spawn(move || {
+                    let content = match read_bytes_prefix(&path, MAX_BYTES) {
                         Ok(bytes) => {
                             if is_probably_text(&bytes) {
                                 let text = String::from_utf8_lossy(&bytes).into_owned();
-                                self.preview = Some(PreviewContent::Text(text));
+                                PreviewContent::Text(text)
                             } else {
-                                let dump = hexdump(&bytes);
-                                self.preview = Some(PreviewContent::Text(dump));
+                                PreviewContent::Text(hexdump(&bytes))
                             }
                         }
-                        Err(e) => {
-                            self.preview =
-                                Some(PreviewContent::Text(format!("Failed to read file: {e}")));
-                        }
-                    }
-                }
+                        Err(e) => PreviewContent::Text(format!("Failed to read file: {e}")),
+                    };
+                    let _ = tx.send((request_id, content));
+                });
             }
             EntryLocation::Zip {
                 archive_path,
                 inner_path,
-            } => match read_zip_bytes_prefix(archive_path, inner_path, MAX_BYTES) {
-                Ok(bytes) => {
-                    if is_probably_text(&bytes) {
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        self.preview = Some(PreviewContent::Text(text));
-                    } else {
-                        let dump = hexdump(&bytes);
-                        self.preview = Some(PreviewContent::Text(dump));
-                    }
-                }
-                Err(e) => {
-                    self.preview = Some(PreviewContent::Text(format!(
-                        "Failed to read zip entry: {e}"
-                    )));
-                }
-            },
+            } => {
+                let (tx, rx) = mpsc::channel();
+                self.preview_rx = Some(rx);
+                self.preview = Some(PreviewContent::Text("Loading...".to_string()));
+                thread::spawn(move || {
+                    let content = match read_zip_bytes_prefix(&archive_path, &inner_path, MAX_BYTES)
+                    {
+                        Ok(bytes) => {
+                            if is_probably_text(&bytes) {
+                                let text = String::from_utf8_lossy(&bytes).into_owned();
+                                PreviewContent::Text(text)
+                            } else {
+                                PreviewContent::Text(hexdump(&bytes))
+                            }
+                        }
+                        Err(e) => PreviewContent::Text(format!(
+                            "Failed to read zip entry: {e}"
+                        )),
+                    };
+                    let _ = tx.send((request_id, content));
+                });
+            }
         }
     }
 
     fn toggle_preview(&mut self) {
         if self.preview.is_some() {
-            self.preview = None;
+            self.clear_preview();
             return;
         }
         self.update_preview_for_current_selection();
@@ -1359,6 +1416,13 @@ impl FileSystemModel {
             self.theme.external.iter().map(|(n, _)| n.clone()).collect()
         }
     }
+
+    fn clear_preview(&mut self) {
+        self.preview = None;
+        self.preview_rx = None;
+        self.preview_request_id = self.preview_request_id.wrapping_add(1);
+    }
+
 }
 
 fn is_zip_path(p: &Path) -> bool {
@@ -1592,7 +1656,7 @@ impl gpui::Render for FileManagerView {
                                 if model.theme_picker_open {
                                     model.close_theme_picker();
                                 } else {
-                                    model.preview = None;
+                                    model.clear_preview();
                                 }
                             });
                             true
@@ -1658,14 +1722,30 @@ impl FileManagerView {
     ) -> impl IntoElement {
         // pump async directory results to keep UI responsive
         self.model.update(cx, |m: &mut FileSystemModel, cx| {
-            let panel = m.panel_mut(panel_side.clone());
-            if let Some(rx) = panel.entries_rx.take() {
-                match rx.try_recv() {
-                    Ok(mut new_entries) => {
+        let panel = m.panel_mut(panel_side.clone());
+        if let Some(rx) = panel.entries_rx.take() {
+            match rx.try_recv() {
+                Ok(batch) => {
+                        let is_replace = matches!(batch, DirBatch::Replace(_));
+                        let prior_selection = if panel.entries.is_empty() {
+                            None
+                        } else {
+                            Some(panel.entries[panel.selected_index].name.clone())
+                        };
                         let start_len = panel.entries.len();
-                        panel.entries.append(&mut new_entries);
-                        // restore preferred selection if any
-                        if let Some(pref) = panel.prefer_select_name.take() {
+                        match batch {
+                            DirBatch::Append(mut new_entries) => {
+                                panel.entries.append(&mut new_entries);
+                            }
+                            DirBatch::Replace(new_entries) => {
+                                panel.entries = new_entries;
+                                panel.selected_index = 0;
+                                panel.top_index = 0;
+                            }
+                        }
+                        let restore_name =
+                            panel.prefer_select_name.take().or(prior_selection);
+                        if let Some(pref) = restore_name {
                             if let Some(idx) = panel.entries.iter().position(|e| e.name == pref) {
                                 panel.selected_index = idx;
                                 // adjust top to keep in view
@@ -1678,7 +1758,7 @@ impl FileManagerView {
                             }
                         }
                         // trigger another frame if we added anything
-                        if panel.entries.len() > start_len {
+                        if panel.entries.len() != start_len || is_replace {
                             cx.notify();
                         }
                     }
@@ -1687,11 +1767,25 @@ impl FileManagerView {
                         cx.notify();
                     }
                     Err(mpsc::TryRecvError::Disconnected) => { /* done */ }
-                }
             }
-        });
+        }
+        if let Some(rx) = m.preview_rx.take() {
+            match rx.try_recv() {
+                Ok((id, content)) => {
+                    if id == m.preview_request_id {
+                        m.preview = Some(content);
+                        cx.notify();
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    m.preview_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+    });
 
-        self.model.update(cx, |m: &mut FileSystemModel, cx2| {
+    self.model.update(cx, |m: &mut FileSystemModel, cx2| {
             let p = m.panel_mut(panel_side.clone());
             let window_rows = compute_window_rows(p);
             // only adjust top_index when selection would go out of the visible window
@@ -1713,10 +1807,31 @@ impl FileManagerView {
             // Keep pumping async RX to ensure view populates without user interaction
             if let Some(rx) = p.entries_rx.take() {
                 match rx.try_recv() {
-                    Ok(mut new_entries) => {
+                    Ok(batch) => {
+                        let is_replace = matches!(batch, DirBatch::Replace(_));
+                        let prior_selection = if p.entries.is_empty() {
+                            None
+                        } else {
+                            Some(p.entries[p.selected_index].name.clone())
+                        };
                         let start_len = p.entries.len();
-                        p.entries.append(&mut new_entries);
-                        if p.entries.len() > start_len {
+                        match batch {
+                            DirBatch::Append(mut new_entries) => {
+                                p.entries.append(&mut new_entries);
+                            }
+                            DirBatch::Replace(new_entries) => {
+                                p.entries = new_entries;
+                                p.selected_index = 0;
+                                p.top_index = 0;
+                            }
+                        }
+                        let restore_name = p.prefer_select_name.take().or(prior_selection);
+                        if let Some(pref) = restore_name {
+                            if let Some(idx) = p.entries.iter().position(|e| e.name == pref) {
+                                p.selected_index = idx;
+                            }
+                        }
+                        if p.entries.len() != start_len || is_replace {
                             cx2.notify();
                         }
                         p.entries_rx = Some(rx);

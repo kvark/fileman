@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gpui = "0.2"
+gpui = { git = "https://github.com/gpui-ce/gpui-ce", package = "gpui-ce" }
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
