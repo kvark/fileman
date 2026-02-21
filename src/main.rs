@@ -538,8 +538,16 @@ struct PanelState {
 }
 
 enum PreviewContent {
-    Text(String),
+    Text(gpui::SharedString),
     Image(Arc<Path>),
+}
+
+enum PreviewRequest {
+    Read {
+        id: u64,
+        location: EntryLocation,
+        max_bytes: usize,
+    },
 }
 
 enum IOTask {
@@ -555,7 +563,8 @@ struct FileSystemModel {
     right_panel: PanelState,
     active_panel: ActivePanel,
     preview: Option<PreviewContent>,
-    preview_rx: Option<mpsc::Receiver<(u64, PreviewContent)>>,
+    preview_tx: mpsc::Sender<PreviewRequest>,
+    preview_rx: mpsc::Receiver<(u64, PreviewContent)>,
     preview_request_id: u64,
     io_tx: mpsc::Sender<IOTask>,
 
@@ -581,6 +590,63 @@ fn start_io_worker() -> mpsc::Sender<IOTask> {
         }
     });
     tx
+}
+
+fn start_preview_worker(
+) -> (
+    mpsc::Sender<PreviewRequest>,
+    mpsc::Receiver<(u64, PreviewContent)>,
+) {
+    let (tx, rx) = mpsc::channel::<PreviewRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<(u64, PreviewContent)>();
+    thread::spawn(move || {
+        while let Ok(mut request) = rx.recv() {
+            while let Ok(next) = rx.try_recv() {
+                request = next;
+            }
+            match request {
+                PreviewRequest::Read {
+                    id,
+                    location,
+                    max_bytes,
+                } => {
+                    let content = match location {
+                        EntryLocation::Fs(path) => match read_bytes_prefix(&path, max_bytes) {
+                            Ok(bytes) => {
+                                if is_probably_text(&bytes) {
+                                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                                    PreviewContent::Text(gpui::SharedString::from(text))
+                                } else {
+                                    PreviewContent::Text(gpui::SharedString::from(hexdump(&bytes)))
+                                }
+                            }
+                            Err(e) => PreviewContent::Text(gpui::SharedString::from(format!(
+                                "Failed to read file: {e}"
+                            ))),
+                        },
+                        EntryLocation::Zip {
+                            archive_path,
+                            inner_path,
+                        } => match read_zip_bytes_prefix(&archive_path, &inner_path, max_bytes) {
+                            Ok(bytes) => {
+                                if is_probably_text(&bytes) {
+                                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                                    PreviewContent::Text(gpui::SharedString::from(text))
+                                } else {
+                                    PreviewContent::Text(gpui::SharedString::from(hexdump(&bytes)))
+                                }
+                            }
+                            Err(e) => PreviewContent::Text(gpui::SharedString::from(format!(
+                                "Failed to read zip entry: {e}"
+                            ))),
+                        },
+                    };
+                    let _ = result_tx.send((id, content));
+                }
+            }
+        }
+    });
+    (tx, result_rx)
 }
 
 fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {
@@ -611,6 +677,7 @@ fn main() -> anyhow::Result<()> {
 
     let cur_dir = std::env::current_dir()?;
     let io_tx = start_io_worker();
+    let (preview_tx, preview_rx) = start_preview_worker();
 
     gpui::Application::new().run(move |cx| {
         cx.open_window(
@@ -649,7 +716,8 @@ fn main() -> anyhow::Result<()> {
                     },
                     active_panel: ActivePanel::Left,
                     preview: None,
-                    preview_rx: None,
+                    preview_tx: preview_tx.clone(),
+                    preview_rx,
                     preview_request_id: 0,
                     io_tx: io_tx_clone.clone(),
                     fs_last_selected_name: HashMap::new(),
@@ -1253,61 +1321,57 @@ impl FileSystemModel {
             let entry = &panel.entries[panel.selected_index];
             (entry.is_dir, entry.location.clone())
         };
-        if is_dir {
-            self.clear_preview();
-            return;
-        }
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let request_id = self.preview_request_id;
         const MAX_BYTES: usize = 64 * 1024;
+        if is_dir {
+            self.preview = Some(PreviewContent::Text(gpui::SharedString::from(
+                format_preview_info(
+                "Directory",
+                &location,
+            ))));
+            return;
+        }
         match location {
             EntryLocation::Fs(path) => {
                 if is_image_path(&path) {
                     self.preview = Some(PreviewContent::Image(Arc::from(path)));
-                    self.preview_rx = None;
                     return;
                 }
-                let (tx, rx) = mpsc::channel();
-                self.preview_rx = Some(rx);
-                self.preview = Some(PreviewContent::Text("Loading...".to_string()));
-                thread::spawn(move || {
-                    let content = match read_bytes_prefix(&path, MAX_BYTES) {
-                        Ok(bytes) => {
-                            if is_probably_text(&bytes) {
-                                let text = String::from_utf8_lossy(&bytes).into_owned();
-                                PreviewContent::Text(text)
-                            } else {
-                                PreviewContent::Text(hexdump(&bytes))
-                            }
-                        }
-                        Err(e) => PreviewContent::Text(format!("Failed to read file: {e}")),
-                    };
-                    let _ = tx.send((request_id, content));
+                if self.preview.is_none() {
+                    self.preview = Some(PreviewContent::Text(gpui::SharedString::from(
+                        format_preview_info(
+                        "File",
+                        &EntryLocation::Fs(path.clone()),
+                    ))));
+                }
+                let _ = self.preview_tx.send(PreviewRequest::Read {
+                    id: request_id,
+                    location: EntryLocation::Fs(path),
+                    max_bytes: MAX_BYTES,
                 });
             }
             EntryLocation::Zip {
                 archive_path,
                 inner_path,
             } => {
-                let (tx, rx) = mpsc::channel();
-                self.preview_rx = Some(rx);
-                self.preview = Some(PreviewContent::Text("Loading...".to_string()));
-                thread::spawn(move || {
-                    let content = match read_zip_bytes_prefix(&archive_path, &inner_path, MAX_BYTES)
-                    {
-                        Ok(bytes) => {
-                            if is_probably_text(&bytes) {
-                                let text = String::from_utf8_lossy(&bytes).into_owned();
-                                PreviewContent::Text(text)
-                            } else {
-                                PreviewContent::Text(hexdump(&bytes))
-                            }
-                        }
-                        Err(e) => PreviewContent::Text(format!(
-                            "Failed to read zip entry: {e}"
-                        )),
-                    };
-                    let _ = tx.send((request_id, content));
+                if self.preview.is_none() {
+                    self.preview = Some(PreviewContent::Text(gpui::SharedString::from(
+                        format_preview_info(
+                        "File",
+                        &EntryLocation::Zip {
+                            archive_path: archive_path.clone(),
+                            inner_path: inner_path.clone(),
+                        },
+                    ))));
+                }
+                let _ = self.preview_tx.send(PreviewRequest::Read {
+                    id: request_id,
+                    location: EntryLocation::Zip {
+                        archive_path,
+                        inner_path,
+                    },
+                    max_bytes: MAX_BYTES,
                 });
             }
         }
@@ -1419,7 +1483,6 @@ impl FileSystemModel {
 
     fn clear_preview(&mut self) {
         self.preview = None;
-        self.preview_rx = None;
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
     }
 
@@ -1430,6 +1493,27 @@ fn is_zip_path(p: &Path) -> bool {
         p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
         Some(ext) if ext == "zip"
     )
+}
+
+fn format_preview_info(kind: &str, location: &EntryLocation) -> String {
+    match location {
+        EntryLocation::Fs(path) => format!("{kind}\n{}", path.to_string_lossy()),
+        EntryLocation::Zip {
+            archive_path,
+            inner_path,
+        } => {
+            let display = if inner_path.is_empty() {
+                format!("{}::zip:/", archive_path.to_string_lossy())
+            } else {
+                format!(
+                    "{}::zip:/{}",
+                    archive_path.to_string_lossy(),
+                    inner_path
+                )
+            };
+            format!("{kind}\n{display}")
+        }
+    }
 }
 
 fn is_image_path(p: &Path) -> bool {
@@ -1769,19 +1853,15 @@ impl FileManagerView {
                     Err(mpsc::TryRecvError::Disconnected) => { /* done */ }
             }
         }
-        if let Some(rx) = m.preview_rx.take() {
-            match rx.try_recv() {
-                Ok((id, content)) => {
-                    if id == m.preview_request_id {
-                        m.preview = Some(content);
-                        cx.notify();
-                    }
+        match m.preview_rx.try_recv() {
+            Ok((id, content)) => {
+                if id == m.preview_request_id {
+                    m.preview = Some(content);
+                    cx.notify();
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    m.preview_rx = Some(rx);
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {}
             }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {}
         }
     });
 
@@ -2052,7 +2132,7 @@ impl FileManagerView {
                     let model = self.model.read(cx);
 
                     if model.preview.is_some() {
-                        self.render_preview(cx).into_any_element()
+                        self.render_preview(&model).into_any_element()
                     } else {
                         file_list
                             .id("list")
@@ -2068,8 +2148,7 @@ impl FileManagerView {
             })
     }
 
-    fn render_preview(&self, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let model = self.model.read(cx);
+    fn render_preview(&self, model: &FileSystemModel) -> impl IntoElement {
         if let Some(preview) = &model.preview {
             let content = match preview {
                 PreviewContent::Text(text) => {
