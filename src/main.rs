@@ -1,2272 +1,1140 @@
-use gpui::prelude::*;
-use serde::Deserialize;
+use anyhow::Result;
+use blade_egui::{GuiPainter, ScreenDescriptor};
+use blade_graphics::{
+    CommandEncoderDesc, Context, ContextDesc, Extent, FinishOp, InitOp, RenderTarget,
+    RenderTargetSet, SurfaceConfig, TextureColor, TextureSubresources, TextureUsage,
+    TextureViewDesc, ViewDimension,
+};
+use egui_winit::State as EguiWinitState;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{self, Read},
-    path::{self, Path},
-    sync::{Arc, mpsc},
+    path::PathBuf,
+    sync::mpsc,
     thread,
 };
-const VIEW_ROWS: usize = 40;
+use winit::{
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    window::{Window, WindowAttributes, WindowId},
+};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ThemeKind {
-    Dark,
-    Light,
+use fileman::app_state::{AppState, PanelState};
+use fileman::core::{
+    ActivePanel, DirBatch, DirEntry, EntryLocation, PanelMode, PreviewContent, is_zip_path,
+    read_zip_directory,
+};
+use fileman::theme::{Color, Theme, ThemeColors};
+use fileman::workers::{start_io_worker, start_preview_worker};
+
+const ROW_HEIGHT: f32 = 22.0;
+
+struct UiCache {
+    left_rows: usize,
+    right_rows: usize,
 }
 
-#[derive(Clone)]
-struct Theme {
-    kind: ThemeKind,
-    external: Vec<(String, ThemeColors)>,
-    selected_external: Option<usize>,
+struct ImageRequest {
+    path: PathBuf,
 }
 
-#[derive(Clone)]
-struct ThemeColors {
-    divider: gpui::Hsla,
-    row_bg_selected_active: gpui::Hsla,
-    row_bg_selected_inactive: gpui::Hsla,
-    row_fg_selected: gpui::Hsla,
-    row_fg_active: gpui::Hsla,
-    row_fg_inactive: gpui::Hsla,
-    panel_border_active: gpui::Hsla,
-    panel_border_inactive: gpui::Hsla,
-    header_bg: gpui::Hsla,
-    header_fg: gpui::Hsla,
-    footer_bg: gpui::Hsla,
-    footer_fg: gpui::Hsla,
-    preview_bg: gpui::Hsla,
-    preview_header_bg: gpui::Hsla,
-    preview_header_fg: gpui::Hsla,
-    preview_text: gpui::Hsla,
+struct ImageResult {
+    path: PathBuf,
+    image: egui::ColorImage,
 }
 
-impl Theme {
-    fn dark() -> Self {
-        Self {
-            kind: ThemeKind::Dark,
-            external: Vec::new(),
-            selected_external: None,
-        }
-    }
-    fn light() -> Self {
-        Self {
-            kind: ThemeKind::Light,
-            external: Vec::new(),
-            selected_external: None,
-        }
-    }
-    fn set_external(&mut self, themes: Vec<(String, ThemeColors)>) {
-        self.external = themes;
-        self.selected_external = if self.external.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
-    }
-    fn toggle(&mut self) {
-        if !self.external.is_empty() {
-            let next = match self.selected_external {
-                None => 0,
-                Some(i) => (i + 1) % self.external.len(),
-            };
-            self.selected_external = Some(next);
-            return;
-        }
-        self.kind = match self.kind {
-            ThemeKind::Dark => ThemeKind::Light,
-            ThemeKind::Light => ThemeKind::Dark,
-        };
-    }
-    fn colors(&self) -> ThemeColors {
-        if let Some(i) = self.selected_external {
-            return self.external[i].1.clone();
-        }
-        match self.kind {
-            ThemeKind::Dark => ThemeColors {
-                divider: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.2,
-                    g: 0.2,
-                    b: 0.2,
-                    a: 1.0,
-                }),
-                row_bg_selected_active: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.2,
-                    g: 0.4,
-                    b: 0.7,
-                    a: 1.0,
-                }),
-                row_bg_selected_inactive: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.15,
-                    g: 0.3,
-                    b: 0.5,
-                    a: 1.0,
-                }),
-                row_fg_selected: gpui::Hsla::from(gpui::Rgba {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 1.0,
-                }),
-                row_fg_active: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.9,
-                    g: 0.9,
-                    b: 0.9,
-                    a: 1.0,
-                }),
-                row_fg_inactive: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.7,
-                    g: 0.7,
-                    b: 0.7,
-                    a: 1.0,
-                }),
-                panel_border_active: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.2,
-                    g: 0.6,
-                    b: 0.9,
-                    a: 1.0,
-                }),
-                panel_border_inactive: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.1,
-                    g: 0.1,
-                    b: 0.1,
-                    a: 1.0,
-                }),
-                header_bg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.75,
-                    g: 0.75,
-                    b: 0.75,
-                    a: 1.0,
-                }),
-                header_fg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                }),
-                footer_bg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.15,
-                    g: 0.15,
-                    b: 0.15,
-                    a: 1.0,
-                }),
-                footer_fg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.8,
-                    g: 0.8,
-                    b: 0.8,
-                    a: 1.0,
-                }),
-                preview_bg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.08,
-                    g: 0.08,
-                    b: 0.08,
-                    a: 1.0,
-                }),
-                preview_header_bg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.2,
-                    g: 0.2,
-                    b: 0.2,
-                    a: 1.0,
-                }),
-                preview_header_fg: gpui::Hsla::from(gpui::Rgba {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 1.0,
-                }),
-                preview_text: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.95,
-                    g: 0.95,
-                    b: 0.95,
-                    a: 1.0,
-                }),
-            },
-            ThemeKind::Light => ThemeColors {
-                divider: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.85,
-                    g: 0.85,
-                    b: 0.85,
-                    a: 1.0,
-                }),
-                row_bg_selected_active: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.75,
-                    g: 0.85,
-                    b: 1.0,
-                    a: 1.0,
-                }),
-                row_bg_selected_inactive: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.85,
-                    g: 0.9,
-                    b: 1.0,
-                    a: 1.0,
-                }),
-                row_fg_selected: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                }),
-                row_fg_active: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.1,
-                    g: 0.1,
-                    b: 0.1,
-                    a: 1.0,
-                }),
-                row_fg_inactive: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.3,
-                    g: 0.3,
-                    b: 0.3,
-                    a: 1.0,
-                }),
-                panel_border_active: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.2,
-                    g: 0.6,
-                    b: 0.9,
-                    a: 1.0,
-                }),
-                panel_border_inactive: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.8,
-                    g: 0.8,
-                    b: 0.8,
-                    a: 1.0,
-                }),
-                header_bg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.95,
-                    g: 0.95,
-                    b: 0.95,
-                    a: 1.0,
-                }),
-                header_fg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.05,
-                    g: 0.05,
-                    b: 0.05,
-                    a: 1.0,
-                }),
-                footer_bg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.92,
-                    g: 0.92,
-                    b: 0.92,
-                    a: 1.0,
-                }),
-                footer_fg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.2,
-                    g: 0.2,
-                    b: 0.2,
-                    a: 1.0,
-                }),
-                preview_bg: gpui::Hsla::from(gpui::Rgba {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 1.0,
-                }),
-                preview_header_bg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.92,
-                    g: 0.92,
-                    b: 0.92,
-                    a: 1.0,
-                }),
-                preview_header_fg: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.1,
-                    g: 0.1,
-                    b: 0.1,
-                    a: 1.0,
-                }),
-                preview_text: gpui::Hsla::from(gpui::Rgba {
-                    r: 0.1,
-                    g: 0.1,
-                    b: 0.1,
-                    a: 1.0,
-                }),
-            },
-        }
-    }
+struct ImageCache {
+    textures: HashMap<PathBuf, egui::TextureHandle>,
+    pending: HashSet<PathBuf>,
+    order: VecDeque<PathBuf>,
+}
 
-    fn load_external_from_dir(&mut self, dir: &std::path::Path) {
-        let themes = load_themes_from_dir(dir);
-        if !themes.is_empty() {
-            self.set_external(themes);
-        }
+const MAX_IMAGE_TEXTURES: usize = 64;
+const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 2;
+
+fn touch_image(cache: &mut ImageCache, key: &PathBuf) {
+    if let Some(pos) = cache.order.iter().position(|p| p == key) {
+        cache.order.remove(pos);
+        cache.order.push_back(key.clone());
     }
 }
 
-#[derive(Deserialize, Clone, Default)]
-struct SerializableColor {
-    r: f32,
-    g: f32,
-    b: f32,
-    a: f32,
+fn color32(c: Color) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        (c.r.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.g.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.b.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.a.clamp(0.0, 1.0) * 255.0) as u8,
+    )
 }
 
-#[derive(Deserialize, Default)]
-struct ThemeFileColors {
-    divider: Option<SerializableColor>,
-    row_bg_selected_active: Option<SerializableColor>,
-    row_bg_selected_inactive: Option<SerializableColor>,
-    row_fg_selected: Option<SerializableColor>,
-    row_fg_active: Option<SerializableColor>,
-    row_fg_inactive: Option<SerializableColor>,
-    panel_border_active: Option<SerializableColor>,
-    panel_border_inactive: Option<SerializableColor>,
-    header_bg: Option<SerializableColor>,
-    header_fg: Option<SerializableColor>,
-    footer_bg: Option<SerializableColor>,
-    footer_fg: Option<SerializableColor>,
-    preview_bg: Option<SerializableColor>,
-    preview_header_bg: Option<SerializableColor>,
-    preview_header_fg: Option<SerializableColor>,
-    preview_text: Option<SerializableColor>,
+fn apply_theme(ctx: &egui::Context, colors: &ThemeColors) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals.window_fill = color32(colors.preview_bg);
+    style.visuals.panel_fill = color32(colors.preview_bg);
+    style.visuals.extreme_bg_color = color32(colors.header_bg);
+    style.visuals.window_stroke.color = color32(colors.panel_border_inactive);
+    style.visuals.selection.bg_fill = color32(colors.row_bg_selected_active);
+    style.visuals.selection.stroke.color = color32(colors.row_fg_selected);
+    style.visuals.widgets.inactive.bg_fill = color32(colors.preview_bg);
+    style.visuals.widgets.inactive.fg_stroke.color = color32(colors.row_fg_inactive);
+    style.visuals.widgets.active.bg_fill = color32(colors.row_bg_selected_active);
+    style.visuals.widgets.active.fg_stroke.color = color32(colors.row_fg_selected);
+    style.visuals.widgets.hovered.bg_fill = color32(colors.row_bg_selected_inactive);
+    style.visuals.widgets.hovered.fg_stroke.color = color32(colors.row_fg_active);
+    style.visuals.hyperlink_color = color32(colors.panel_border_active);
+    style.visuals.override_text_color = Some(color32(colors.row_fg_active));
+    ctx.set_style(style);
 }
 
-#[derive(Deserialize, Default)]
-struct ThemeFile {
-    name: Option<String>,
-    colors: Option<ThemeFileColors>,
+fn surface_error_help() -> &'static str {
+    "Blade-graphics could not find a supported GPU backend.\n\
+Try one of:\n\
+  - Install Vulkan drivers for your GPU and re-run.\n\
+  - Build with GLES fallback: RUSTFLAGS=\"--cfg gles\" cargo run\n\
+On Linux in CI or headless environments, Vulkan is often unavailable."
 }
 
-fn rgba_from(c: &SerializableColor) -> gpui::Hsla {
-    gpui::Hsla::from(gpui::Rgba {
-        r: c.r,
-        g: c.g,
-        b: c.b,
-        a: c.a,
-    })
-}
-
-fn merge_colors(base: &ThemeColors, patch: &ThemeFileColors) -> ThemeColors {
-    ThemeColors {
-        divider: patch
-            .divider
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.divider),
-        row_bg_selected_active: patch
-            .row_bg_selected_active
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.row_bg_selected_active),
-        row_bg_selected_inactive: patch
-            .row_bg_selected_inactive
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.row_bg_selected_inactive),
-        row_fg_selected: patch
-            .row_fg_selected
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.row_fg_selected),
-        row_fg_active: patch
-            .row_fg_active
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.row_fg_active),
-        row_fg_inactive: patch
-            .row_fg_inactive
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.row_fg_inactive),
-        panel_border_active: patch
-            .panel_border_active
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.panel_border_active),
-        panel_border_inactive: patch
-            .panel_border_inactive
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.panel_border_inactive),
-        header_bg: patch
-            .header_bg
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.header_bg),
-        header_fg: patch
-            .header_fg
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.header_fg),
-        footer_bg: patch
-            .footer_bg
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.footer_bg),
-        footer_fg: patch
-            .footer_fg
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.footer_fg),
-        preview_bg: patch
-            .preview_bg
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.preview_bg),
-        preview_header_bg: patch
-            .preview_header_bg
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.preview_header_bg),
-        preview_header_fg: patch
-            .preview_header_fg
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.preview_header_fg),
-        preview_text: patch
-            .preview_text
-            .as_ref()
-            .map(rgba_from)
-            .unwrap_or_else(|| base.preview_text),
-    }
-}
-
-fn parse_theme_bytes(name_hint: &str, bytes: &[u8]) -> Option<(String, ThemeColors)> {
-    let dark_base = Theme::dark().colors();
-    // Try JSON
-    if let Ok(tf) = serde_json::from_slice::<ThemeFile>(bytes) {
-        let name = tf.name.unwrap_or_else(|| name_hint.to_string());
-        let colors = tf
-            .colors
-            .map(|c| merge_colors(&dark_base, &c))
-            .unwrap_or(dark_base.clone());
-        return Some((name, colors));
-    }
-    // Try YAML
-    if let Ok(tf) = serde_yaml::from_slice::<ThemeFile>(bytes) {
-        let name = tf.name.unwrap_or_else(|| name_hint.to_string());
-        let colors = tf
-            .colors
-            .map(|c| merge_colors(&dark_base, &c))
-            .unwrap_or(dark_base.clone());
-        return Some((name, colors));
-    }
-    // Try TOML
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        if let Ok(tf) = toml::from_str::<ThemeFile>(s) {
-            let name = tf.name.unwrap_or_else(|| name_hint.to_string());
-            let colors = tf
-                .colors
-                .map(|c| merge_colors(&dark_base, &c))
-                .unwrap_or(dark_base.clone());
-            return Some((name, colors));
-        }
-    }
-    None
-}
-
-fn load_themes_from_dir(dir: &std::path::Path) -> Vec<(String, ThemeColors)> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let name_hint = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("theme")
-                .to_string();
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !matches!(ext.as_str(), "json" | "yaml" | "yml" | "toml") {
-                continue;
-            }
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Some((name, colors)) = parse_theme_bytes(&name_hint, &bytes) {
-                    out.push((name, colors));
-                }
-            }
-        }
-    }
-    out
-}
-
-#[derive(Clone)]
-enum EntryLocation {
-    Fs(path::PathBuf),
-    Zip {
-        archive_path: path::PathBuf,
-        inner_path: String, // no leading slash, '' means root
-    },
-}
-
-#[derive(Clone)]
-struct DirEntry {
-    name: String,
-    is_dir: bool,
-    location: EntryLocation,
-}
-
-enum DirBatch {
-    Append(Vec<DirEntry>),
-    Replace(Vec<DirEntry>),
-}
-
-#[derive(Clone, PartialEq)]
-enum ActivePanel {
-    Left,
-    Right,
-}
-
-enum PanelMode {
-    Fs,
-    Zip {
-        archive_path: path::PathBuf,
-        cwd: String,
-    },
-}
-
-struct PanelState {
-    current_path: path::PathBuf, // For Fs mode: real fs path. For Zip: archive file path.
-    mode: PanelMode,
-    selected_index: usize,
-    entries: Vec<DirEntry>,
-    // async population
-    entries_rx: Option<mpsc::Receiver<DirBatch>>,
-    // selection restoration by name
-    prefer_select_name: Option<String>,
-    // virtual scrolling: first visible row index
-    top_index: usize,
-    // tracked scroll handle to measure viewport bounds and children
-    scroll: gpui::ScrollHandle,
-    // anchor to capture viewport bounds each frame
-    scroll_anchor: gpui::ScrollAnchor,
-}
-
-enum PreviewContent {
-    Text(gpui::SharedString),
-    Image(Arc<Path>),
-}
-
-enum PreviewRequest {
-    Read {
-        id: u64,
-        location: EntryLocation,
-        max_bytes: usize,
-    },
-}
-
-enum IOTask {
-    Copy {
-        src: path::PathBuf,
-        dst_dir: path::PathBuf,
-    },
-}
-
-// Models
-struct FileSystemModel {
-    left_panel: PanelState,
-    right_panel: PanelState,
-    active_panel: ActivePanel,
-    preview: Option<PreviewContent>,
-    preview_tx: mpsc::Sender<PreviewRequest>,
-    preview_rx: mpsc::Receiver<(u64, PreviewContent)>,
-    preview_request_id: u64,
-    io_tx: mpsc::Sender<IOTask>,
-
-    // remember last selected entry name per directory
-    fs_last_selected_name: HashMap<path::PathBuf, String>,
-    zip_last_selected_name: HashMap<(path::PathBuf, String), String>,
-    theme: Theme,
-    theme_picker_open: bool,
-    theme_picker_selected: Option<usize>,
-}
-
-fn start_io_worker() -> mpsc::Sender<IOTask> {
-    let (tx, rx) = mpsc::channel::<IOTask>();
-    thread::spawn(move || {
-        while let Ok(task) = rx.recv() {
-            match task {
-                IOTask::Copy { src, dst_dir } => {
-                    if let Err(e) = copy_recursively(&src, &dst_dir) {
-                        eprintln!("Copy error: {e}");
-                    }
-                }
-            }
-        }
-    });
-    tx
-}
-
-fn start_preview_worker(
-) -> (
-    mpsc::Sender<PreviewRequest>,
-    mpsc::Receiver<(u64, PreviewContent)>,
-) {
-    let (tx, rx) = mpsc::channel::<PreviewRequest>();
-    let (result_tx, result_rx) = mpsc::channel::<(u64, PreviewContent)>();
-    thread::spawn(move || {
-        while let Ok(mut request) = rx.recv() {
-            while let Ok(next) = rx.try_recv() {
-                request = next;
-            }
-            match request {
-                PreviewRequest::Read {
-                    id,
-                    location,
-                    max_bytes,
-                } => {
-                    let content = match location {
-                        EntryLocation::Fs(path) => match read_bytes_prefix(&path, max_bytes) {
-                            Ok(bytes) => {
-                                if is_probably_text(&bytes) {
-                                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                                    PreviewContent::Text(gpui::SharedString::from(text))
-                                } else {
-                                    PreviewContent::Text(gpui::SharedString::from(hexdump(&bytes)))
-                                }
-                            }
-                            Err(e) => PreviewContent::Text(gpui::SharedString::from(format!(
-                                "Failed to read file: {e}"
-                            ))),
-                        },
-                        EntryLocation::Zip {
-                            archive_path,
-                            inner_path,
-                        } => match read_zip_bytes_prefix(&archive_path, &inner_path, max_bytes) {
-                            Ok(bytes) => {
-                                if is_probably_text(&bytes) {
-                                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                                    PreviewContent::Text(gpui::SharedString::from(text))
-                                } else {
-                                    PreviewContent::Text(gpui::SharedString::from(hexdump(&bytes)))
-                                }
-                            }
-                            Err(e) => PreviewContent::Text(gpui::SharedString::from(format!(
-                                "Failed to read zip entry: {e}"
-                            ))),
-                        },
-                    };
-                    let _ = result_tx.send((id, content));
-                }
-            }
-        }
-    });
-    (tx, result_rx)
-}
-
-fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {
-    if src.is_dir() {
-        let dest = dst_dir.join(src.file_name().unwrap());
-        fs::create_dir_all(&dest)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                copy_recursively(&path, &dest)?;
+fn panel_path_display(panel: &PanelState) -> String {
+    match &panel.mode {
+        PanelMode::Fs => panel.current_path.to_string_lossy().into_owned(),
+        PanelMode::Zip { archive_path, cwd } => {
+            if cwd.is_empty() {
+                format!("{}::zip:/", archive_path.to_string_lossy())
             } else {
-                fs::copy(&path, dest.join(entry.file_name()))?;
+                format!("{}::zip:/{}", archive_path.to_string_lossy(), cwd)
             }
         }
-    } else {
-        let dest = dst_dir.join(src.file_name().unwrap());
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(src, dest)?;
     }
-    Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    env_logger::init();
+fn apply_dir_batch(panel: &mut PanelState, batch: DirBatch) {
+    let prior_selection = panel
+        .entries
+        .get(panel.selected_index)
+        .map(|e| e.name.clone());
 
-    let cur_dir = std::env::current_dir()?;
-    let io_tx = start_io_worker();
-    let (preview_tx, preview_rx) = start_preview_worker();
-
-    gpui::Application::new().run(move |cx| {
-        cx.open_window(
-            gpui::WindowOptions {
-                focus: true,
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Dual Panel File Manager".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, app| {
-                let io_tx_clone = io_tx.clone();
-                let fs_entity = app.new(move |_| FileSystemModel {
-                    left_panel: PanelState {
-                        current_path: cur_dir.clone(),
-                        mode: PanelMode::Fs,
-                        selected_index: 0,
-                        entries: Vec::new(),
-                        entries_rx: None,
-                        prefer_select_name: None,
-                        top_index: 0,
-                        scroll: gpui::ScrollHandle::new(),
-                        scroll_anchor: gpui::ScrollAnchor::for_handle(gpui::ScrollHandle::new()),
-                    },
-                    right_panel: PanelState {
-                        current_path: cur_dir.clone(),
-                        mode: PanelMode::Fs,
-                        selected_index: 0,
-                        entries: Vec::new(),
-                        entries_rx: None,
-                        prefer_select_name: None,
-                        top_index: 0,
-                        scroll: gpui::ScrollHandle::new(),
-                        scroll_anchor: gpui::ScrollAnchor::for_handle(gpui::ScrollHandle::new()),
-                    },
-                    active_panel: ActivePanel::Left,
-                    preview: None,
-                    preview_tx: preview_tx.clone(),
-                    preview_rx,
-                    preview_request_id: 0,
-                    io_tx: io_tx_clone.clone(),
-                    fs_last_selected_name: HashMap::new(),
-                    zip_last_selected_name: HashMap::new(),
-                    theme: Theme::dark(),
-                    theme_picker_open: false,
-                    theme_picker_selected: None,
-                });
-
-                // Load initial directories
-                app.update_entity(&fs_entity, |model: &mut FileSystemModel, cx| {
-                    // Load external themes from ./themes (if present)
-                    model
-                        .theme
-                        .load_external_from_dir(std::path::Path::new("./themes"));
-
-                    model.load_fs_directory_async(
-                        model.left_panel.current_path.clone(),
-                        ActivePanel::Left,
-                        None,
-                        cx,
-                    );
-                    model.load_fs_directory_async(
-                        model.right_panel.current_path.clone(),
-                        ActivePanel::Right,
-                        None,
-                        cx,
-                    );
-                });
-
-                let view = app.new(|cx| FileManagerView {
-                    model: fs_entity,
-                    focus_handle: {
-                        window.focus(&cx.focus_handle());
-                        cx.focus_handle().clone()
-                    },
-                });
-
-                window.activate_window();
-                app.activate(true);
-                let fh = app.read_entity(&view, |v: &FileManagerView, _| v.focus_handle.clone());
-                window.focus(&fh);
-                view
-            },
-        )
-        .unwrap();
-    });
-    Ok(())
-}
-
-impl FileSystemModel {
-    #[profiling::function]
-    fn load_fs_directory_async(
-        &mut self,
-        path: path::PathBuf,
-        target_panel: ActivePanel,
-        prefer_name: Option<String>,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        // set initial parent entry for instant UI
-        let mut initial: Vec<DirEntry> = Vec::new();
-        if path.parent().is_some() {
-            initial.push(DirEntry {
-                name: "..".to_string(),
-                is_dir: true,
-                location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
-            });
+    match batch {
+        DirBatch::Append(mut new_entries) => {
+            panel.entries.append(&mut new_entries);
         }
+        DirBatch::Replace(new_entries) => {
+            panel.entries = new_entries;
+            panel.selected_index = 0;
+            panel.top_index = 0;
+        }
+    }
 
-        // create channel and start background loader
-        let (tx, rx) = mpsc::channel::<DirBatch>();
-        let path_clone = path.clone();
+    let restore_name = panel.prefer_select_name.take().or(prior_selection);
+    if let Some(pref) = restore_name
+        && let Some(idx) = panel.entries.iter().position(|e| e.name == pref)
+    {
+        panel.selected_index = idx;
+    }
+}
 
-        // Immediately populate UI with a quick snapshot so the list isn't empty
-        if let Ok(mut rd) = fs::read_dir(&path) {
-            let mut snapshot: Vec<DirEntry> = Vec::with_capacity(128);
-            for _ in 0..128 {
-                if let Some(ent) = rd.next() {
-                    if let Ok(entry) = ent {
-                        let file_name = entry.file_name().to_string_lossy().to_string();
-                        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                        snapshot.push(DirEntry {
+fn pump_async(app: &mut AppState) {
+    for side in [ActivePanel::Left, ActivePanel::Right] {
+        let panel = app.panel_mut(side.clone());
+        if let Some(rx) = panel.entries_rx.take() {
+            let mut handled = 0usize;
+            while handled < 8 {
+                match rx.try_recv() {
+                    Ok(batch) => {
+                        apply_dir_batch(panel, batch);
+                        handled += 1;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        panel.entries_rx = Some(rx);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+    }
+
+    match app.preview_rx.try_recv() {
+        Ok((id, content)) => {
+            if id == app.preview_request_id {
+                app.preview = Some(content);
+            }
+        }
+        Err(mpsc::TryRecvError::Empty) => {}
+        Err(mpsc::TryRecvError::Disconnected) => {}
+    }
+}
+
+fn load_fs_directory_async(
+    app: &mut AppState,
+    path: PathBuf,
+    target_panel: ActivePanel,
+    prefer_name: Option<String>,
+) {
+    let mut initial: Vec<DirEntry> = Vec::new();
+    if path.parent().is_some() {
+        initial.push(DirEntry {
+            name: "..".to_string(),
+            is_dir: true,
+            location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
+        });
+    }
+
+    let (tx, rx) = mpsc::channel::<DirBatch>();
+    let path_clone = path.clone();
+
+    if let Ok(mut rd) = fs::read_dir(&path) {
+        let mut snapshot: Vec<DirEntry> = Vec::with_capacity(128);
+        for _ in 0..128 {
+            match rd.next() {
+                Some(Ok(entry)) => {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    snapshot.push(DirEntry {
+                        name: file_name,
+                        is_dir,
+                        location: EntryLocation::Fs(entry.path()),
+                    });
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+        if !snapshot.is_empty() {
+            let _ = tx.send(DirBatch::Append(snapshot));
+        }
+        thread::spawn(move || {
+            let chunk = 500usize;
+            let mut all: Vec<DirEntry> = Vec::new();
+            for entry in rd.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if let Ok(file_type) = entry.file_type() {
+                    let is_dir = file_type.is_dir();
+                    all.push(DirEntry {
+                        name: file_name,
+                        is_dir,
+                        location: EntryLocation::Fs(entry.path()),
+                    });
+                }
+            }
+            all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+            let mut sorted: Vec<DirEntry> = Vec::new();
+            if let Some(parent) = path_clone.parent() {
+                sorted.push(DirEntry {
+                    name: "..".to_string(),
+                    is_dir: true,
+                    location: EntryLocation::Fs(parent.to_path_buf()),
+                });
+            }
+            sorted.extend(all);
+
+            if sorted.is_empty() {
+                return;
+            }
+            let mut start = 0usize;
+            while start < sorted.len() {
+                let end = (start + chunk).min(sorted.len());
+                let batch = sorted[start..end].to_vec();
+                if start == 0 {
+                    let _ = tx.send(DirBatch::Replace(batch));
+                } else {
+                    let _ = tx.send(DirBatch::Append(batch));
+                }
+                start = end;
+            }
+        });
+    } else {
+        thread::spawn(move || {
+            let chunk = 500usize;
+            let mut all: Vec<DirEntry> = Vec::new();
+            if let Ok(read_dir) = fs::read_dir(&path_clone) {
+                for entry in read_dir.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if let Ok(file_type) = entry.file_type() {
+                        let is_dir = file_type.is_dir();
+                        all.push(DirEntry {
                             name: file_name,
                             is_dir,
                             location: EntryLocation::Fs(entry.path()),
                         });
-                    } else {
-                        break;
                     }
+                }
+            }
+            all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+            let mut sorted: Vec<DirEntry> = Vec::new();
+            if let Some(parent) = path_clone.parent() {
+                sorted.push(DirEntry {
+                    name: "..".to_string(),
+                    is_dir: true,
+                    location: EntryLocation::Fs(parent.to_path_buf()),
+                });
+            }
+            sorted.extend(all);
+            if sorted.is_empty() {
+                return;
+            }
+            let mut start = 0usize;
+            while start < sorted.len() {
+                let end = (start + chunk).min(sorted.len());
+                let batch = sorted[start..end].to_vec();
+                if start == 0 {
+                    let _ = tx.send(DirBatch::Replace(batch));
                 } else {
-                    break;
+                    let _ = tx.send(DirBatch::Append(batch));
                 }
+                start = end;
             }
-            if !snapshot.is_empty() {
-                // Send the initial snapshot synchronously
-                let _ = tx.send(DirBatch::Append(snapshot));
-            }
-            // Continue streaming the rest in background from the same iterator
-            thread::spawn(move || {
-                // Stream directory entries in chunks to avoid blocking on huge folders
-                let chunk = 500usize;
-                let mut all: Vec<DirEntry> = Vec::new();
-                for entry_res in rd {
-                    if let Ok(entry) = entry_res {
-                        let file_name = entry.file_name().to_string_lossy().to_string();
-                        if let Ok(file_type) = entry.file_type() {
-                            let is_dir = file_type.is_dir();
-                            all.push(DirEntry {
-                                name: file_name,
-                                is_dir,
-                                location: EntryLocation::Fs(entry.path()),
-                            });
-                        }
-                    }
-                }
-                all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-                let mut sorted: Vec<DirEntry> = Vec::new();
-                if let Some(parent) = path_clone.parent() {
-                    sorted.push(DirEntry {
-                        name: "..".to_string(),
-                        is_dir: true,
-                        location: EntryLocation::Fs(parent.to_path_buf()),
-                    });
-                }
-                sorted.extend(all);
-
-                if sorted.is_empty() {
-                    return;
-                }
-                let mut start = 0usize;
-                while start < sorted.len() {
-                    let end = (start + chunk).min(sorted.len());
-                    let batch = sorted[start..end].to_vec();
-                    if start == 0 {
-                        let _ = tx.send(DirBatch::Replace(batch));
-                    } else {
-                        let _ = tx.send(DirBatch::Append(batch));
-                    }
-                    start = end;
-                }
-            });
-        } else {
-            // Fallback to background streaming if we couldn't read_dir immediately
-            thread::spawn(move || {
-                let chunk = 500usize;
-                let mut all: Vec<DirEntry> = Vec::new();
-                if let Ok(mut read_dir) = fs::read_dir(&path_clone) {
-                    while let Some(entry_res) = read_dir.next() {
-                        if let Ok(entry) = entry_res {
-                            let file_name = entry.file_name().to_string_lossy().to_string();
-                            if let Ok(file_type) = entry.file_type() {
-                                let is_dir = file_type.is_dir();
-                                all.push(DirEntry {
-                                    name: file_name,
-                                    is_dir,
-                                    location: EntryLocation::Fs(entry.path()),
-                                });
-                            }
-                        }
-                    }
-                }
-                all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-                let mut sorted: Vec<DirEntry> = Vec::new();
-                if let Some(parent) = path_clone.parent() {
-                    sorted.push(DirEntry {
-                        name: "..".to_string(),
-                        is_dir: true,
-                        location: EntryLocation::Fs(parent.to_path_buf()),
-                    });
-                }
-                sorted.extend(all);
-                if sorted.is_empty() {
-                    return;
-                }
-                let mut start = 0usize;
-                while start < sorted.len() {
-                    let end = (start + chunk).min(sorted.len());
-                    let batch = sorted[start..end].to_vec();
-                    if start == 0 {
-                        let _ = tx.send(DirBatch::Replace(batch));
-                    } else {
-                        let _ = tx.send(DirBatch::Append(batch));
-                    }
-                    start = end;
-                }
-            });
-        }
-
-        let remembered = prefer_name
-            .clone()
-            .or_else(|| self.fs_last_selected_name.get(&path).cloned());
-        let panel_state = self.panel_mut(target_panel);
-        panel_state.current_path = path.clone();
-        panel_state.mode = PanelMode::Fs;
-        panel_state.entries = initial;
-        panel_state.selected_index = 0;
-        panel_state.top_index = 0;
-        panel_state.entries_rx = Some(rx);
-
-        // restore selection by name
-        panel_state.prefer_select_name = remembered;
-
-        // request a repaint to begin pumping
-        cx.notify();
-    }
-
-    #[profiling::function]
-    fn load_zip_directory_async(
-        &mut self,
-        archive_path: path::PathBuf,
-        cwd: String,
-        target_panel: ActivePanel,
-        prefer_name: Option<String>,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        // initial ".." entry
-        let mut initial: Vec<DirEntry> = Vec::new();
-        if !cwd.is_empty() {
-            let parent = cwd
-                .trim_end_matches('/')
-                .rsplit_once('/')
-                .map(|(p, _)| p.to_string())
-                .unwrap_or_else(|| "".to_string());
-            initial.push(DirEntry {
-                name: "..".into(),
-                is_dir: true,
-                location: EntryLocation::Zip {
-                    archive_path: archive_path.clone(),
-                    inner_path: parent,
-                },
-            });
-        } else {
-            if let Some(parent) = archive_path.parent() {
-                initial.push(DirEntry {
-                    name: "..".into(),
-                    is_dir: true,
-                    location: EntryLocation::Fs(parent.to_path_buf()),
-                });
-            }
-        }
-
-        let (tx, rx) = mpsc::channel::<DirBatch>();
-        let ap = archive_path.clone();
-        let cwd_clone = cwd.clone();
-
-        // Send a small initial batch synchronously to avoid an empty view
-        match Self::read_zip_directory(&ap, &cwd_clone) {
-            Ok(mut all) => {
-                if !all.is_empty() && all[0].name == ".." {
-                    all.remove(0);
-                }
-                let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
-                if !initial.is_empty() {
-                    let _ = tx.send(DirBatch::Append(initial));
-                }
-                // Stream the remaining in background
-                thread::spawn(move || {
-                    let chunk = 500usize;
-                    let mut start = 128.min(all.len());
-                    while start < all.len() {
-                        let end = (start + chunk).min(all.len());
-                        let _ = tx.send(DirBatch::Append(all[start..end].to_vec()));
-                        start = end;
-                    }
-                });
-            }
-            Err(_) => {
-                // Nothing to show initially, background attempt won't help since listing failed
-            }
-        }
-
-        let remembered = prefer_name.clone().or_else(|| {
-            self.zip_last_selected_name
-                .get(&(archive_path.clone(), cwd.clone()))
-                .cloned()
         });
-        let panel_state = self.panel_mut(target_panel);
-
-        panel_state.current_path = archive_path.clone();
-        panel_state.mode = PanelMode::Zip {
-            archive_path: archive_path.clone(),
-            cwd: cwd.clone(),
-        };
-        panel_state.entries = initial;
-        panel_state.selected_index = 0;
-        panel_state.top_index = 0;
-        panel_state.entries_rx = Some(rx);
-        panel_state.prefer_select_name = remembered;
-
-        cx.notify();
     }
 
-    #[profiling::function]
-    fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
-        let mut entries = Vec::new();
-
-        let mut read_dir = fs::read_dir(path)?;
-        let mut dir_entries = Vec::new();
-
-        while let Some(entry) = read_dir.next() {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy().to_string();
-
-            let file_type = entry.file_type()?;
-            let is_dir = file_type.is_dir();
-
-            dir_entries.push(DirEntry {
-                name: file_name,
-                is_dir,
-                location: EntryLocation::Fs(entry.path()),
-            });
-        }
-
-        // Keep sorting in the background loader; we will remove the parent placeholder there.
-        dir_entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-
-        // Include parent here as well for non-async call sites, though async path strips it.
-        if path.parent().is_some() {
-            entries.push(DirEntry {
-                name: "..".to_string(),
-                is_dir: true,
-                location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
-            });
-        }
-
-        entries.extend(dir_entries);
-
-        Ok(entries)
-    }
-
-    #[profiling::function]
-    fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
-        let file = fs::File::open(archive_path)?;
-        let mut zip = zip::ZipArchive::new(file)?;
-        let mut dirs: HashSet<String> = HashSet::new();
-        let mut files: Vec<String> = Vec::new();
-
-        let prefix = if cwd.is_empty() {
-            "".to_string()
-        } else {
-            format!("{}/", cwd.trim_end_matches('/'))
-        };
-
-        for i in 0..zip.len() {
-            let entry = zip.by_index(i)?;
-            let name = entry.name();
-            if !name.starts_with(&prefix) {
-                continue;
-            }
-            let rem = &name[prefix.len()..];
-            if rem.is_empty() {
-                continue;
-            }
-            if let Some(slash) = rem.find('/') {
-                let dir = rem[..slash].to_string();
-                dirs.insert(dir);
-            } else {
-                files.push(rem.to_string());
-            }
-        }
-
-        let mut entries: Vec<DirEntry> = Vec::new();
-
-        // Parent entry
-        if !cwd.is_empty() {
-            let parent = cwd
-                .trim_end_matches('/')
-                .rsplit_once('/')
-                .map(|(p, _)| p.to_string())
-                .unwrap_or_else(|| "".to_string());
-            entries.push(DirEntry {
-                name: "..".into(),
-                is_dir: true,
-                location: EntryLocation::Zip {
-                    archive_path: archive_path.to_path_buf(),
-                    inner_path: parent,
-                },
-            });
-        } else {
-            // leaving the archive to its parent FS directory
-            if let Some(parent) = archive_path.parent() {
-                entries.push(DirEntry {
-                    name: "..".into(),
-                    is_dir: true,
-                    location: EntryLocation::Fs(parent.to_path_buf()),
-                });
-            }
-        }
-
-        let mut dir_entries: Vec<DirEntry> = dirs
-            .into_iter()
-            .map(|d| DirEntry {
-                name: d.clone(),
-                is_dir: true,
-                location: EntryLocation::Zip {
-                    archive_path: archive_path.to_path_buf(),
-                    inner_path: if cwd.is_empty() {
-                        d
-                    } else {
-                        format!("{}/{}", cwd.trim_end_matches('/'), d)
-                    },
-                },
-            })
-            .collect();
-
-        let mut file_entries: Vec<DirEntry> = files
-            .into_iter()
-            .map(|f| DirEntry {
-                name: f.clone(),
-                is_dir: false,
-                location: EntryLocation::Zip {
-                    archive_path: archive_path.to_path_buf(),
-                    inner_path: if cwd.is_empty() {
-                        f
-                    } else {
-                        format!("{}/{}", cwd.trim_end_matches('/'), f)
-                    },
-                },
-            })
-            .collect();
-
-        dir_entries.sort_by(|a, b| a.name.cmp(&b.name));
-        file_entries.sort_by(|a, b| a.name.cmp(&b.name));
-        entries.extend(dir_entries);
-        entries.extend(file_entries);
-
-        Ok(entries)
-    }
-
-    fn panel(&self, which: ActivePanel) -> &PanelState {
-        match which {
-            ActivePanel::Left => &self.left_panel,
-            ActivePanel::Right => &self.right_panel,
-        }
-    }
-
-    fn panel_mut(&mut self, which: ActivePanel) -> &mut PanelState {
-        match which {
-            ActivePanel::Left => &mut self.left_panel,
-            ActivePanel::Right => &mut self.right_panel,
-        }
-    }
-
-    fn get_active_panel(&self) -> &PanelState {
-        self.panel(self.active_panel.clone())
-    }
-
-    fn get_active_panel_mut(&mut self) -> &mut PanelState {
-        self.panel_mut(self.active_panel.clone())
-    }
-
-    fn select_entry(&mut self, index: usize) {
-        let panel = self.get_active_panel_mut();
-        if index < panel.entries.len() {
-            panel.selected_index = index;
-            // keep cursor visible within the virtual window; only scroll if selection goes out of view
-            let window_rows = compute_window_rows(panel);
-            if panel.selected_index < panel.top_index {
-                panel.top_index = panel.selected_index;
-            } else if panel.selected_index >= panel.top_index + window_rows {
-                panel.top_index = panel.selected_index + 1 - window_rows;
-            }
-            if self.preview.is_some() {
-                self.update_preview_for_current_selection();
-            }
-        } else {
-            log::error!("Unable to select entry at index {}", index);
-        }
-    }
-
-    fn open_selected(&mut self, cx: &mut gpui::Context<Self>) {
-        let active = self.active_panel.clone();
-
-        // Gather needed data without holding immutable borrows across mutations
-        let (selected_entry, current_path, zip_cwd) = {
-            let panel = self.get_active_panel();
-            if panel.entries.is_empty() {
-                return;
-            }
-            let entry = panel.entries[panel.selected_index].clone();
-            let current_path = panel.current_path.clone();
-            let zip_cwd = match &panel.mode {
-                PanelMode::Zip { cwd, .. } => Some(cwd.clone()),
-                _ => None,
-            };
-            (entry, current_path, zip_cwd)
-        };
-
-        // Remember the selection for the current location
-        self.store_current_selection_memory();
-
-        match &selected_entry.location {
-            EntryLocation::Fs(path) => {
-                if selected_entry.is_dir {
-                    let prefer_name = if selected_entry.name == ".." {
-                        current_path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                    } else {
-                        None
-                    };
-
-                    self.load_fs_directory_async(path.clone(), active.clone(), prefer_name, cx);
-
-                    if selected_entry.name != ".." {
-                        if let Some(name) = self.fs_last_selected_name.get(path).cloned() {
-                            self.select_entry_by_name(active, &name);
-                        }
-                    }
-                } else if is_zip_path(path) {
-                    self.load_zip_directory_async(path.clone(), "".to_string(), active, None, cx);
-                }
-            }
-            EntryLocation::Zip {
-                archive_path,
-                inner_path,
-            } => {
-                if selected_entry.is_dir {
-                    let prefer_name = if selected_entry.name == ".." {
-                        zip_cwd.as_ref().and_then(|cwd| {
-                            cwd.trim_end_matches('/')
-                                .rsplit('/')
-                                .next()
-                                .map(|s| s.to_string())
-                        })
-                    } else {
-                        None
-                    };
-
-                    self.load_zip_directory_async(
-                        archive_path.clone(),
-                        inner_path.clone(),
-                        active.clone(),
-                        prefer_name,
-                        cx,
-                    );
-
-                    if selected_entry.name != ".." {
-                        if let Some(name) = self
-                            .zip_last_selected_name
-                            .get(&(archive_path.clone(), inner_path.clone()))
-                            .cloned()
-                        {
-                            self.select_entry_by_name(active, &name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn switch_panel(&mut self) {
-        self.active_panel = match self.active_panel {
-            ActivePanel::Left => ActivePanel::Right,
-            ActivePanel::Right => ActivePanel::Left,
-        };
-    }
-
-    fn store_current_selection_memory(&mut self) {
-        let (fs_key, zip_key, selected_name_opt) = {
-            let panel = self.get_active_panel();
-            if panel.entries.is_empty() {
-                return;
-            }
-            let selected_name = panel.entries[panel.selected_index].name.clone();
-            match &panel.mode {
-                PanelMode::Fs => (Some(panel.current_path.clone()), None, Some(selected_name)),
-                PanelMode::Zip {
-                    archive_path, cwd, ..
-                } => (
-                    None,
-                    Some((archive_path.clone(), cwd.clone())),
-                    Some(selected_name),
-                ),
-            }
-        };
-        if let Some(selected_name) = selected_name_opt {
-            if let Some(path) = fs_key {
-                self.fs_last_selected_name.insert(path, selected_name);
-            } else if let Some((ap, cwd)) = zip_key {
-                self.zip_last_selected_name.insert((ap, cwd), selected_name);
-            }
-        }
-    }
-
-    fn select_entry_by_name(&mut self, which: ActivePanel, name: &str) {
-        let panel = self.panel_mut(which);
-        if let Some(idx) = panel.entries.iter().position(|e| e.name == name) {
-            panel.selected_index = idx;
-        }
-    }
-
-    fn update_preview_for_current_selection(&mut self) {
-        let (is_dir, location) = {
-            let panel = self.get_active_panel();
-            if panel.entries.is_empty() {
-                self.clear_preview();
-                return;
-            }
-            let entry = &panel.entries[panel.selected_index];
-            (entry.is_dir, entry.location.clone())
-        };
-        self.preview_request_id = self.preview_request_id.wrapping_add(1);
-        let request_id = self.preview_request_id;
-        const MAX_BYTES: usize = 64 * 1024;
-        if is_dir {
-            self.preview = Some(PreviewContent::Text(gpui::SharedString::from(
-                format_preview_info(
-                "Directory",
-                &location,
-            ))));
-            return;
-        }
-        match location {
-            EntryLocation::Fs(path) => {
-                if is_image_path(&path) {
-                    self.preview = Some(PreviewContent::Image(Arc::from(path)));
-                    return;
-                }
-                if self.preview.is_none() {
-                    self.preview = Some(PreviewContent::Text(gpui::SharedString::from(
-                        format_preview_info(
-                        "File",
-                        &EntryLocation::Fs(path.clone()),
-                    ))));
-                }
-                let _ = self.preview_tx.send(PreviewRequest::Read {
-                    id: request_id,
-                    location: EntryLocation::Fs(path),
-                    max_bytes: MAX_BYTES,
-                });
-            }
-            EntryLocation::Zip {
-                archive_path,
-                inner_path,
-            } => {
-                if self.preview.is_none() {
-                    self.preview = Some(PreviewContent::Text(gpui::SharedString::from(
-                        format_preview_info(
-                        "File",
-                        &EntryLocation::Zip {
-                            archive_path: archive_path.clone(),
-                            inner_path: inner_path.clone(),
-                        },
-                    ))));
-                }
-                let _ = self.preview_tx.send(PreviewRequest::Read {
-                    id: request_id,
-                    location: EntryLocation::Zip {
-                        archive_path,
-                        inner_path,
-                    },
-                    max_bytes: MAX_BYTES,
-                });
-            }
-        }
-    }
-
-    fn toggle_preview(&mut self) {
-        if self.preview.is_some() {
-            self.clear_preview();
-            return;
-        }
-        self.update_preview_for_current_selection();
-    }
-
-    fn enqueue_copy_selected(&mut self) {
-        let src = {
-            let p = self.get_active_panel();
-            if p.entries.is_empty() {
-                return;
-            }
-            match &p.entries[p.selected_index].location {
-                EntryLocation::Fs(path) => path.clone(),
-                EntryLocation::Zip { .. } => {
-                    // Skip copy for zip-internal entries for now
-                    return;
-                }
-            }
-        };
-
-        let dst_dir = {
-            let other_panel = match self.active_panel {
-                ActivePanel::Left => &self.right_panel,
-                ActivePanel::Right => &self.left_panel,
-            };
-            match &other_panel.mode {
-                PanelMode::Fs => other_panel.current_path.clone(),
-                PanelMode::Zip { .. } => {
-                    // Can't copy into zip for now
-                    return;
-                }
-            }
-        };
-
-        if let Err(e) = self.io_tx.send(IOTask::Copy {
-            src: src.clone(),
-            dst_dir: dst_dir.clone(),
-        }) {
-            eprintln!("Failed to enqueue copy: {e}");
-        } else {
-            log::info!(
-                "Enqueued copy: {} -> {}",
-                src.to_string_lossy(),
-                dst_dir.to_string_lossy()
-            );
-        }
-    }
-    fn switch_theme(&mut self) {
-        // If external themes exist and picker is open, apply selected; otherwise toggle
-        if self.theme.selected_external.is_some() && self.theme_picker_open {
-            self.apply_selected_theme();
-        } else {
-            self.theme.toggle();
-        }
-    }
-
-    fn open_theme_picker(&mut self) {
-        self.theme_picker_open = true;
-        // initialize selection to current external selection or first
-        self.theme_picker_selected = self.theme.selected_external.or(Some(0));
-    }
-
-    fn close_theme_picker(&mut self) {
-        self.theme_picker_open = false;
-    }
-
-    fn select_next_theme(&mut self) {
-        if self.theme.external.is_empty() {
-            return;
-        }
-        let len = self.theme.external.len();
-        let cur = self.theme_picker_selected.unwrap_or(0);
-        self.theme_picker_selected = Some((cur + 1) % len);
-    }
-
-    fn select_prev_theme(&mut self) {
-        if self.theme.external.is_empty() {
-            return;
-        }
-        let len = self.theme.external.len();
-        let cur = self.theme_picker_selected.unwrap_or(0);
-        self.theme_picker_selected = Some((cur + len - 1) % len);
-    }
-
-    fn apply_selected_theme(&mut self) {
-        if let Some(i) = self.theme_picker_selected {
-            if i < self.theme.external.len() {
-                self.theme.selected_external = Some(i);
-            }
-        }
-        self.theme_picker_open = false;
-    }
-
-    fn theme_names(&self) -> Vec<String> {
-        if self.theme.external.is_empty() {
-            vec!["Dark".to_string(), "Light".to_string()]
-        } else {
-            self.theme.external.iter().map(|(n, _)| n.clone()).collect()
-        }
-    }
-
-    fn clear_preview(&mut self) {
-        self.preview = None;
-        self.preview_request_id = self.preview_request_id.wrapping_add(1);
-    }
-
+    let remembered = prefer_name
+        .clone()
+        .or_else(|| app.fs_last_selected_name.get(&path).cloned());
+    let panel_state = app.panel_mut(target_panel);
+    panel_state.current_path = path.clone();
+    panel_state.mode = PanelMode::Fs;
+    panel_state.entries = initial;
+    panel_state.selected_index = 0;
+    panel_state.top_index = 0;
+    panel_state.entries_rx = Some(rx);
+    panel_state.prefer_select_name = remembered;
 }
 
-fn is_zip_path(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
-        Some(ext) if ext == "zip"
-    )
+fn load_zip_directory_async(
+    app: &mut AppState,
+    archive_path: PathBuf,
+    cwd: String,
+    target_panel: ActivePanel,
+    prefer_name: Option<String>,
+) {
+    let mut initial: Vec<DirEntry> = Vec::new();
+    if !cwd.is_empty() {
+        let parent = cwd
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        initial.push(DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            location: EntryLocation::Zip {
+                archive_path: archive_path.clone(),
+                inner_path: parent,
+            },
+        });
+    } else if let Some(parent) = archive_path.parent() {
+        initial.push(DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            location: EntryLocation::Fs(parent.to_path_buf()),
+        });
+    }
+
+    let (tx, rx) = mpsc::channel::<DirBatch>();
+    let ap = archive_path.clone();
+    let cwd_clone = cwd.clone();
+
+    if let Ok(mut all) = read_zip_directory(&ap, &cwd_clone) {
+        if !all.is_empty() && all[0].name == ".." {
+            all.remove(0);
+        }
+        let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
+        if !initial.is_empty() {
+            let _ = tx.send(DirBatch::Append(initial));
+        }
+        thread::spawn(move || {
+            let chunk = 500usize;
+            let mut start = 128.min(all.len());
+            while start < all.len() {
+                let end = (start + chunk).min(all.len());
+                let _ = tx.send(DirBatch::Append(all[start..end].to_vec()));
+                start = end;
+            }
+        });
+    }
+
+    let remembered = prefer_name.clone().or_else(|| {
+        app.zip_last_selected_name
+            .get(&(archive_path.clone(), cwd.clone()))
+            .cloned()
+    });
+    let panel_state = app.panel_mut(target_panel);
+
+    panel_state.current_path = archive_path.clone();
+    panel_state.mode = PanelMode::Zip {
+        archive_path: archive_path.clone(),
+        cwd: cwd.clone(),
+    };
+    panel_state.entries = initial;
+    panel_state.selected_index = 0;
+    panel_state.top_index = 0;
+    panel_state.entries_rx = Some(rx);
+    panel_state.prefer_select_name = remembered;
 }
 
-fn format_preview_info(kind: &str, location: &EntryLocation) -> String {
-    match location {
-        EntryLocation::Fs(path) => format!("{kind}\n{}", path.to_string_lossy()),
+fn open_selected(app: &mut AppState) {
+    let active = app.active_panel.clone();
+
+    let (selected_entry, current_path, zip_cwd) = {
+        let panel = app.get_active_panel();
+        if panel.entries.is_empty() {
+            return;
+        }
+        let entry = panel.entries[panel.selected_index].clone();
+        let current_path = panel.current_path.clone();
+        let zip_cwd = match &panel.mode {
+            PanelMode::Zip { cwd, .. } => Some(cwd.clone()),
+            _ => None,
+        };
+        (entry, current_path, zip_cwd)
+    };
+
+    app.store_current_selection_memory();
+
+    match &selected_entry.location {
+        EntryLocation::Fs(path) => {
+            if selected_entry.is_dir {
+                let prefer_name = if selected_entry.name == ".." {
+                    current_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+                load_fs_directory_async(app, path.clone(), active.clone(), prefer_name);
+
+                if selected_entry.name != ".."
+                    && let Some(name) = app.fs_last_selected_name.get(path).cloned()
+                {
+                    app.select_entry_by_name(active, &name);
+                }
+            } else if is_zip_path(path) {
+                load_zip_directory_async(app, path.clone(), "".to_string(), active, None);
+            }
+        }
         EntryLocation::Zip {
             archive_path,
             inner_path,
         } => {
-            let display = if inner_path.is_empty() {
-                format!("{}::zip:/", archive_path.to_string_lossy())
-            } else {
-                format!(
-                    "{}::zip:/{}",
-                    archive_path.to_string_lossy(),
-                    inner_path
-                )
-            };
-            format!("{kind}\n{display}")
-        }
-    }
-}
+            if selected_entry.is_dir {
+                let prefer_name = if selected_entry.name == ".." {
+                    zip_cwd.as_ref().and_then(|cwd| {
+                        cwd.trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .map(|s| s.to_string())
+                    })
+                } else {
+                    None
+                };
+                load_zip_directory_async(
+                    app,
+                    archive_path.clone(),
+                    inner_path.clone(),
+                    active.clone(),
+                    prefer_name,
+                );
 
-fn is_image_path(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
-        Some(ext) if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp")
-    )
-}
-
-fn is_text_path(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
-        Some(ext)
-            if matches!(
-                ext.as_str(),
-                "txt" | "md" | "json" | "toml" | "yaml" | "yml" | "rs" | "log" | "ini" | "csv"
-            )
-    )
-}
-
-fn read_text_preview(path: &Path, max_bytes: usize) -> anyhow::Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.by_ref().take(max_bytes as u64).read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-fn read_bytes_prefix(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.by_ref().take(max_bytes as u64).read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-fn read_zip_bytes_prefix(
-    archive_path: &Path,
-    inner_path: &str,
-    max_bytes: usize,
-) -> anyhow::Result<Vec<u8>> {
-    let file = fs::File::open(archive_path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let normalized = inner_path.trim_start_matches('/');
-    let mut data = Vec::new();
-    let mut found = None;
-    for i in 0..zip.len() {
-        let name = zip.by_index(i)?.name().to_string();
-        if name == normalized {
-            found = Some(i);
-            break;
-        }
-    }
-    if let Some(idx) = found {
-        let mut zf = zip.by_index(idx)?;
-        zf.by_ref().take(max_bytes as u64).read_to_end(&mut data)?;
-        Ok(data)
-    } else {
-        Err(anyhow::anyhow!(format!(
-            "Entry not found in zip: {}",
-            inner_path
-        )))
-    }
-}
-
-fn hexdump(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut offset = 0usize;
-    for chunk in bytes.chunks(16) {
-        out.push_str(&format!("{:08x}: ", offset));
-        for i in 0..16 {
-            if i < chunk.len() {
-                out.push_str(&format!("{:02x} ", chunk[i]));
-            } else {
-                out.push_str("   ");
-            }
-            if i == 7 {
-                out.push(' ');
-            }
-        }
-        out.push(' ');
-        for &b in chunk {
-            let ch = if (0x20..=0x7e).contains(&b) {
-                b as char
-            } else {
-                '.'
-            };
-            out.push(ch);
-        }
-        out.push('\n');
-        offset += 16;
-    }
-    out
-}
-
-fn is_probably_text(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return true;
-    }
-    // If any NUL bytes, it's likely binary
-    if bytes.iter().any(|&b| b == 0) {
-        return false;
-    }
-    // Count printable bytes plus common whitespace
-    let mut printable = 0usize;
-    for &b in bytes {
-        match b {
-            0x09 | 0x0A | 0x0D => printable += 1, // tab, LF, CR
-            0x20..=0x7E => printable += 1,        // visible ASCII
-            _ => {}
-        }
-    }
-    let ratio = printable as f32 / bytes.len().max(1) as f32;
-    ratio > 0.85
-}
-
-// Views
-struct FileManagerView {
-    model: gpui::Entity<FileSystemModel>,
-    focus_handle: gpui::FocusHandle,
-}
-
-impl gpui::Focusable for FileManagerView {
-    fn focus_handle(&self, _app: &gpui::App) -> gpui::FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl gpui::EventEmitter<gpui::DismissEvent> for FileManagerView {}
-
-impl gpui::Render for FileManagerView {
-    #[profiling::function]
-    fn render(
-        &mut self,
-        _window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> impl IntoElement {
-        gpui::div()
-            .relative()
-            .flex()
-            .flex_row()
-            .size_full()
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .size_full()
-                    .min_w(gpui::px(0.0))
-                    .child(self.render_panel(ActivePanel::Left, cx)),
-            )
-            .child(
-                gpui::div()
-                    .w(gpui::px(2.0))
-                    .bg(self.model.read(cx).theme.colors().divider)
-                    .h_full(),
-            )
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .size_full()
-                    .min_w(gpui::px(0.0))
-                    .child(self.render_panel(ActivePanel::Right, cx)),
-            )
-            .child(self.render_theme_picker(cx))
-            .key_context("parent")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(
-                |this: &mut Self,
-                 event: &gpui::KeyDownEvent,
-                 _window,
-                 cx: &mut gpui::Context<Self>| {
-                    let key = event.keystroke.key.as_str();
-                    let handled = match key {
-                        "tab" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                model.switch_panel();
-                                if model.preview.is_some() {
-                                    model.update_preview_for_current_selection();
-                                }
-                            });
-                            true
-                        }
-                        "enter" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, cx| {
-                                if model.theme_picker_open {
-                                    model.apply_selected_theme();
-                                } else {
-                                    model.open_selected(cx);
-                                }
-                            });
-                            true
-                        }
-                        "down" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                if model.theme_picker_open {
-                                    model.select_next_theme();
-                                } else {
-                                    let panel = model.get_active_panel();
-                                    if panel.selected_index + 1 < panel.entries.len() {
-                                        model.select_entry(panel.selected_index + 1);
-                                    }
-                                }
-                            });
-                            true
-                        }
-                        "up" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                if model.theme_picker_open {
-                                    model.select_prev_theme();
-                                } else {
-                                    let panel = model.get_active_panel();
-                                    if panel.selected_index > 0 {
-                                        model.select_entry(panel.selected_index - 1);
-                                    }
-                                }
-                            });
-                            true
-                        }
-                        "f3" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                model.toggle_preview();
-                            });
-                            true
-                        }
-                        "escape" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                if model.theme_picker_open {
-                                    model.close_theme_picker();
-                                } else {
-                                    model.clear_preview();
-                                }
-                            });
-                            true
-                        }
-                        "f5" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                model.enqueue_copy_selected();
-                            });
-                            true
-                        }
-                        "f9" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                model.switch_theme();
-                            });
-                            true
-                        }
-                        "f10" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                model.open_theme_picker();
-                            });
-                            true
-                        }
-                        "pageup" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                let panel = model.get_active_panel();
-                                let rows = compute_window_rows(panel);
-                                let new_index = panel.selected_index.saturating_sub(rows);
-                                model.select_entry(new_index);
-                            });
-                            true
-                        }
-                        "pagedown" => {
-                            this.model.update(cx, |model: &mut FileSystemModel, _| {
-                                let panel = model.get_active_panel();
-                                let len = panel.entries.len();
-                                let rows = compute_window_rows(panel);
-                                let mut new_index = panel.selected_index.saturating_add(rows);
-                                if len > 0 && new_index >= len {
-                                    new_index = len - 1;
-                                }
-                                model.select_entry(new_index);
-                            });
-                            true
-                        }
-                        _ => false,
-                    };
-
-                    if handled {
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                },
-            ))
-    }
-}
-
-impl FileManagerView {
-    #[profiling::function]
-    fn render_panel(
-        &self,
-        panel_side: ActivePanel,
-        cx: &mut gpui::Context<Self>,
-    ) -> impl IntoElement {
-        // pump async directory results to keep UI responsive
-        self.model.update(cx, |m: &mut FileSystemModel, cx| {
-        let panel = m.panel_mut(panel_side.clone());
-        if let Some(rx) = panel.entries_rx.take() {
-            match rx.try_recv() {
-                Ok(batch) => {
-                        let is_replace = matches!(batch, DirBatch::Replace(_));
-                        let prior_selection = if panel.entries.is_empty() {
-                            None
-                        } else {
-                            Some(panel.entries[panel.selected_index].name.clone())
-                        };
-                        let start_len = panel.entries.len();
-                        match batch {
-                            DirBatch::Append(mut new_entries) => {
-                                panel.entries.append(&mut new_entries);
-                            }
-                            DirBatch::Replace(new_entries) => {
-                                panel.entries = new_entries;
-                                panel.selected_index = 0;
-                                panel.top_index = 0;
-                            }
-                        }
-                        let restore_name =
-                            panel.prefer_select_name.take().or(prior_selection);
-                        if let Some(pref) = restore_name {
-                            if let Some(idx) = panel.entries.iter().position(|e| e.name == pref) {
-                                panel.selected_index = idx;
-                                // adjust top to keep in view
-                                let window_rows = compute_window_rows(panel);
-                                if panel.selected_index < panel.top_index {
-                                    panel.top_index = panel.selected_index;
-                                } else if panel.selected_index >= panel.top_index + window_rows {
-                                    panel.top_index = panel.selected_index + 1 - window_rows;
-                                }
-                            }
-                        }
-                        // trigger another frame if we added anything
-                        if panel.entries.len() != start_len || is_replace {
-                            cx.notify();
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        panel.entries_rx = Some(rx);
-                        cx.notify();
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => { /* done */ }
-            }
-        }
-        match m.preview_rx.try_recv() {
-            Ok((id, content)) => {
-                if id == m.preview_request_id {
-                    m.preview = Some(content);
-                    cx.notify();
+                if selected_entry.name != ".."
+                    && let Some(name) = app
+                        .zip_last_selected_name
+                        .get(&(archive_path.clone(), inner_path.clone()))
+                        .cloned()
+                {
+                    app.select_entry_by_name(active, &name);
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {}
         }
-    });
+    }
+}
 
-    self.model.update(cx, |m: &mut FileSystemModel, cx2| {
-            let p = m.panel_mut(panel_side.clone());
-            let window_rows = compute_window_rows(p);
-            // only adjust top_index when selection would go out of the visible window
-            if p.selected_index < p.top_index {
-                p.top_index = p.selected_index;
-            } else if p.selected_index >= p.top_index + window_rows {
-                p.top_index = p.selected_index + 1 - window_rows;
+fn window_rows_for(panel_height: f32, spacing: f32) -> usize {
+    let row = ROW_HEIGHT + spacing;
+    if panel_height <= 0.0 || row <= 0.0 {
+        return 10;
+    }
+    ((panel_height / row).floor() as usize).max(1)
+}
+
+fn active_window_rows(app: &AppState, cache: &UiCache) -> usize {
+    match app.active_panel {
+        ActivePanel::Left => cache.left_rows,
+        ActivePanel::Right => cache.right_rows,
+    }
+}
+
+fn handle_keyboard(input: &egui::InputState, app: &mut AppState, cache: &UiCache) {
+    let window_rows = active_window_rows(app, cache);
+    if input.key_pressed(egui::Key::Tab) {
+        app.switch_panel();
+        if app.preview.is_some() {
+            app.update_preview_for_current_selection();
+        }
+    }
+    if input.key_pressed(egui::Key::Enter) {
+        if app.theme_picker_open {
+            app.apply_selected_theme();
+        } else {
+            open_selected(app);
+        }
+    }
+    if input.key_pressed(egui::Key::ArrowDown) {
+        if app.theme_picker_open {
+            app.select_next_theme();
+        } else {
+            let panel = app.get_active_panel();
+            if panel.selected_index + 1 < panel.entries.len() {
+                app.select_entry(panel.selected_index + 1, window_rows);
             }
-            // Clamp top_index within valid range considering small lists
-            let visible = window_rows.max(1);
-            let max_top = p.entries.len().saturating_sub(visible);
-            if p.top_index > max_top {
-                p.top_index = max_top;
+        }
+    }
+    if input.key_pressed(egui::Key::ArrowUp) {
+        if app.theme_picker_open {
+            app.select_prev_theme();
+        } else {
+            let panel = app.get_active_panel();
+            if panel.selected_index > 0 {
+                app.select_entry(panel.selected_index - 1, window_rows);
             }
-            // Ensure selection remains within range (avoid locking cursor)
-            if !p.entries.is_empty() && p.selected_index >= p.entries.len() {
-                p.selected_index = p.entries.len() - 1;
-            }
-            // Keep pumping async RX to ensure view populates without user interaction
-            if let Some(rx) = p.entries_rx.take() {
-                match rx.try_recv() {
-                    Ok(batch) => {
-                        let is_replace = matches!(batch, DirBatch::Replace(_));
-                        let prior_selection = if p.entries.is_empty() {
-                            None
-                        } else {
-                            Some(p.entries[p.selected_index].name.clone())
-                        };
-                        let start_len = p.entries.len();
-                        match batch {
-                            DirBatch::Append(mut new_entries) => {
-                                p.entries.append(&mut new_entries);
-                            }
-                            DirBatch::Replace(new_entries) => {
-                                p.entries = new_entries;
-                                p.selected_index = 0;
-                                p.top_index = 0;
-                            }
+        }
+    }
+    if input.key_pressed(egui::Key::PageUp) {
+        let panel = app.get_active_panel();
+        let new_index = panel.selected_index.saturating_sub(window_rows);
+        app.select_entry(new_index, window_rows);
+    }
+    if input.key_pressed(egui::Key::PageDown) {
+        let panel = app.get_active_panel();
+        let len = panel.entries.len();
+        let mut new_index = panel.selected_index.saturating_add(window_rows);
+        if len > 0 && new_index >= len {
+            new_index = len - 1;
+        }
+        app.select_entry(new_index, window_rows);
+    }
+    if input.key_pressed(egui::Key::F3) {
+        app.toggle_preview();
+    }
+    if input.key_pressed(egui::Key::Escape) {
+        if app.theme_picker_open {
+            app.close_theme_picker();
+        } else {
+            app.clear_preview();
+        }
+    }
+    if input.key_pressed(egui::Key::F5) {
+        app.enqueue_copy_selected();
+    }
+    if input.key_pressed(egui::Key::F9) {
+        app.switch_theme();
+    }
+    if input.key_pressed(egui::Key::F10) {
+        app.open_theme_picker();
+    }
+}
+
+fn draw_preview(
+    ui: &mut egui::Ui,
+    app: &AppState,
+    image_cache: &mut ImageCache,
+    image_req_tx: &mpsc::Sender<ImageRequest>,
+) {
+    let colors = app.theme.colors();
+    let header_bg = color32(colors.preview_header_bg);
+    let header_fg = color32(colors.preview_header_fg);
+    let text_color = color32(colors.preview_text);
+
+    egui::Frame::NONE
+        .fill(color32(colors.preview_bg))
+        .show(ui, |ui| {
+            egui::Frame::NONE.fill(header_bg).show(ui, |ui| {
+                ui.colored_label(header_fg, "Preview (F3/Esc to close)");
+            });
+            ui.add_space(4.0);
+
+            egui::ScrollArea::vertical().show(ui, |ui| match app.preview.as_ref() {
+                Some(PreviewContent::Text(text)) => {
+                    ui.colored_label(text_color, text);
+                }
+                Some(PreviewContent::Image(path)) => {
+                    let key = path.to_path_buf();
+                    if let Some(handle) = image_cache.textures.get(&key).cloned() {
+                        touch_image(image_cache, &key);
+                        let sized = egui::load::SizedTexture::from_handle(&handle);
+                        let available = ui.available_size();
+                        let tex = sized.size;
+                        let scale = (available.x / tex.x)
+                            .min(available.y / tex.y)
+                            .clamp(0.01, 1.0);
+                        let size = egui::Vec2::new(tex.x * scale, tex.y * scale);
+                        ui.add(egui::Image::new(sized).fit_to_exact_size(size));
+                    } else {
+                        if image_cache.pending.insert(key.clone()) {
+                            let _ = image_req_tx.send(ImageRequest { path: key.clone() });
                         }
-                        let restore_name = p.prefer_select_name.take().or(prior_selection);
-                        if let Some(pref) = restore_name {
-                            if let Some(idx) = p.entries.iter().position(|e| e.name == pref) {
-                                p.selected_index = idx;
-                            }
-                        }
-                        if p.entries.len() != start_len || is_replace {
-                            cx2.notify();
-                        }
-                        p.entries_rx = Some(rx);
+                        ui.colored_label(
+                            text_color,
+                            format!("Loading image...\n{}", key.to_string_lossy()),
+                        );
                     }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        p.entries_rx = Some(rx);
-                        cx2.notify();
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => { /* done */ }
+                }
+                None => {}
+            });
+        });
+}
+
+fn draw_theme_picker(ctx: &egui::Context, app: &mut AppState) {
+    let names = app.theme_names();
+    let selected = app.theme_picker_selected.unwrap_or(0);
+
+    egui::Window::new("Themes")
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            for (i, name) in names.iter().enumerate() {
+                let is_selected = i == selected;
+                let text = if is_selected {
+                    egui::RichText::new(name).strong()
+                } else {
+                    egui::RichText::new(name)
+                };
+                if ui.selectable_label(is_selected, text).clicked() {
+                    app.theme_picker_selected = Some(i);
                 }
             }
         });
-        let model = self.model.read(cx);
-        let colors = model.theme.colors();
-        let panel = match panel_side {
-            ActivePanel::Left => &model.left_panel,
-            ActivePanel::Right => &model.right_panel,
-        };
-        let is_active = model.active_panel == panel_side;
-        let target_is_left = matches!(panel_side, ActivePanel::Left);
-        let visible_cap: usize = 2000;
-        let total_items = panel.entries.len();
+}
 
-        let path_display = match &panel.mode {
-            PanelMode::Fs => panel.current_path.to_string_lossy().into_owned(),
-            PanelMode::Zip { archive_path, cwd } => {
-                if cwd.is_empty() {
-                    format!("{}::zip:/", archive_path.to_string_lossy())
-                } else {
-                    format!("{}::zip:/{}", archive_path.to_string_lossy(), cwd)
-                }
-            }
-        };
+fn draw_panel(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    panel_side: ActivePanel,
+    image_cache: &mut ImageCache,
+    image_req_tx: &mpsc::Sender<ImageRequest>,
+) -> usize {
+    let colors = app.theme.colors();
+    let is_active = app.active_panel == panel_side;
 
-        let mut file_list = gpui::div()
-            .flex_1()
-            .p_2()
-            .h_full()
-            .w_full()
-            .min_w(gpui::px(0.0))
-            .children(
-                panel
-                    .entries
-                    .iter()
-                    .skip(panel.top_index.min(panel.entries.len().saturating_sub(1)))
-                    .take({
-                        let start = panel.top_index.min(panel.entries.len().saturating_sub(1));
-                        let remain = panel.entries.len().saturating_sub(start);
-                        remain.min(visible_cap).max(1)
-                    })
-                    .enumerate()
-                    .map(|(index, entry)| {
-                        let real_index = panel.top_index + index;
-                        let is_selected = panel.selected_index == real_index;
-                        let is_directory = entry.is_dir;
+    let panel = app.panel(panel_side.clone());
+    let entries_len = panel.entries.len();
+    let selected_index = panel.selected_index;
+    let header_text = format!(
+        "{}    {}/{}",
+        panel_path_display(panel),
+        if entries_len == 0 {
+            0
+        } else {
+            selected_index + 1
+        },
+        entries_len
+    );
 
-                        gpui::div()
-                    .py_1()
-                    .px_2()
-                    .h(gpui::px(24.0)).min_w(gpui::px(0.0))
-                    .w_full()
-                    .bg(if is_selected {
-                        if is_active {
-                            colors.row_bg_selected_active
-                        } else {
-                            colors.row_bg_selected_inactive
-                        }
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .text_color(
-                        if is_selected {
-                            colors.row_fg_selected
-                        } else if is_active {
-                            colors.row_fg_active
-                        } else {
-                            colors.row_fg_inactive
-                        }
-                    )
-                    .font_weight(if is_directory {
-                        gpui::FontWeight::BOLD
-                    } else {
-                        gpui::FontWeight::NORMAL
-                    })
-                    .child(format!(
-                        "{}{}",
-                        if is_directory { "📁 " } else { "📄 " },
-                        entry.name
-                    ))
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(
-                            move |this: &mut Self,
-                                  event: &gpui::MouseDownEvent,
-                                  _window,
-                                  cx: &mut gpui::Context<Self>| {
-                                if !is_active {
-                                    this.model.update(cx, |m: &mut FileSystemModel, _| {
-                                        m.active_panel = if target_is_left {
-                                            ActivePanel::Left
-                                        } else {
-                                            ActivePanel::Right
-                                        };
-                                    });
-                                }
+    let mut rows = 10usize;
+    let mut clicked_index: Option<usize> = None;
+    let mut open_on_double_click = false;
+    let mut new_top_index: Option<usize> = None;
+    let panel_side_for_closure = panel_side.clone();
 
-                                this.model.update(cx, move |m: &mut FileSystemModel, cx| {
-                                    m.select_entry(real_index);
-                                    if event.click_count > 1 {
-                                        m.open_selected(cx);
-                                    }
-                                });
-                                cx.notify();
-                            },
-                        ),
-                    )
-                    }),
-            );
-        file_list = file_list.on_scroll_wheel(cx.listener(
-            move |this: &mut Self,
-                  event: &gpui::ScrollWheelEvent,
-                  _window,
-                  cx: &mut gpui::Context<Self>| {
-                let rows: isize = match event.delta {
-                    gpui::ScrollDelta::Lines(pt) => {
-                        if pt.y > 0.0 {
-                            3
-                        } else if pt.y < 0.0 {
-                            -3
-                        } else {
-                            0
-                        }
-                    }
-                    gpui::ScrollDelta::Pixels(pt) => {
-                        if pt.y > gpui::px(0.0) {
-                            3
-                        } else if pt.y < gpui::px(0.0) {
-                            -3
-                        } else {
-                            0
-                        }
-                    }
-                };
-                this.model.update(cx, |m: &mut FileSystemModel, _| {
-                    let p = m.panel_mut(if target_is_left {
-                        ActivePanel::Left
-                    } else {
-                        ActivePanel::Right
-                    });
-                    let window_rows = compute_window_rows(p);
-                    if rows > 0 {
-                        p.top_index = p.top_index.saturating_add(rows as usize);
-                    } else {
-                        p.top_index = p.top_index.saturating_sub((-rows) as usize);
-                    }
-                    let max_top = p.entries.len().saturating_sub(window_rows.max(1));
-                    if p.top_index > max_top {
-                        p.top_index = max_top;
-                    }
-                    // do not change selection here; only adjust top_index via wheel
-                    // selection visibility is enforced when moving the cursor or rendering
-                });
-                cx.notify();
-                cx.stop_propagation();
-            },
-        ));
-        file_list.style().overflow = gpui::PointRefinement {
-            x: Some(gpui::Overflow::Hidden),
-            y: Some(gpui::Overflow::Scroll),
-        };
-        file_list.style().scrollbar_width = Some(gpui::px(30.0).into());
-        if total_items > visible_cap {
-            file_list = file_list.child(
-                gpui::div()
-                    .py_1()
-                    .px_2()
-                    .w_full()
-                    .bg(colors.footer_bg)
-                    .text_color(colors.footer_fg)
-                    .child(format!("Showing {} of {} items", visible_cap, total_items)),
-            );
-        }
-
-        gpui::div()
-            .flex()
-            .flex_col()
-            .relative()
-            .size_full()
-            .min_w(gpui::px(0.0))
-            .border_1()
-            .border_color(if is_active {
+    egui::Frame::NONE
+        .stroke(egui::Stroke::new(
+            1.0,
+            color32(if is_active {
                 colors.panel_border_active
             } else {
                 colors.panel_border_inactive
-            })
-            .child(
-                // Path header
-                gpui::div()
-                    .p_2()
-                    .bg(colors.header_bg)
-                    .text_color(colors.header_fg)
-                    .w_full()
-                    .w_full()
-                    .min_w(gpui::px(0.0))
-                    .child(format!(
-                        "{}    {}/{}",
-                        path_display,
-                        if panel.entries.is_empty() {
-                            0
-                        } else {
-                            panel.selected_index + 1
-                        },
-                        panel.entries.len()
-                    )),
-            )
-            .child({
-                if !is_active {
-                    let model = self.model.read(cx);
+            }),
+        ))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                egui::Frame::NONE
+                    .fill(color32(colors.header_bg))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if is_active {
+                                ui.colored_label(color32(colors.header_fg), "●");
+                            }
+                            ui.colored_label(color32(colors.header_fg), header_text);
+                        });
+                    });
 
-                    if model.preview.is_some() {
-                        self.render_preview(&model).into_any_element()
-                    } else {
-                        file_list
-                            .id("list")
-                            .track_scroll(&panel.scroll)
-                            .into_any_element()
-                    }
+                let preview_open = app.preview.is_some() && !is_active;
+                if preview_open {
+                    draw_preview(ui, app, image_cache, image_req_tx);
+                    rows = window_rows_for(ui.available_height(), ui.spacing().item_spacing.y);
+                    return;
+                }
+
+                let list_height = (ui.available_height() - 24.0).max(0.0);
+                rows = window_rows_for(list_height, ui.spacing().item_spacing.y);
+                let mut visible_range = 0..0;
+
+                egui::ScrollArea::vertical()
+                    .id_salt(match panel_side_for_closure {
+                        ActivePanel::Left => "left_list",
+                        ActivePanel::Right => "right_list",
+                    })
+                    .show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
+                        visible_range = row_range.clone();
+                        for idx in row_range {
+                            let entry = &panel.entries[idx];
+                            let is_selected = selected_index == idx;
+                            let bg = if is_selected {
+                                if is_active {
+                                    colors.row_bg_selected_active
+                                } else {
+                                    colors.row_bg_selected_inactive
+                                }
+                            } else {
+                                Color::rgba(0.0, 0.0, 0.0, 0.0)
+                            };
+                            let fg = if is_selected {
+                                colors.row_fg_selected
+                            } else if is_active {
+                                colors.row_fg_active
+                            } else {
+                                colors.row_fg_inactive
+                            };
+                            let prefix = if entry.is_dir { "d " } else { "f " };
+                            let label = format!("{prefix}{}", entry.name);
+                            let mut text = egui::RichText::new(label).color(color32(fg));
+                            if entry.is_dir {
+                                text = text.strong();
+                            }
+
+                            let response = egui::Frame::NONE
+                                .fill(color32(bg))
+                                .show(ui, |ui| {
+                                    ui.add_sized(
+                                        [ui.available_width(), ROW_HEIGHT],
+                                        egui::Label::new(text).sense(egui::Sense::click()),
+                                    )
+                                })
+                                .inner;
+
+                            if is_selected && is_active {
+                                ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
+                            }
+                            if response.clicked() {
+                                clicked_index = Some(idx);
+                            }
+                            if response.double_clicked() {
+                                clicked_index = Some(idx);
+                                open_on_double_click = true;
+                            }
+                        }
+                    });
+
+                if entries_len > 0 {
+                    new_top_index = Some(visible_range.start.min(entries_len - 1));
                 } else {
-                    file_list
-                        .id("list")
-                        .track_scroll(&panel.scroll)
-                        .into_any_element()
+                    new_top_index = Some(0);
                 }
-            })
+
+                let selected_label = panel
+                    .entries
+                    .get(selected_index)
+                    .map(|e| e.name.as_str())
+                    .unwrap_or("-");
+                let footer_text = format!("items: {entries_len} | selected: {selected_label}");
+
+                egui::Frame::NONE
+                    .fill(color32(colors.footer_bg))
+                    .show(ui, |ui| {
+                        ui.colored_label(color32(colors.footer_fg), footer_text);
+                    });
+            });
+        });
+
+    if let Some(top) = new_top_index {
+        app.panel_mut(panel_side.clone()).top_index = top;
     }
 
-    fn render_preview(&self, model: &FileSystemModel) -> impl IntoElement {
-        if let Some(preview) = &model.preview {
-            let content = match preview {
-                PreviewContent::Text(text) => {
-                    let mut area = gpui::div()
-                        .p_2()
-                        .w_full()
-                        .h_full()
-                        .text_color(model.theme.colors().preview_text)
-                        .child(text.clone());
-                    area.style().overflow = gpui::PointRefinement {
-                        x: Some(gpui::Overflow::Hidden),
-                        y: Some(gpui::Overflow::Scroll),
-                    };
-                    area.style().scrollbar_width = Some(gpui::px(30.0).into());
-                    gpui::div().flex_1().p_2().child(area)
-                }
-                PreviewContent::Image(path) => {
-                    let mut area = gpui::div()
-                        .p_2()
-                        .w_full()
-                        .h_full()
-                        .child(gpui::img(path.clone()).w_full().h_full());
-                    area.style().overflow = gpui::PointRefinement {
-                        x: Some(gpui::Overflow::Hidden),
-                        y: Some(gpui::Overflow::Scroll),
-                    };
-                    area.style().scrollbar_width = Some(gpui::px(30.0).into());
-                    gpui::div().flex_1().p_2().child(area)
-                }
-            };
-
-            gpui::div()
-                .flex()
-                .flex_col()
-                .w_full()
-                .h_full()
-                .min_w(gpui::px(0.0))
-                .bg(model.theme.colors().preview_bg)
-                .child(
-                    gpui::div()
-                        .p_2()
-                        .bg(model.theme.colors().preview_header_bg)
-                        .text_color(model.theme.colors().preview_header_fg)
-                        .child("Preview (F3 to close, Esc to close)"),
-                )
-                .child(content)
-        } else {
-            // zero-width placeholder to keep layout simple
-            gpui::div().w(gpui::px(0.0)).h_full()
+    if let Some(idx) = clicked_index {
+        app.active_panel = panel_side;
+        app.select_entry(idx, rows);
+        if open_on_double_click {
+            open_selected(app);
         }
     }
 
-    fn render_theme_picker(&self, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let model = self.model.read(cx);
-        if !model.theme_picker_open {
-            return gpui::div().w(gpui::px(0.0)).h(gpui::px(0.0)).into_any_element();
+    rows
+}
+
+struct Runtime {
+    window: Window,
+    window_id: WindowId,
+    context: Context,
+    surface: blade_graphics::Surface,
+    surface_config: SurfaceConfig,
+    surface_info: blade_graphics::SurfaceInfo,
+    command_encoder: blade_graphics::CommandEncoder,
+    last_sync: Option<blade_graphics::SyncPoint>,
+    egui_ctx: egui::Context,
+    egui_state: EguiWinitState,
+    painter: GuiPainter,
+    size: winit::dpi::PhysicalSize<u32>,
+    app: AppState,
+    ui_cache: UiCache,
+    image_cache: ImageCache,
+    image_req_tx: mpsc::Sender<ImageRequest>,
+    image_res_rx: mpsc::Receiver<ImageResult>,
+}
+
+impl Runtime {
+    fn shutdown(&mut self) {
+        self.image_cache.textures.clear();
+        self.image_cache.order.clear();
+        self.image_cache.pending.clear();
+        if let Some(sync) = self.last_sync.take() {
+            self.context.wait_for(&sync, !0);
         }
-        let names = model.theme_names();
-        let selected = model.theme_picker_selected.unwrap_or(0);
-        let colors = model.theme.colors();
-
-        let list = gpui::div()
-            .flex()
-            .flex_col()
-            .w(gpui::px(480.0))
-            .max_h(gpui::px(400.0))
-            .bg(colors.preview_bg)
-            .border_1()
-            .border_color(colors.panel_border_active)
-            .rounded(gpui::px(6.0))
-            .shadow_lg()
-            .children(
-                names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let is_sel = i == selected;
-                        gpui::div()
-                            .px_3()
-                            .py_2()
-                            .bg(if is_sel { colors.row_bg_selected_active } else { gpui::transparent_black() })
-                            .text_color(if is_sel { colors.row_fg_selected } else { colors.row_fg_active })
-                            .child(name.clone())
-                    }),
-            );
-
-        gpui::div()
-            .absolute()
-            .top(gpui::px(0.0))
-            .left(gpui::px(0.0))
-            .right(gpui::px(0.0))
-            .bottom(gpui::px(0.0))
-            .bg(gpui::Hsla::from(gpui::Rgba {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.35,
-            }))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(list)
-            .into_any_element()
+        self.context
+            .destroy_command_encoder(&mut self.command_encoder);
+        self.painter.destroy(&self.context);
+        self.context.destroy_surface(&mut self.surface);
     }
 }
 
-fn compute_window_rows(panel: &PanelState) -> usize {
-    // Measure viewport height via ScrollHandle bounds; if height is zero (not laid out yet),
-    // fall back to a conservative default to avoid premature scrolling.
-    let bounds = panel.scroll.bounds();
-    let height: f32 = bounds.size.height.into();
-    let row_px: f32 = 24.0; // row height as set on each entry div
+struct App {
+    runtime: Option<Runtime>,
+}
 
-    if height <= 0.0 || row_px <= 0.0 {
-        // Fallback: assume a small, safe number of rows to keep selection logic stable
-        return 10;
+impl App {
+    fn new() -> Self {
+        Self { runtime: None }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.runtime.is_some() {
+            return;
+        }
+
+        let window = event_loop
+            .create_window(WindowAttributes::default().with_title("Fileman (egui)"))
+            .expect("create window");
+        let window_id = window.id();
+
+        let context = unsafe {
+            match Context::init(ContextDesc {
+                presentation: true,
+                validation: cfg!(debug_assertions),
+                timing: false,
+                capture: false,
+                overlay: true,
+                device_id: 0,
+            }) {
+                Ok(context) => context,
+                Err(err) => {
+                    eprintln!("Failed to init GPU context: {err:?}");
+                    eprintln!("{}", surface_error_help());
+                    event_loop.exit();
+                    return;
+                }
+            }
+        };
+        let size = window.inner_size();
+        let surface_config = SurfaceConfig {
+            size: Extent {
+                width: size.width.max(1),
+                height: size.height.max(1),
+                depth: 1,
+            },
+            usage: TextureUsage::TARGET,
+            ..SurfaceConfig::default()
+        };
+        let surface = match context.create_surface_configured(&window, surface_config) {
+            Ok(surface) => surface,
+            Err(err) => {
+                eprintln!("Failed to create GPU surface: {err:?}");
+                eprintln!("{}", surface_error_help());
+                event_loop.exit();
+                return;
+            }
+        };
+        let surface_info = surface.info();
+
+        let egui_ctx = egui::Context::default();
+        let egui_state = EguiWinitState::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+
+        let painter = GuiPainter::new(surface_info, &context);
+        let command_encoder = context.create_command_encoder(CommandEncoderDesc {
+            name: "egui",
+            buffer_count: 1,
+        });
+
+        let cur_dir = std::env::current_dir().expect("current_dir");
+        let io_tx = start_io_worker();
+        let (preview_tx, preview_rx) = start_preview_worker();
+        let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
+        let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResult>();
+
+        thread::spawn(move || {
+            while let Ok(req) = image_req_rx.recv() {
+                if let Ok(img) = image::open(&req.path) {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let result = ImageResult {
+                        path: req.path,
+                        image: egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+                    };
+                    let _ = image_res_tx.send(result);
+                }
+            }
+        });
+
+        let mut app = AppState {
+            left_panel: PanelState {
+                current_path: cur_dir.clone(),
+                mode: PanelMode::Fs,
+                selected_index: 0,
+                entries: Vec::new(),
+                entries_rx: None,
+                prefer_select_name: None,
+                top_index: 0,
+            },
+            right_panel: PanelState {
+                current_path: cur_dir.clone(),
+                mode: PanelMode::Fs,
+                selected_index: 0,
+                entries: Vec::new(),
+                entries_rx: None,
+                prefer_select_name: None,
+                top_index: 0,
+            },
+            active_panel: ActivePanel::Left,
+            preview: None,
+            preview_tx: preview_tx.clone(),
+            preview_rx,
+            preview_request_id: 0,
+            io_tx,
+            fs_last_selected_name: Default::default(),
+            zip_last_selected_name: Default::default(),
+            theme: Theme::dark(),
+            theme_picker_open: false,
+            theme_picker_selected: None,
+        };
+
+        app.theme
+            .load_external_from_dir(std::path::Path::new("./themes"));
+        load_fs_directory_async(&mut app, cur_dir.clone(), ActivePanel::Left, None);
+        load_fs_directory_async(&mut app, cur_dir, ActivePanel::Right, None);
+
+        let ui_cache = UiCache {
+            left_rows: 10,
+            right_rows: 10,
+        };
+        let image_cache = ImageCache {
+            textures: HashMap::new(),
+            pending: HashSet::new(),
+            order: VecDeque::new(),
+        };
+
+        self.runtime = Some(Runtime {
+            window,
+            window_id,
+            context,
+            surface,
+            surface_config,
+            surface_info,
+            command_encoder,
+            last_sync: None,
+            egui_ctx,
+            egui_state,
+            painter,
+            size,
+            app,
+            ui_cache,
+            image_cache,
+            image_req_tx,
+            image_res_rx,
+        });
     }
 
-    let rows = (height / row_px).floor() as usize;
-    rows.max(1)
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let runtime = match self.runtime.as_mut() {
+            Some(runtime) if runtime.window_id == window_id => runtime,
+            _ => return,
+        };
+
+        if runtime
+            .egui_state
+            .on_window_event(&runtime.window, &event)
+            .consumed
+        {
+            return;
+        }
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(new_size) => {
+                runtime.size = new_size;
+                runtime.surface_config.size = Extent {
+                    width: runtime.size.width.max(1),
+                    height: runtime.size.height.max(1),
+                    depth: 1,
+                };
+                runtime
+                    .context
+                    .reconfigure_surface(&mut runtime.surface, runtime.surface_config);
+            }
+            WindowEvent::RedrawRequested => {
+                pump_async(&mut runtime.app);
+                let mut decoded_images = Vec::new();
+                while decoded_images.len() < MAX_IMAGE_UPLOADS_PER_FRAME {
+                    match runtime.image_res_rx.try_recv() {
+                        Ok(img) => decoded_images.push(img),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+
+                let raw_input = runtime.egui_state.take_egui_input(&runtime.window);
+                let output = runtime.egui_ctx.run(raw_input, |ctx| {
+                    apply_theme(ctx, &runtime.app.theme.colors());
+                    let input = ctx.input(|i| i.clone());
+                    handle_keyboard(&input, &mut runtime.app, &runtime.ui_cache);
+
+                    for decoded in decoded_images.drain(..) {
+                        let handle = ctx.load_texture(
+                            format!("preview:{}", decoded.path.to_string_lossy()),
+                            decoded.image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        if !runtime.image_cache.textures.contains_key(&decoded.path) {
+                            runtime.image_cache.order.push_back(decoded.path.clone());
+                        }
+                        runtime
+                            .image_cache
+                            .textures
+                            .insert(decoded.path.clone(), handle);
+                        runtime.image_cache.pending.remove(&decoded.path);
+                        while runtime.image_cache.order.len() > MAX_IMAGE_TEXTURES {
+                            if let Some(old) = runtime.image_cache.order.pop_front()
+                                && old != decoded.path
+                            {
+                                runtime.image_cache.textures.remove(&old);
+                            }
+                        }
+                    }
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            runtime.ui_cache.left_rows = draw_panel(
+                                ui,
+                                &mut runtime.app,
+                                ActivePanel::Left,
+                                &mut runtime.image_cache,
+                                &runtime.image_req_tx,
+                            );
+                            ui.separator();
+                            runtime.ui_cache.right_rows = draw_panel(
+                                ui,
+                                &mut runtime.app,
+                                ActivePanel::Right,
+                                &mut runtime.image_cache,
+                                &runtime.image_req_tx,
+                            );
+                        });
+                    });
+
+                    if runtime.app.theme_picker_open {
+                        draw_theme_picker(ctx, &mut runtime.app);
+                    }
+                });
+                runtime
+                    .egui_state
+                    .handle_platform_output(&runtime.window, output.platform_output);
+
+                let paint_jobs = runtime
+                    .egui_ctx
+                    .tessellate(output.shapes, output.pixels_per_point);
+                let screen_descriptor = ScreenDescriptor {
+                    physical_size: (runtime.size.width, runtime.size.height),
+                    scale_factor: runtime.window.scale_factor() as f32,
+                };
+
+                runtime.command_encoder.start();
+                runtime.painter.update_textures(
+                    &mut runtime.command_encoder,
+                    &output.textures_delta,
+                    &runtime.context,
+                );
+
+                let frame = runtime.surface.acquire_frame();
+                let view = runtime.context.create_texture_view(
+                    frame.texture(),
+                    TextureViewDesc {
+                        name: "surface",
+                        format: runtime.surface_info.format,
+                        dimension: ViewDimension::D2,
+                        subresources: &TextureSubresources::default(),
+                    },
+                );
+
+                let mut render = runtime.command_encoder.render(
+                    "egui",
+                    RenderTargetSet {
+                        colors: &[RenderTarget {
+                            view,
+                            init_op: InitOp::Clear(TextureColor::TransparentBlack),
+                            finish_op: FinishOp::Store,
+                        }],
+                        depth_stencil: None,
+                    },
+                );
+                runtime.painter.paint(
+                    &mut render,
+                    &paint_jobs,
+                    &screen_descriptor,
+                    &runtime.context,
+                );
+                drop(render);
+
+                runtime.command_encoder.present(frame);
+                let sync = runtime.context.submit(&mut runtime.command_encoder);
+                runtime.last_sync = Some(sync.clone());
+                runtime.painter.after_submit(&sync);
+                runtime.context.destroy_texture_view(view);
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.window.request_redraw();
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(mut runtime) = self.runtime.take() {
+            runtime.shutdown();
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+
+    let event_loop = EventLoop::new()?;
+    let mut app = App::new();
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(())
 }
