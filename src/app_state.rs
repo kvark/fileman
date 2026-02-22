@@ -240,6 +240,74 @@ impl AppState {
         }
     }
 
+    pub fn enqueue_move_selected(&mut self) {
+        let src = {
+            let p = self.get_active_panel();
+            if p.entries.is_empty() {
+                return;
+            }
+            match &p.entries[p.selected_index].location {
+                EntryLocation::Fs(path) => path.clone(),
+                EntryLocation::Zip { .. } => {
+                    return;
+                }
+            }
+        };
+
+        let dst_dir = {
+            let other_panel = match self.active_panel {
+                ActivePanel::Left => &self.right_panel,
+                ActivePanel::Right => &self.left_panel,
+            };
+            match &other_panel.mode {
+                PanelMode::Fs => other_panel.current_path.clone(),
+                PanelMode::Zip { .. } => {
+                    return;
+                }
+            }
+        };
+
+        if let Err(e) = self.io_tx.send(IOTask::Move {
+            src: src.clone(),
+            dst_dir: dst_dir.clone(),
+        }) {
+            eprintln!("Failed to enqueue move: {e}");
+        } else {
+            log::info!(
+                "Enqueued move: {} -> {}",
+                src.to_string_lossy(),
+                dst_dir.to_string_lossy()
+            );
+        }
+    }
+
+    pub fn enqueue_delete_selected(&mut self) {
+        let target = {
+            let p = self.get_active_panel();
+            if p.entries.is_empty() {
+                return;
+            }
+            let entry = &p.entries[p.selected_index];
+            if entry.name == ".." {
+                return;
+            }
+            match &entry.location {
+                EntryLocation::Fs(path) => path.clone(),
+                EntryLocation::Zip { .. } => {
+                    return;
+                }
+            }
+        };
+
+        if let Err(e) = self.io_tx.send(IOTask::Delete {
+            target: target.clone(),
+        }) {
+            eprintln!("Failed to enqueue delete: {e}");
+        } else {
+            log::info!("Enqueued delete: {}", target.to_string_lossy());
+        }
+    }
+
     pub fn switch_theme(&mut self) {
         if self.theme.selected_external.is_some() && self.theme_picker_open {
             self.apply_selected_theme();

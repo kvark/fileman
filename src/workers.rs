@@ -15,6 +15,35 @@ pub fn start_io_worker() -> mpsc::Sender<IOTask> {
                         eprintln!("Copy error: {e}");
                     }
                 }
+                IOTask::Move { src, dst_dir } => {
+                    let target = dst_dir.join(
+                        src.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "moved".to_string()),
+                    );
+                    if let Err(e) = std::fs::rename(&src, &target) {
+                        if let Err(copy_err) = copy_recursively(&src, &dst_dir) {
+                            eprintln!("Move error (copy fallback): {copy_err}");
+                        } else if let Err(remove_err) = if src.is_dir() {
+                            std::fs::remove_dir_all(&src)
+                        } else {
+                            std::fs::remove_file(&src)
+                        } {
+                            eprintln!("Move cleanup error: {remove_err}");
+                        }
+                        eprintln!("Move error: {e}");
+                    }
+                }
+                IOTask::Delete { target } => {
+                    let res = if target.is_dir() {
+                        std::fs::remove_dir_all(&target)
+                    } else {
+                        std::fs::remove_file(&target)
+                    };
+                    if let Err(e) = res {
+                        eprintln!("Delete error: {e}");
+                    }
+                }
             }
         }
     });

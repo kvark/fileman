@@ -59,6 +59,13 @@ pub enum IOTask {
         src: path::PathBuf,
         dst_dir: path::PathBuf,
     },
+    Move {
+        src: path::PathBuf,
+        dst_dir: path::PathBuf,
+    },
+    Delete {
+        target: path::PathBuf,
+    },
 }
 
 pub fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {

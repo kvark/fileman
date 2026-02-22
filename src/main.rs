@@ -647,12 +647,38 @@ fn handle_keyboard(
     }
     if input.key_pressed(egui::Key::F5) {
         app.enqueue_copy_selected();
+        refresh_fs_panels(app);
+    }
+    if input.key_pressed(egui::Key::F6) {
+        app.enqueue_move_selected();
+        refresh_fs_panels(app);
     }
     if input.key_pressed(egui::Key::F9) {
         app.switch_theme();
     }
     if input.key_pressed(egui::Key::F10) {
         app.open_theme_picker();
+    }
+    if input.key_pressed(egui::Key::F8) {
+        app.enqueue_delete_selected();
+        refresh_active_panel(app);
+    }
+}
+
+fn refresh_active_panel(app: &mut AppState) {
+    let which = app.active_panel.clone();
+    let path = app.panel(which.clone()).current_path.clone();
+    if matches!(app.panel(which.clone()).mode, PanelMode::Fs) {
+        load_fs_directory_async(app, path, which, None);
+    }
+}
+
+fn refresh_fs_panels(app: &mut AppState) {
+    for which in [ActivePanel::Left, ActivePanel::Right] {
+        if matches!(app.panel(which.clone()).mode, PanelMode::Fs) {
+            let path = app.panel(which.clone()).current_path.clone();
+            load_fs_directory_async(app, path, which, None);
+        }
     }
 }
 
@@ -691,6 +717,11 @@ fn draw_preview(
                     if let Some(job) = highlight_cache.get(&key) {
                         ui.add(egui::Label::new(job.clone()).selectable(true));
                     } else {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.colored_label(text_color, "Highlighting…");
+                        });
+                        ui.add_space(6.0);
                         if highlight_pending.insert(key.clone()) {
                             let _ = highlight_req_tx.send(HighlightRequest {
                                 key: key.clone(),

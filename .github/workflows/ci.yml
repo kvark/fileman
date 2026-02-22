@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 jobs:
@@ -23,11 +25,22 @@ jobs:
       - name: Install software rendering deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 mesa-vulkan-drivers
+          sudo apt-get install -y libegl1 libvulkan1 mesa-vulkan-drivers
+      - name: Select lavapipe ICD
+        run: |
+          icd=""
+          for candidate in /usr/share/vulkan/icd.d/*lvp*.json /usr/share/vulkan/icd.d/*.json; do
+            if [ -f "$candidate" ]; then
+              icd="$candidate"
+              break
+            fi
+          done
+          if [ -z "$icd" ]; then
+            echo "No Vulkan ICD found in /usr/share/vulkan/icd.d" >&2
+            exit 1
+          fi
+          echo "VK_ICD_FILENAMES=$icd" >> $GITHUB_ENV
       - name: Build snapshot
-        env:
-          LIBGL_ALWAYS_SOFTWARE: "1"
-          VK_ICD_FILENAMES: "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
         run: cargo run -- --snapshot /tmp/screen.png
       - name: Compare snapshot
         run: |
