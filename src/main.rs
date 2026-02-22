@@ -1,9 +1,9 @@
 use anyhow::Result;
 use blade_egui::{GuiPainter, ScreenDescriptor};
 use blade_graphics::{
-    CommandEncoderDesc, Context, ContextDesc, Extent, FinishOp, InitOp, RenderTarget,
-    RenderTargetSet, SurfaceConfig, TextureColor, TextureSubresources, TextureUsage,
-    TextureViewDesc, ViewDimension,
+    AlphaMode, CommandEncoderDesc, Context, ContextDesc, Extent, FinishOp, InitOp, RenderTarget,
+    RenderTargetSet, SurfaceConfig, SurfaceInfo, TextureColor, TextureDesc, TextureFormat,
+    TextureSubresources, TextureUsage, TextureViewDesc, ViewDimension,
 };
 use egui_winit::State as EguiWinitState;
 use std::{
@@ -22,13 +22,15 @@ use winit::{
 
 use fileman::app_state::{AppState, PanelState};
 use fileman::core::{
-    ActivePanel, DirBatch, DirEntry, EntryLocation, PanelMode, PreviewContent, is_zip_path,
-    read_zip_directory,
+    ActivePanel, DirBatch, DirEntry, EntryLocation, PanelMode, PreviewContent, PreviewRequest,
+    is_zip_path, read_fs_directory, read_zip_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors};
 use fileman::workers::{start_io_worker, start_preview_worker};
 
 const ROW_HEIGHT: f32 = 22.0;
+const SNAPSHOT_WIDTH: u32 = 1280;
+const SNAPSHOT_HEIGHT: u32 = 720;
 
 struct UiCache {
     left_rows: usize,
@@ -201,11 +203,13 @@ fn load_fs_directory_async(
             }
         }
         if !snapshot.is_empty() {
-            let _ = tx.send(DirBatch::Append(snapshot));
+            let _ = tx.send(DirBatch::Append(snapshot.clone()));
         }
+        let mut snapshot = snapshot;
         thread::spawn(move || {
             let chunk = 500usize;
             let mut all: Vec<DirEntry> = Vec::new();
+            all.append(&mut snapshot);
             for entry in rd.flatten() {
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if let Ok(file_type) = entry.file_type() {
@@ -609,9 +613,12 @@ fn draw_panel(
     ui: &mut egui::Ui,
     app: &mut AppState,
     panel_side: ActivePanel,
-    image_cache: &mut ImageCache,
-    image_req_tx: &mpsc::Sender<ImageRequest>,
+    _image_cache: &mut ImageCache,
+    _image_req_tx: &mpsc::Sender<ImageRequest>,
 ) -> usize {
+    let available = ui.available_size();
+    ui.set_min_size(available);
+    let panel_height = available.y.max(0.0);
     let colors = app.theme.colors();
     let is_active = app.active_panel == panel_side;
 
@@ -636,6 +643,7 @@ fn draw_panel(
     let panel_side_for_closure = panel_side.clone();
 
     egui::Frame::NONE
+        .fill(color32(Color::rgba(0.0, 0.0, 0.0, 0.0)))
         .stroke(egui::Stroke::new(
             1.0,
             color32(if is_active {
@@ -645,84 +653,101 @@ fn draw_panel(
             }),
         ))
         .show(ui, |ui| {
+            ui.set_min_height(panel_height);
+            ui.spacing_mut().item_spacing = egui::Vec2::new(6.0, 4.0);
             ui.vertical(|ui| {
-                egui::Frame::NONE
-                    .fill(color32(colors.header_bg))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if is_active {
-                                ui.colored_label(color32(colors.header_fg), "●");
-                            }
-                            ui.colored_label(color32(colors.header_fg), header_text);
-                        });
-                    });
+                let header_height = 28.0;
+                let footer_height = 22.0;
+                let spacing = ui.spacing().item_spacing.y;
 
-                let preview_open = app.preview.is_some() && !is_active;
-                if preview_open {
-                    draw_preview(ui, app, image_cache, image_req_tx);
-                    rows = window_rows_for(ui.available_height(), ui.spacing().item_spacing.y);
-                    return;
-                }
+                ui.allocate_ui_with_layout(
+                    egui::Vec2::new(ui.available_width(), header_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::Frame::NONE
+                            .fill(color32(colors.header_bg))
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if is_active {
+                                        ui.colored_label(color32(colors.header_fg), "●");
+                                    }
+                                    ui.colored_label(color32(colors.header_fg), header_text);
+                                });
+                            });
+                    },
+                );
 
-                let list_height = (ui.available_height() - 24.0).max(0.0);
+                let list_height = (ui.available_height() - footer_height - spacing).max(0.0);
                 rows = window_rows_for(list_height, ui.spacing().item_spacing.y);
                 let mut visible_range = 0..0;
 
-                egui::ScrollArea::vertical()
-                    .id_salt(match panel_side_for_closure {
-                        ActivePanel::Left => "left_list",
-                        ActivePanel::Right => "right_list",
-                    })
-                    .show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
-                        visible_range = row_range.clone();
-                        for idx in row_range {
-                            let entry = &panel.entries[idx];
-                            let is_selected = selected_index == idx;
-                            let bg = if is_selected {
-                                if is_active {
-                                    colors.row_bg_selected_active
-                                } else {
-                                    colors.row_bg_selected_inactive
+                ui.allocate_ui_with_layout(
+                    egui::Vec2::new(ui.available_width(), list_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(match panel_side_for_closure {
+                                ActivePanel::Left => "left_list",
+                                ActivePanel::Right => "right_list",
+                            })
+                            .auto_shrink([false, false])
+                            .show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
+                                visible_range = row_range.clone();
+                                for idx in row_range {
+                                    let entry = &panel.entries[idx];
+                                    let is_selected = selected_index == idx;
+                                    let stripe = idx % 2 == 0;
+                                    let bg = if is_selected {
+                                        if is_active {
+                                            colors.row_bg_selected_active
+                                        } else {
+                                            colors.row_bg_selected_inactive
+                                        }
+                                    } else if stripe {
+                                        Color::rgba(0.0, 0.0, 0.0, 0.06)
+                                    } else {
+                                        Color::rgba(0.0, 0.0, 0.0, 0.0)
+                                    };
+                                    let fg = if is_selected {
+                                        colors.row_fg_selected
+                                    } else if is_active {
+                                        colors.row_fg_active
+                                    } else {
+                                        colors.row_fg_inactive
+                                    };
+                                    let prefix = if entry.is_dir { "d " } else { "f " };
+                                    let label = format!("{prefix}{}", entry.name);
+                                    let mut text = egui::RichText::new(label).color(color32(fg));
+                                    if entry.is_dir {
+                                        text = text.strong();
+                                    }
+
+                                    let response = egui::Frame::NONE
+                                        .fill(color32(bg))
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .show(ui, |ui| {
+                                            ui.add_sized(
+                                                [ui.available_width(), ROW_HEIGHT],
+                                                egui::Label::new(text).sense(egui::Sense::click()),
+                                            )
+                                        })
+                                        .inner;
+
+                                    if is_selected && is_active {
+                                        ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
+                                    }
+                                    if response.clicked() {
+                                        clicked_index = Some(idx);
+                                    }
+                                    if response.double_clicked() {
+                                        clicked_index = Some(idx);
+                                        open_on_double_click = true;
+                                    }
                                 }
-                            } else {
-                                Color::rgba(0.0, 0.0, 0.0, 0.0)
-                            };
-                            let fg = if is_selected {
-                                colors.row_fg_selected
-                            } else if is_active {
-                                colors.row_fg_active
-                            } else {
-                                colors.row_fg_inactive
-                            };
-                            let prefix = if entry.is_dir { "d " } else { "f " };
-                            let label = format!("{prefix}{}", entry.name);
-                            let mut text = egui::RichText::new(label).color(color32(fg));
-                            if entry.is_dir {
-                                text = text.strong();
-                            }
-
-                            let response = egui::Frame::NONE
-                                .fill(color32(bg))
-                                .show(ui, |ui| {
-                                    ui.add_sized(
-                                        [ui.available_width(), ROW_HEIGHT],
-                                        egui::Label::new(text).sense(egui::Sense::click()),
-                                    )
-                                })
-                                .inner;
-
-                            if is_selected && is_active {
-                                ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
-                            }
-                            if response.clicked() {
-                                clicked_index = Some(idx);
-                            }
-                            if response.double_clicked() {
-                                clicked_index = Some(idx);
-                                open_on_double_click = true;
-                            }
-                        }
-                    });
+                            });
+                    },
+                );
 
                 if entries_len > 0 {
                     new_top_index = Some(visible_range.start.min(entries_len - 1));
@@ -737,11 +762,18 @@ fn draw_panel(
                     .unwrap_or("-");
                 let footer_text = format!("items: {entries_len} | selected: {selected_label}");
 
-                egui::Frame::NONE
-                    .fill(color32(colors.footer_bg))
-                    .show(ui, |ui| {
-                        ui.colored_label(color32(colors.footer_fg), footer_text);
-                    });
+                ui.allocate_ui_with_layout(
+                    egui::Vec2::new(ui.available_width(), footer_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::Frame::NONE
+                            .fill(color32(colors.footer_bg))
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .show(ui, |ui| {
+                                ui.colored_label(color32(colors.footer_fg), footer_text);
+                            });
+                    },
+                );
             });
         });
 
@@ -1031,24 +1063,56 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    if runtime.app.preview.is_some() {
+                        egui::TopBottomPanel::bottom("preview")
+                            .exact_height(220.0)
+                            .show(ctx, |ui| {
+                                draw_preview(
+                                    ui,
+                                    &mut runtime.app,
+                                    &mut runtime.image_cache,
+                                    &runtime.image_req_tx,
+                                );
+                            });
+                    }
+
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            runtime.ui_cache.left_rows = draw_panel(
-                                ui,
-                                &mut runtime.app,
-                                ActivePanel::Left,
-                                &mut runtime.image_cache,
-                                &runtime.image_req_tx,
-                            );
-                            ui.separator();
-                            runtime.ui_cache.right_rows = draw_panel(
-                                ui,
-                                &mut runtime.app,
-                                ActivePanel::Right,
-                                &mut runtime.image_cache,
-                                &runtime.image_req_tx,
-                            );
-                        });
+                        let available = ui.available_size();
+                        let spacing_x = ui.spacing().item_spacing.x;
+                        let panel_width = ((available.x - spacing_x) * 0.5).max(0.0);
+                        ui.allocate_ui_with_layout(
+                            available,
+                            egui::Layout::left_to_right(egui::Align::TOP),
+                            |ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(panel_width, available.y),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        runtime.ui_cache.left_rows = draw_panel(
+                                            ui,
+                                            &mut runtime.app,
+                                            ActivePanel::Left,
+                                            &mut runtime.image_cache,
+                                            &runtime.image_req_tx,
+                                        );
+                                    },
+                                );
+                                ui.separator();
+                                ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(panel_width, available.y),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        runtime.ui_cache.right_rows = draw_panel(
+                                            ui,
+                                            &mut runtime.app,
+                                            ActivePanel::Right,
+                                            &mut runtime.image_cache,
+                                            &runtime.image_req_tx,
+                                        );
+                                    },
+                                );
+                            },
+                        );
                     });
 
                     if runtime.app.theme_picker_open {
@@ -1131,10 +1195,247 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     env_logger::init();
 
+    if let Some(snapshot_path) = parse_snapshot_arg()? {
+        return run_snapshot(&snapshot_path);
+    }
+
     let event_loop = EventLoop::new()?;
     let mut app = App::new();
     event_loop
         .run_app(&mut app)
         .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(())
+}
+
+fn parse_snapshot_arg() -> Result<Option<PathBuf>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--snapshot" {
+            return args
+                .next()
+                .map(|value| Ok(Some(PathBuf::from(value))))
+                .unwrap_or_else(|| Err(anyhow::anyhow!("--snapshot requires a path")));
+        }
+    }
+    Ok(None)
+}
+
+fn run_snapshot(path: &PathBuf) -> Result<()> {
+    let context = unsafe {
+        Context::init(ContextDesc::default())
+            .map_err(|err| anyhow::anyhow!("Failed to init GPU context: {err:?}"))?
+    };
+
+    let size = Extent {
+        width: SNAPSHOT_WIDTH,
+        height: SNAPSHOT_HEIGHT,
+        depth: 1,
+    };
+    let format = TextureFormat::Rgba8Unorm;
+    let surface_info = SurfaceInfo {
+        format,
+        alpha: AlphaMode::PreMultiplied,
+    };
+    let mut painter = GuiPainter::new(surface_info, &context);
+    let mut command_encoder = context.create_command_encoder(CommandEncoderDesc {
+        name: "snapshot",
+        buffer_count: 1,
+    });
+
+    let texture = context.create_texture(TextureDesc {
+        name: "snapshot_target",
+        format,
+        size,
+        array_layer_count: 1,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: blade_graphics::TextureDimension::D2,
+        usage: TextureUsage::TARGET | TextureUsage::COPY,
+        external: None,
+    });
+    let view = context.create_texture_view(
+        texture,
+        TextureViewDesc {
+            name: "snapshot_view",
+            format,
+            dimension: ViewDimension::D2,
+            subresources: &TextureSubresources::default(),
+        },
+    );
+
+    let cur_dir = std::env::current_dir()?;
+    let entries = read_fs_directory(cur_dir.as_path()).unwrap_or_default();
+
+    let (preview_tx, _preview_req_rx) = mpsc::channel::<PreviewRequest>();
+    let (_preview_res_tx, preview_rx) = mpsc::channel::<(u64, PreviewContent)>();
+    let (io_tx, _io_rx) = mpsc::channel();
+    let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
+    let mut image_cache = ImageCache {
+        textures: HashMap::new(),
+        pending: HashSet::new(),
+        order: VecDeque::new(),
+    };
+
+    let mut app = AppState {
+        left_panel: PanelState {
+            current_path: cur_dir.clone(),
+            mode: PanelMode::Fs,
+            selected_index: 0,
+            entries: entries.clone(),
+            entries_rx: None,
+            prefer_select_name: None,
+            top_index: 0,
+        },
+        right_panel: PanelState {
+            current_path: cur_dir.clone(),
+            mode: PanelMode::Fs,
+            selected_index: 0,
+            entries,
+            entries_rx: None,
+            prefer_select_name: None,
+            top_index: 0,
+        },
+        active_panel: ActivePanel::Left,
+        preview: None,
+        preview_tx,
+        preview_rx,
+        preview_request_id: 0,
+        io_tx,
+        fs_last_selected_name: Default::default(),
+        zip_last_selected_name: Default::default(),
+        theme: Theme::dark(),
+        theme_picker_open: false,
+        theme_picker_selected: None,
+    };
+    app.theme
+        .load_external_from_dir(std::path::Path::new("./themes"));
+
+    let egui_ctx = egui::Context::default();
+    let screen_rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::Vec2::new(SNAPSHOT_WIDTH as f32, SNAPSHOT_HEIGHT as f32),
+    );
+    let viewport_info = egui::ViewportInfo {
+        native_pixels_per_point: Some(1.0),
+        inner_rect: Some(screen_rect),
+        ..Default::default()
+    };
+    let raw_input = egui::RawInput {
+        screen_rect: Some(screen_rect),
+        viewports: std::iter::once((egui::ViewportId::ROOT, viewport_info)).collect(),
+        ..Default::default()
+    };
+    let output = egui_ctx.run(raw_input, |ctx| {
+        apply_theme(ctx, &app.theme.colors());
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.columns(2, |cols| {
+                draw_panel(
+                    &mut cols[0],
+                    &mut app,
+                    ActivePanel::Left,
+                    &mut image_cache,
+                    &image_req_tx,
+                );
+                draw_panel(
+                    &mut cols[1],
+                    &mut app,
+                    ActivePanel::Right,
+                    &mut image_cache,
+                    &image_req_tx,
+                );
+            });
+        });
+    });
+
+    let paint_jobs = egui_ctx.tessellate(output.shapes, output.pixels_per_point);
+    let screen_descriptor = ScreenDescriptor {
+        physical_size: (SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT),
+        scale_factor: 1.0,
+    };
+
+    command_encoder.start();
+    command_encoder.init_texture(texture);
+    painter.update_textures(&mut command_encoder, &output.textures_delta, &context);
+    let mut render = command_encoder.render(
+        "snapshot",
+        RenderTargetSet {
+            colors: &[RenderTarget {
+                view,
+                init_op: InitOp::Clear(TextureColor::TransparentBlack),
+                finish_op: FinishOp::Store,
+            }],
+            depth_stencil: None,
+        },
+    );
+    painter.paint(&mut render, &paint_jobs, &screen_descriptor, &context);
+    drop(render);
+
+    let bytes_per_row = align_to(SNAPSHOT_WIDTH * 4, 256);
+    let buffer_size = bytes_per_row as u64 * SNAPSHOT_HEIGHT as u64;
+    let result_buffer = context.create_buffer(blade_graphics::BufferDesc {
+        name: "snapshot_readback",
+        size: buffer_size,
+        memory: blade_graphics::Memory::Shared,
+    });
+
+    {
+        let mut transfer = command_encoder.transfer("snapshot readback");
+        transfer.copy_texture_to_buffer(
+            blade_graphics::TexturePiece {
+                texture,
+                mip_level: 0,
+                array_layer: 0,
+                origin: [0, 0, 0],
+            },
+            result_buffer.into(),
+            bytes_per_row,
+            size,
+        );
+    }
+
+    let sync = context.submit(&mut command_encoder);
+    painter.after_submit(&sync);
+    context.wait_for(&sync, !0);
+
+    save_snapshot_png(
+        &result_buffer,
+        SNAPSHOT_WIDTH,
+        SNAPSHOT_HEIGHT,
+        bytes_per_row as usize,
+        path,
+    )?;
+
+    context.destroy_texture_view(view);
+    context.destroy_texture(texture);
+    context.destroy_buffer(result_buffer);
+    painter.destroy(&context);
+    context.destroy_command_encoder(&mut command_encoder);
+
+    Ok(())
+}
+
+fn align_to(value: u32, alignment: u32) -> u32 {
+    ((value + alignment - 1) / alignment) * alignment
+}
+
+fn save_snapshot_png(
+    buffer: &blade_graphics::Buffer,
+    width: u32,
+    height: u32,
+    bytes_per_row: usize,
+    path: &PathBuf,
+) -> Result<()> {
+    let row_bytes = (width * 4) as usize;
+    let mut data = vec![0u8; row_bytes * height as usize];
+    let src = buffer.data() as *const u8;
+    for y in 0..height as usize {
+        let src_row = unsafe { std::slice::from_raw_parts(src.add(y * bytes_per_row), row_bytes) };
+        let dst_row = &mut data[y * row_bytes..(y + 1) * row_bytes];
+        dst_row.copy_from_slice(src_row);
+    }
+
+    let image = image::RgbaImage::from_raw(width, height, data)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create image from snapshot data"))?;
+    image.save(path)?;
     Ok(())
 }
