@@ -20,9 +20,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install software rendering deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 mesa-vulkan-drivers
       - name: Build snapshot
         env:
           RUSTFLAGS: "--cfg gles"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          VK_ICD_FILENAMES: "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
         run: cargo run -- --snapshot /tmp/screen.png
       - name: Compare snapshot
         run: |

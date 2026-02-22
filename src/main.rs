@@ -28,7 +28,7 @@ use fileman::core::{
 use fileman::theme::{Color, Theme, ThemeColors};
 use fileman::workers::{start_io_worker, start_preview_worker};
 
-const ROW_HEIGHT: f32 = 22.0;
+const ROW_HEIGHT: f32 = 24.0;
 const SNAPSHOT_WIDTH: u32 = 1280;
 const SNAPSHOT_HEIGHT: u32 = 720;
 
@@ -73,10 +73,16 @@ fn color32(c: Color) -> egui::Color32 {
 
 fn apply_theme(ctx: &egui::Context, colors: &ThemeColors) {
     let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::Vec2::new(8.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(8);
     style.visuals.window_fill = color32(colors.preview_bg);
     style.visuals.panel_fill = color32(colors.preview_bg);
     style.visuals.extreme_bg_color = color32(colors.header_bg);
     style.visuals.window_stroke.color = color32(colors.panel_border_inactive);
+    style.visuals.window_corner_radius = egui::CornerRadius::same(6);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(6);
+    style.visuals.faint_bg_color = color32(colors.divider);
+    style.visuals.code_bg_color = color32(colors.footer_bg);
     style.visuals.selection.bg_fill = color32(colors.row_bg_selected_active);
     style.visuals.selection.stroke.color = color32(colors.row_fg_selected);
     style.visuals.widgets.inactive.bg_fill = color32(colors.preview_bg);
@@ -467,9 +473,15 @@ fn active_window_rows(app: &AppState, cache: &UiCache) -> usize {
     }
 }
 
-fn handle_keyboard(input: &egui::InputState, app: &mut AppState, cache: &UiCache) {
+fn handle_keyboard(
+    ctx: &egui::Context,
+    input: &egui::InputState,
+    app: &mut AppState,
+    cache: &UiCache,
+) {
     let window_rows = active_window_rows(app, cache);
-    if input.key_pressed(egui::Key::Tab) {
+    let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+    if tab_pressed {
         app.switch_panel();
         if app.preview.is_some() {
             app.update_preview_for_current_selection();
@@ -609,6 +621,71 @@ fn draw_theme_picker(ctx: &egui::Context, app: &mut AppState) {
         });
 }
 
+fn draw_top_bar(ctx: &egui::Context, app: &AppState) {
+    let colors = app.theme.colors();
+    egui::TopBottomPanel::top("top_bar")
+        .exact_height(40.0)
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(color32(colors.header_bg))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let title = egui::RichText::new("Fileman")
+                            .color(color32(colors.header_fg))
+                            .strong();
+                        ui.label(title);
+                        ui.add_space(18.0);
+                        let active_label = match app.active_panel {
+                            ActivePanel::Left => "Active: Left",
+                            ActivePanel::Right => "Active: Right",
+                        };
+                        ui.label(
+                            egui::RichText::new(active_label).color(color32(colors.header_fg)),
+                        );
+                    });
+                });
+        });
+}
+
+fn draw_command_bar(ctx: &egui::Context, colors: &ThemeColors) {
+    egui::TopBottomPanel::bottom("command_bar")
+        .exact_height(30.0)
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(color32(colors.footer_bg))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        draw_key_cap(ui, "F3", "View", colors);
+                        draw_key_cap(ui, "F4", "Edit", colors);
+                        draw_key_cap(ui, "F5", "Copy", colors);
+                        draw_key_cap(ui, "F6", "Move", colors);
+                        draw_key_cap(ui, "F7", "Mkdir", colors);
+                        draw_key_cap(ui, "F8", "Delete", colors);
+                    });
+                });
+        });
+}
+
+fn draw_key_cap(ui: &mut egui::Ui, key: &str, label: &str, colors: &ThemeColors) {
+    let key_text = egui::RichText::new(key)
+        .color(color32(colors.row_fg_selected))
+        .strong();
+    let label_text = egui::RichText::new(format!(" {label}")).color(color32(colors.footer_fg));
+    egui::Frame::NONE
+        .fill(color32(colors.preview_header_bg))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(key_text);
+                ui.label(label_text);
+            });
+        });
+    ui.add_space(6.0);
+}
+
 fn draw_panel(
     ui: &mut egui::Ui,
     app: &mut AppState,
@@ -642,7 +719,7 @@ fn draw_panel(
     let mut new_top_index: Option<usize> = None;
     let panel_side_for_closure = panel_side.clone();
 
-    egui::Frame::NONE
+    let panel_response = egui::Frame::NONE
         .fill(color32(Color::rgba(0.0, 0.0, 0.0, 0.0)))
         .stroke(egui::Stroke::new(
             1.0,
@@ -656,8 +733,8 @@ fn draw_panel(
             ui.set_min_height(panel_height);
             ui.spacing_mut().item_spacing = egui::Vec2::new(6.0, 4.0);
             ui.vertical(|ui| {
-                let header_height = 28.0;
-                let footer_height = 22.0;
+                let header_height = 30.0;
+                let footer_height = 24.0;
                 let spacing = ui.spacing().item_spacing.y;
 
                 ui.allocate_ui_with_layout(
@@ -716,31 +793,48 @@ fn draw_panel(
                                     } else {
                                         colors.row_fg_inactive
                                     };
-                                    let prefix = if entry.is_dir { "d " } else { "f " };
-                                    let label = format!("{prefix}{}", entry.name);
-                                    let mut text = egui::RichText::new(label).color(color32(fg));
+                                    let mut text =
+                                        egui::RichText::new(&entry.name).color(color32(fg));
                                     if entry.is_dir {
                                         text = text.strong();
                                     }
 
-                                    let response = egui::Frame::NONE
-                                        .fill(color32(bg))
-                                        .corner_radius(egui::CornerRadius::same(3))
-                                        .show(ui, |ui| {
-                                            ui.add_sized(
-                                                [ui.available_width(), ROW_HEIGHT],
-                                                egui::Label::new(text).sense(egui::Sense::click()),
-                                            )
-                                        })
-                                        .inner;
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
+                                        egui::Sense::click(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        egui::CornerRadius::same(3),
+                                        color32(bg),
+                                    );
+                                    if entry.is_dir {
+                                        let bar_rect = egui::Rect::from_min_max(
+                                            rect.left_top(),
+                                            rect.left_top() + egui::Vec2::new(4.0, rect.height()),
+                                        );
+                                        ui.painter().rect_filled(
+                                            bar_rect,
+                                            egui::CornerRadius::same(3),
+                                            color32(colors.panel_border_active),
+                                        );
+                                    }
+                                    let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                    ui.painter().text(
+                                        rect.left_center() + egui::Vec2::new(10.0, 0.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        entry.name.as_str(),
+                                        font_id,
+                                        color32(fg),
+                                    );
 
                                     if is_selected && is_active {
                                         ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
                                     }
-                                    if response.clicked() {
+                                    if response.clicked_by(egui::PointerButton::Primary) {
                                         clicked_index = Some(idx);
                                     }
-                                    if response.double_clicked() {
+                                    if response.double_clicked_by(egui::PointerButton::Primary) {
                                         clicked_index = Some(idx);
                                         open_on_double_click = true;
                                     }
@@ -777,12 +871,16 @@ fn draw_panel(
             });
         });
 
+    if panel_response.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
+        app.active_panel = panel_side.clone();
+    }
+
     if let Some(top) = new_top_index {
         app.panel_mut(panel_side.clone()).top_index = top;
     }
 
     if let Some(idx) = clicked_index {
-        app.active_panel = panel_side;
+        app.active_panel = panel_side.clone();
         app.select_entry(idx, rows);
         if open_on_double_click {
             open_selected(app);
@@ -1038,7 +1136,7 @@ impl ApplicationHandler for App {
                 let output = runtime.egui_ctx.run(raw_input, |ctx| {
                     apply_theme(ctx, &runtime.app.theme.colors());
                     let input = ctx.input(|i| i.clone());
-                    handle_keyboard(&input, &mut runtime.app, &runtime.ui_cache);
+                    handle_keyboard(ctx, &input, &mut runtime.app, &runtime.ui_cache);
 
                     for decoded in decoded_images.drain(..) {
                         let handle = ctx.load_texture(
@@ -1062,6 +1160,10 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+
+                    draw_top_bar(ctx, &runtime.app);
+
+                    draw_command_bar(ctx, &runtime.app.theme.colors());
 
                     if runtime.app.preview.is_some() {
                         egui::TopBottomPanel::bottom("preview")
@@ -1131,6 +1233,9 @@ impl ApplicationHandler for App {
                     scale_factor: runtime.window.scale_factor() as f32,
                 };
 
+                if let Some(sync) = runtime.last_sync.take() {
+                    runtime.context.wait_for(&sync, !0);
+                }
                 runtime.command_encoder.start();
                 runtime.painter.update_textures(
                     &mut runtime.command_encoder,
@@ -1139,6 +1244,7 @@ impl ApplicationHandler for App {
                 );
 
                 let frame = runtime.surface.acquire_frame();
+                runtime.command_encoder.init_texture(frame.texture());
                 let view = runtime.context.create_texture_view(
                     frame.texture(),
                     TextureViewDesc {
@@ -1327,6 +1433,12 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     };
     let output = egui_ctx.run(raw_input, |ctx| {
         apply_theme(ctx, &app.theme.colors());
+        draw_top_bar(ctx, &app);
+        draw_command_bar(ctx, &app.theme.colors());
+        let _ui_cache = UiCache {
+            left_rows: 10,
+            right_rows: 10,
+        };
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.columns(2, |cols| {
                 draw_panel(

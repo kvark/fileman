@@ -27,7 +27,7 @@ pub enum DirBatch {
     Replace(Vec<DirEntry>),
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum ActivePanel {
     Left,
     Right,
