@@ -21,6 +21,8 @@ pub struct AppState {
     pub right_panel: PanelState,
     pub active_panel: ActivePanel,
     pub preview: Option<PreviewContent>,
+    pub preview_key: Option<String>,
+    pub preview_ext: Option<String>,
     pub preview_tx: mpsc::Sender<PreviewRequest>,
     pub preview_rx: mpsc::Receiver<(u64, PreviewContent)>,
     pub preview_request_id: u64,
@@ -114,15 +116,28 @@ impl AppState {
     }
 
     pub fn update_preview_for_current_selection(&mut self) {
-        let (is_dir, location) = {
+        let (is_dir, location, key, ext) = {
             let panel = self.get_active_panel();
             if panel.entries.is_empty() {
                 self.clear_preview();
                 return;
             }
             let entry = &panel.entries[panel.selected_index];
-            (entry.is_dir, entry.location.clone())
+            let ext = std::path::Path::new(&entry.name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_string());
+            let key = match &entry.location {
+                EntryLocation::Fs(path) => path.to_string_lossy().into_owned(),
+                EntryLocation::Zip {
+                    archive_path,
+                    inner_path,
+                } => format!("{}::zip:/{}", archive_path.to_string_lossy(), inner_path),
+            };
+            (entry.is_dir, entry.location.clone(), key, ext)
         };
+        self.preview_key = Some(key);
+        self.preview_ext = ext;
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let request_id = self.preview_request_id;
         const MAX_BYTES: usize = 64 * 1024;
@@ -279,6 +294,8 @@ impl AppState {
 
     pub fn clear_preview(&mut self) {
         self.preview = None;
+        self.preview_key = None;
+        self.preview_ext = None;
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
     }
 }

@@ -6,12 +6,20 @@ use blade_graphics::{
     TextureSubresources, TextureUsage, TextureViewDesc, ViewDimension,
 };
 use egui_winit::State as EguiWinitState;
+use once_cell::sync::Lazy;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::mpsc,
     thread,
+};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{Style, Theme as SyntectTheme, ThemeSet},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
 };
 use winit::{
     application::ApplicationHandler,
@@ -25,12 +33,14 @@ use fileman::core::{
     ActivePanel, DirBatch, DirEntry, EntryLocation, PanelMode, PreviewContent, PreviewRequest,
     is_zip_path, read_fs_directory, read_zip_directory,
 };
-use fileman::theme::{Color, Theme, ThemeColors};
+use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{start_io_worker, start_preview_worker};
 
 const ROW_HEIGHT: f32 = 24.0;
 const SNAPSHOT_WIDTH: u32 = 1280;
 const SNAPSHOT_HEIGHT: u32 = 720;
+const MAX_IMAGE_TEXTURES: usize = 64;
+const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 2;
 
 struct UiCache {
     left_rows: usize,
@@ -46,14 +56,23 @@ struct ImageResult {
     image: egui::ColorImage,
 }
 
+struct HighlightRequest {
+    key: String,
+    text: String,
+    ext: Option<String>,
+    theme_kind: ThemeKind,
+}
+
+struct HighlightResult {
+    key: String,
+    job: egui::text::LayoutJob,
+}
+
 struct ImageCache {
     textures: HashMap<PathBuf, egui::TextureHandle>,
     pending: HashSet<PathBuf>,
     order: VecDeque<PathBuf>,
 }
-
-const MAX_IMAGE_TEXTURES: usize = 64;
-const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 2;
 
 fn touch_image(cache: &mut ImageCache, key: &PathBuf) {
     if let Some(pos) = cache.order.iter().position(|p| p == key) {
@@ -70,6 +89,9 @@ fn color32(c: Color) -> egui::Color32 {
         (c.a.clamp(0.0, 1.0) * 255.0) as u8,
     )
 }
+
+static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
 fn apply_theme(ctx: &egui::Context, colors: &ThemeColors) {
     let mut style = (*ctx.style()).clone();
@@ -94,6 +116,83 @@ fn apply_theme(ctx: &egui::Context, colors: &ThemeColors) {
     style.visuals.hyperlink_color = color32(colors.panel_border_active);
     style.visuals.override_text_color = Some(color32(colors.row_fg_active));
     ctx.set_style(style);
+}
+
+fn pick_theme(theme_kind: ThemeKind) -> &'static SyntectTheme {
+    let themes = &THEME_SET.themes;
+    let key = match theme_kind {
+        ThemeKind::Dark => "base16-ocean.dark",
+        ThemeKind::Light => "InspiredGitHub",
+    };
+    themes
+        .get(key)
+        .or_else(|| themes.values().next())
+        .expect("syntect theme")
+}
+
+fn highlight_text_job(
+    text: &str,
+    extension: Option<&str>,
+    theme_kind: ThemeKind,
+) -> egui::text::LayoutJob {
+    let ext = extension.map(|ext| ext.to_ascii_lowercase());
+    if ext.as_deref() == Some("toml") {
+        return fileman::syntax::toml::highlight_toml_job(text, theme_kind);
+    }
+    let by_name_ci = |name: &str| {
+        let needle = name.to_ascii_lowercase();
+        SYNTAX_SET
+            .syntaxes()
+            .iter()
+            .find(|s| s.name.to_ascii_lowercase().contains(&needle))
+    };
+    let syntax = ext
+        .as_deref()
+        .and_then(|ext| SYNTAX_SET.find_syntax_by_extension(ext))
+        .or_else(|| {
+            ext.as_deref().and_then(|ext| match ext {
+                "toml" => by_name_ci("toml"),
+                "yml" | "yaml" => by_name_ci("yaml"),
+                "rs" => SYNTAX_SET.find_syntax_by_name("Rust"),
+                "md" => SYNTAX_SET.find_syntax_by_name("Markdown"),
+                "json" => SYNTAX_SET.find_syntax_by_name("JSON"),
+                "js" => SYNTAX_SET.find_syntax_by_name("JavaScript"),
+                "ts" => SYNTAX_SET.find_syntax_by_name("TypeScript"),
+                "css" => SYNTAX_SET.find_syntax_by_name("CSS"),
+                "html" => SYNTAX_SET.find_syntax_by_name("HTML"),
+                _ => None,
+            })
+        })
+        .or_else(|| SYNTAX_SET.find_syntax_by_first_line(text))
+        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+    let mut highlighter = HighlightLines::new(syntax, pick_theme(theme_kind));
+    let mut job = egui::text::LayoutJob::default();
+    for line in LinesWithEndings::from(text) {
+        let ranges = highlighter
+            .highlight_line(line, &SYNTAX_SET)
+            .unwrap_or_else(|_| vec![(Style::default(), line)]);
+        for (style, piece) in ranges {
+            let color = egui::Color32::from_rgba_unmultiplied(
+                style.foreground.r,
+                style.foreground.g,
+                style.foreground.b,
+                style.foreground.a,
+            );
+            let format = egui::TextFormat {
+                font_id: egui::FontId::monospace(13.0),
+                color,
+                ..Default::default()
+            };
+            job.append(piece, 0.0, format);
+        }
+    }
+    job
+}
+
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn surface_error_help() -> &'static str {
@@ -341,10 +440,18 @@ fn load_zip_directory_async(
     }
 
     let (tx, rx) = mpsc::channel::<DirBatch>();
-    let ap = archive_path.clone();
+    let archive_clone = archive_path.clone();
     let cwd_clone = cwd.clone();
 
-    if let Ok(mut all) = read_zip_directory(&ap, &cwd_clone) {
+    thread::spawn(move || {
+        let all = match read_zip_directory(&archive_clone, &cwd_clone) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("Failed to read zip: {e}");
+                return;
+            }
+        };
+        let mut all = all;
         if !all.is_empty() && all[0].name == ".." {
             all.remove(0);
         }
@@ -361,7 +468,7 @@ fn load_zip_directory_async(
                 start = end;
             }
         });
-    }
+    });
 
     let remembered = prefer_name.clone().or_else(|| {
         app.zip_last_selected_name
@@ -554,6 +661,9 @@ fn draw_preview(
     app: &AppState,
     image_cache: &mut ImageCache,
     image_req_tx: &mpsc::Sender<ImageRequest>,
+    highlight_cache: &HashMap<String, egui::text::LayoutJob>,
+    highlight_pending: &mut HashSet<String>,
+    highlight_req_tx: &mpsc::Sender<HighlightRequest>,
     min_height: f32,
 ) {
     let colors = app.theme.colors();
@@ -570,9 +680,28 @@ fn draw_preview(
             });
             ui.add_space(4.0);
 
-            egui::ScrollArea::vertical().show(ui, |ui| match app.preview.as_ref() {
+            egui::ScrollArea::both().show(ui, |ui| match app.preview.as_ref() {
                 Some(PreviewContent::Text(text)) => {
-                    ui.colored_label(text_color, text);
+                    let ext = app.preview_ext.clone();
+                    let base_key = app
+                        .preview_key
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let key = format!("{base_key}:{:x}", hash_text(text));
+                    if let Some(job) = highlight_cache.get(&key) {
+                        ui.add(egui::Label::new(job.clone()).selectable(true));
+                    } else {
+                        if highlight_pending.insert(key.clone()) {
+                            let _ = highlight_req_tx.send(HighlightRequest {
+                                key: key.clone(),
+                                text: text.clone(),
+                                ext,
+                                theme_kind: app.theme.kind,
+                            });
+                        }
+                        ui.colored_label(text_color, text);
+                        ui.ctx().request_repaint();
+                    }
                 }
                 Some(PreviewContent::Image(path)) => {
                     let key = path.to_path_buf();
@@ -771,11 +900,6 @@ fn draw_panel(
                                     } else {
                                         colors.row_fg_inactive
                                     };
-                                    let mut text =
-                                        egui::RichText::new(&entry.name).color(color32(fg));
-                                    if entry.is_dir {
-                                        text = text.strong();
-                                    }
 
                                     let (rect, response) = ui.allocate_exact_size(
                                         egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
@@ -786,6 +910,7 @@ fn draw_panel(
                                         egui::CornerRadius::same(3),
                                         color32(bg),
                                     );
+
                                     let icon_size = egui::Vec2::splat(10.0);
                                     let icon_pos = rect.left_center()
                                         - egui::Vec2::new(0.0, icon_size.y * 0.5)
@@ -801,6 +926,7 @@ fn draw_panel(
                                         egui::CornerRadius::same(2),
                                         color32(icon_color),
                                     );
+
                                     let font_id = egui::TextStyle::Body.resolve(ui.style());
                                     ui.painter().text(
                                         rect.left_center() + egui::Vec2::new(22.0, 0.0),
@@ -888,6 +1014,10 @@ struct Runtime {
     app: AppState,
     ui_cache: UiCache,
     image_cache: ImageCache,
+    highlight_cache: HashMap<String, egui::text::LayoutJob>,
+    highlight_pending: HashSet<String>,
+    highlight_req_tx: mpsc::Sender<HighlightRequest>,
+    highlight_res_rx: mpsc::Receiver<HighlightResult>,
     image_req_tx: mpsc::Sender<ImageRequest>,
     image_res_rx: mpsc::Receiver<ImageResult>,
 }
@@ -897,6 +1027,8 @@ impl Runtime {
         self.image_cache.textures.clear();
         self.image_cache.order.clear();
         self.image_cache.pending.clear();
+        self.highlight_cache.clear();
+        self.highlight_pending.clear();
         if let Some(sync) = self.last_sync.take() {
             self.context.wait_for(&sync, !0);
         }
@@ -988,6 +1120,8 @@ impl ApplicationHandler for App {
         let (preview_tx, preview_rx) = start_preview_worker();
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
         let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResult>();
+        let (highlight_req_tx, highlight_req_rx) = mpsc::channel::<HighlightRequest>();
+        let (highlight_res_tx, highlight_res_rx) = mpsc::channel::<HighlightResult>();
 
         thread::spawn(move || {
             while let Ok(req) = image_req_rx.recv() {
@@ -1000,6 +1134,13 @@ impl ApplicationHandler for App {
                     };
                     let _ = image_res_tx.send(result);
                 }
+            }
+        });
+
+        thread::spawn(move || {
+            while let Ok(req) = highlight_req_rx.recv() {
+                let job = highlight_text_job(&req.text, req.ext.as_deref(), req.theme_kind);
+                let _ = highlight_res_tx.send(HighlightResult { key: req.key, job });
             }
         });
 
@@ -1024,6 +1165,8 @@ impl ApplicationHandler for App {
             },
             active_panel: ActivePanel::Left,
             preview: None,
+            preview_key: None,
+            preview_ext: None,
             preview_tx: preview_tx.clone(),
             preview_rx,
             preview_request_id: 0,
@@ -1049,6 +1192,8 @@ impl ApplicationHandler for App {
             pending: HashSet::new(),
             order: VecDeque::new(),
         };
+        let highlight_cache = HashMap::new();
+        let highlight_pending = HashSet::new();
 
         self.runtime = Some(Runtime {
             window,
@@ -1066,6 +1211,10 @@ impl ApplicationHandler for App {
             app,
             ui_cache,
             image_cache,
+            highlight_cache,
+            highlight_pending,
+            highlight_req_tx,
+            highlight_res_rx,
             image_req_tx,
             image_res_rx,
         });
@@ -1112,6 +1261,10 @@ impl ApplicationHandler for App {
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => break,
                     }
+                }
+                while let Ok(res) = runtime.highlight_res_rx.try_recv() {
+                    runtime.highlight_cache.insert(res.key.clone(), res.job);
+                    runtime.highlight_pending.remove(&res.key);
                 }
 
                 let raw_input = runtime.egui_state.take_egui_input(&runtime.window);
@@ -1164,9 +1317,12 @@ impl ApplicationHandler for App {
                             {
                                 draw_preview(
                                     ui,
-                                    &mut runtime.app,
+                                    &runtime.app,
                                     &mut runtime.image_cache,
                                     &runtime.image_req_tx,
+                                    &runtime.highlight_cache,
+                                    &mut runtime.highlight_pending,
+                                    &runtime.highlight_req_tx,
                                     rect.height(),
                                 );
                             } else {
@@ -1186,9 +1342,12 @@ impl ApplicationHandler for App {
                             {
                                 draw_preview(
                                     ui,
-                                    &mut runtime.app,
+                                    &runtime.app,
                                     &mut runtime.image_cache,
                                     &runtime.image_req_tx,
+                                    &runtime.highlight_cache,
+                                    &mut runtime.highlight_pending,
+                                    &runtime.highlight_req_tx,
                                     rect.height(),
                                 );
                             } else {
@@ -1293,21 +1452,6 @@ impl ApplicationHandler for App {
     }
 }
 
-fn main() -> Result<()> {
-    env_logger::init();
-
-    if let Some(snapshot_path) = parse_snapshot_arg()? {
-        return run_snapshot(&snapshot_path);
-    }
-
-    let event_loop = EventLoop::new()?;
-    let mut app = App::new();
-    event_loop
-        .run_app(&mut app)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    Ok(())
-}
-
 fn parse_snapshot_arg() -> Result<Option<PathBuf>> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1371,11 +1515,14 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     let (_preview_res_tx, preview_rx) = mpsc::channel::<(u64, PreviewContent)>();
     let (io_tx, _io_rx) = mpsc::channel();
     let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
+    let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
     let mut image_cache = ImageCache {
         textures: HashMap::new(),
         pending: HashSet::new(),
         order: VecDeque::new(),
     };
+    let highlight_cache = HashMap::new();
+    let mut highlight_pending = HashSet::new();
 
     let mut app = AppState {
         left_panel: PanelState {
@@ -1398,6 +1545,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         },
         active_panel: ActivePanel::Left,
         preview: None,
+        preview_key: None,
+        preview_ext: None,
         preview_tx,
         preview_rx,
         preview_request_id: 0,
@@ -1412,18 +1561,23 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         .load_external_from_dir(std::path::Path::new("./themes"));
 
     let egui_ctx = egui::Context::default();
-    let screen_rect = egui::Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::Vec2::new(SNAPSHOT_WIDTH as f32, SNAPSHOT_HEIGHT as f32),
-    );
-    let viewport_info = egui::ViewportInfo {
-        native_pixels_per_point: Some(1.0),
-        inner_rect: Some(screen_rect),
-        ..Default::default()
-    };
     let raw_input = egui::RawInput {
-        screen_rect: Some(screen_rect),
-        viewports: std::iter::once((egui::ViewportId::ROOT, viewport_info)).collect(),
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(SNAPSHOT_WIDTH as f32, SNAPSHOT_HEIGHT as f32),
+        )),
+        viewports: std::iter::once((
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                native_pixels_per_point: Some(1.0),
+                inner_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(SNAPSHOT_WIDTH as f32, SNAPSHOT_HEIGHT as f32),
+                )),
+                ..Default::default()
+            },
+        ))
+        .collect(),
         ..Default::default()
     };
     let output = egui_ctx.run(raw_input, |ctx| {
@@ -1446,7 +1600,16 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
 
             ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                 if app.preview.is_some() && app.active_panel == ActivePanel::Right {
-                    draw_preview(ui, &mut app, &mut image_cache, &image_req_tx, rect.height());
+                    draw_preview(
+                        ui,
+                        &app,
+                        &mut image_cache,
+                        &image_req_tx,
+                        &highlight_cache,
+                        &mut highlight_pending,
+                        &highlight_req_tx,
+                        rect.height(),
+                    );
                 } else {
                     draw_panel(
                         ui,
@@ -1460,7 +1623,16 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
                 if app.preview.is_some() && app.active_panel == ActivePanel::Left {
-                    draw_preview(ui, &mut app, &mut image_cache, &image_req_tx, rect.height());
+                    draw_preview(
+                        ui,
+                        &app,
+                        &mut image_cache,
+                        &image_req_tx,
+                        &highlight_cache,
+                        &mut highlight_pending,
+                        &highlight_req_tx,
+                        rect.height(),
+                    );
                 } else {
                     draw_panel(
                         ui,
@@ -1573,5 +1745,20 @@ fn save_snapshot_png(
     let image = image::RgbaImage::from_raw(width, height, data)
         .ok_or_else(|| anyhow::anyhow!("Failed to create image from snapshot data"))?;
     image.save(path)?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+
+    if let Some(snapshot_path) = parse_snapshot_arg()? {
+        return run_snapshot(&snapshot_path);
+    }
+
+    let event_loop = EventLoop::new()?;
+    let mut app = App::new();
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| anyhow::anyhow!(e))?;
     Ok(())
 }
