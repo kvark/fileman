@@ -554,6 +554,7 @@ fn draw_preview(
     app: &AppState,
     image_cache: &mut ImageCache,
     image_req_tx: &mpsc::Sender<ImageRequest>,
+    min_height: f32,
 ) {
     let colors = app.theme.colors();
     let header_bg = color32(colors.preview_header_bg);
@@ -563,6 +564,7 @@ fn draw_preview(
     egui::Frame::NONE
         .fill(color32(colors.preview_bg))
         .show(ui, |ui| {
+            ui.set_min_height(min_height);
             egui::Frame::NONE.fill(header_bg).show(ui, |ui| {
                 ui.colored_label(header_fg, "Preview (F3/Esc to close)");
             });
@@ -594,7 +596,9 @@ fn draw_preview(
                         );
                     }
                 }
-                None => {}
+                None => {
+                    ui.colored_label(text_color, "No preview");
+                }
             });
         });
 }
@@ -618,33 +622,6 @@ fn draw_theme_picker(ctx: &egui::Context, app: &mut AppState) {
                     app.theme_picker_selected = Some(i);
                 }
             }
-        });
-}
-
-fn draw_top_bar(ctx: &egui::Context, app: &AppState) {
-    let colors = app.theme.colors();
-    egui::TopBottomPanel::top("top_bar")
-        .exact_height(40.0)
-        .show(ctx, |ui| {
-            egui::Frame::NONE
-                .fill(color32(colors.header_bg))
-                .inner_margin(egui::Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let title = egui::RichText::new("Fileman")
-                            .color(color32(colors.header_fg))
-                            .strong();
-                        ui.label(title);
-                        ui.add_space(18.0);
-                        let active_label = match app.active_panel {
-                            ActivePanel::Left => "Active: Left",
-                            ActivePanel::Right => "Active: Right",
-                        };
-                        ui.label(
-                            egui::RichText::new(active_label).color(color32(colors.header_fg)),
-                        );
-                    });
-                });
         });
 }
 
@@ -692,10 +669,11 @@ fn draw_panel(
     panel_side: ActivePanel,
     _image_cache: &mut ImageCache,
     _image_req_tx: &mpsc::Sender<ImageRequest>,
+    min_height: f32,
 ) -> usize {
     let available = ui.available_size();
     ui.set_min_size(available);
-    let panel_height = available.y.max(0.0);
+    let panel_height = available.y.max(0.0).max(min_height);
     let colors = app.theme.colors();
     let is_active = app.active_panel == panel_side;
 
@@ -808,20 +786,24 @@ fn draw_panel(
                                         egui::CornerRadius::same(3),
                                         color32(bg),
                                     );
-                                    if entry.is_dir {
-                                        let bar_rect = egui::Rect::from_min_max(
-                                            rect.left_top(),
-                                            rect.left_top() + egui::Vec2::new(4.0, rect.height()),
-                                        );
-                                        ui.painter().rect_filled(
-                                            bar_rect,
-                                            egui::CornerRadius::same(3),
-                                            color32(colors.panel_border_active),
-                                        );
-                                    }
+                                    let icon_size = egui::Vec2::splat(10.0);
+                                    let icon_pos = rect.left_center()
+                                        - egui::Vec2::new(0.0, icon_size.y * 0.5)
+                                        + egui::Vec2::new(6.0, 0.0);
+                                    let icon_rect = egui::Rect::from_min_size(icon_pos, icon_size);
+                                    let icon_color = if entry.is_dir {
+                                        colors.panel_border_active
+                                    } else {
+                                        colors.row_fg_inactive
+                                    };
+                                    ui.painter().rect_filled(
+                                        icon_rect,
+                                        egui::CornerRadius::same(2),
+                                        color32(icon_color),
+                                    );
                                     let font_id = egui::TextStyle::Body.resolve(ui.style());
                                     ui.painter().text(
-                                        rect.left_center() + egui::Vec2::new(10.0, 0.0),
+                                        rect.left_center() + egui::Vec2::new(22.0, 0.0),
                                         egui::Align2::LEFT_CENTER,
                                         entry.name.as_str(),
                                         font_id,
@@ -1161,59 +1143,72 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    draw_top_bar(ctx, &runtime.app);
-
                     draw_command_bar(ctx, &runtime.app.theme.colors());
 
-                    if runtime.app.preview.is_some() {
-                        egui::TopBottomPanel::bottom("preview")
-                            .exact_height(220.0)
-                            .show(ctx, |ui| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let spacing_x = ui.spacing().item_spacing.x;
+                        let panel_width = ((rect.width() - spacing_x) * 0.5).max(0.0);
+                        let left_rect = egui::Rect::from_min_size(
+                            rect.min,
+                            egui::Vec2::new(panel_width, rect.height()),
+                        );
+                        let right_rect = egui::Rect::from_min_size(
+                            rect.min + egui::Vec2::new(panel_width + spacing_x, 0.0),
+                            egui::Vec2::new(panel_width, rect.height()),
+                        );
+
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                            if runtime.app.preview.is_some()
+                                && runtime.app.active_panel == ActivePanel::Right
+                            {
                                 draw_preview(
                                     ui,
                                     &mut runtime.app,
                                     &mut runtime.image_cache,
                                     &runtime.image_req_tx,
+                                    rect.height(),
                                 );
-                            });
-                    }
-
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let available = ui.available_size();
-                        let spacing_x = ui.spacing().item_spacing.x;
-                        let panel_width = ((available.x - spacing_x) * 0.5).max(0.0);
-                        ui.allocate_ui_with_layout(
-                            available,
-                            egui::Layout::left_to_right(egui::Align::TOP),
-                            |ui| {
-                                ui.allocate_ui_with_layout(
-                                    egui::Vec2::new(panel_width, available.y),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| {
-                                        runtime.ui_cache.left_rows = draw_panel(
-                                            ui,
-                                            &mut runtime.app,
-                                            ActivePanel::Left,
-                                            &mut runtime.image_cache,
-                                            &runtime.image_req_tx,
-                                        );
-                                    },
+                            } else {
+                                runtime.ui_cache.left_rows = draw_panel(
+                                    ui,
+                                    &mut runtime.app,
+                                    ActivePanel::Left,
+                                    &mut runtime.image_cache,
+                                    &runtime.image_req_tx,
+                                    rect.height(),
                                 );
-                                ui.separator();
-                                ui.allocate_ui_with_layout(
-                                    egui::Vec2::new(panel_width, available.y),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| {
-                                        runtime.ui_cache.right_rows = draw_panel(
-                                            ui,
-                                            &mut runtime.app,
-                                            ActivePanel::Right,
-                                            &mut runtime.image_cache,
-                                            &runtime.image_req_tx,
-                                        );
-                                    },
+                            }
+                        });
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                            if runtime.app.preview.is_some()
+                                && runtime.app.active_panel == ActivePanel::Left
+                            {
+                                draw_preview(
+                                    ui,
+                                    &mut runtime.app,
+                                    &mut runtime.image_cache,
+                                    &runtime.image_req_tx,
+                                    rect.height(),
                                 );
-                            },
+                            } else {
+                                runtime.ui_cache.right_rows = draw_panel(
+                                    ui,
+                                    &mut runtime.app,
+                                    ActivePanel::Right,
+                                    &mut runtime.image_cache,
+                                    &runtime.image_req_tx,
+                                    rect.height(),
+                                );
+                            }
+                        });
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                rect.min + egui::Vec2::new(panel_width, 0.0),
+                                egui::Vec2::new(spacing_x, rect.height()),
+                            ),
+                            egui::CornerRadius::ZERO,
+                            color32(runtime.app.theme.colors().divider),
                         );
                     });
 
@@ -1433,29 +1428,58 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     };
     let output = egui_ctx.run(raw_input, |ctx| {
         apply_theme(ctx, &app.theme.colors());
-        draw_top_bar(ctx, &app);
         draw_command_bar(ctx, &app.theme.colors());
         let _ui_cache = UiCache {
             left_rows: 10,
             right_rows: 10,
         };
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.columns(2, |cols| {
-                draw_panel(
-                    &mut cols[0],
-                    &mut app,
-                    ActivePanel::Left,
-                    &mut image_cache,
-                    &image_req_tx,
-                );
-                draw_panel(
-                    &mut cols[1],
-                    &mut app,
-                    ActivePanel::Right,
-                    &mut image_cache,
-                    &image_req_tx,
-                );
+            let rect = ui.available_rect_before_wrap();
+            let spacing_x = ui.spacing().item_spacing.x;
+            let panel_width = ((rect.width() - spacing_x) * 0.5).max(0.0);
+            let left_rect =
+                egui::Rect::from_min_size(rect.min, egui::Vec2::new(panel_width, rect.height()));
+            let right_rect = egui::Rect::from_min_size(
+                rect.min + egui::Vec2::new(panel_width + spacing_x, 0.0),
+                egui::Vec2::new(panel_width, rect.height()),
+            );
+
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                if app.preview.is_some() && app.active_panel == ActivePanel::Right {
+                    draw_preview(ui, &mut app, &mut image_cache, &image_req_tx, rect.height());
+                } else {
+                    draw_panel(
+                        ui,
+                        &mut app,
+                        ActivePanel::Left,
+                        &mut image_cache,
+                        &image_req_tx,
+                        rect.height(),
+                    );
+                }
             });
+            ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                if app.preview.is_some() && app.active_panel == ActivePanel::Left {
+                    draw_preview(ui, &mut app, &mut image_cache, &image_req_tx, rect.height());
+                } else {
+                    draw_panel(
+                        ui,
+                        &mut app,
+                        ActivePanel::Right,
+                        &mut image_cache,
+                        &image_req_tx,
+                        rect.height(),
+                    );
+                }
+            });
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    rect.min + egui::Vec2::new(panel_width, 0.0),
+                    egui::Vec2::new(spacing_x, rect.height()),
+                ),
+                egui::CornerRadius::ZERO,
+                color32(app.theme.colors().divider),
+            );
         });
     });
 
