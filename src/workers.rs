@@ -1,8 +1,9 @@
 use std::{sync::mpsc, thread};
 
 use crate::core::{
-    EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, copy_recursively, hexdump,
-    is_probably_text, read_bytes_prefix, read_zip_bytes_prefix,
+    EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, copy_recursively,
+    format_container_listing, hexdump, is_probably_text, read_bytes_prefix,
+    read_container_bytes_prefix, read_container_directory,
 };
 
 pub fn start_io_worker() -> (mpsc::Sender<IOTask>, mpsc::Receiver<IOResult>) {
@@ -81,10 +82,16 @@ pub fn start_preview_worker() -> (
                             }
                             Err(e) => PreviewContent::Text(format!("Failed to read file: {e}")),
                         },
-                        EntryLocation::Zip {
+                        EntryLocation::Container {
+                            kind,
                             archive_path,
                             inner_path,
-                        } => match read_zip_bytes_prefix(&archive_path, &inner_path, max_bytes) {
+                        } => match read_container_bytes_prefix(
+                            kind,
+                            &archive_path,
+                            &inner_path,
+                            max_bytes,
+                        ) {
                             Ok(bytes) => {
                                 if is_probably_text(&bytes) {
                                     let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -99,6 +106,25 @@ pub fn start_preview_worker() -> (
                         },
                     };
                     let _ = result_tx.send((id, content));
+                }
+                PreviewRequest::ListContainer {
+                    id,
+                    kind,
+                    archive_path,
+                    max_entries,
+                } => {
+                    let entries = match read_container_directory(kind, &archive_path, "") {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            let content =
+                                PreviewContent::Text(format!("Failed to read archive: {e}"));
+                            let _ = result_tx.send((id, content));
+                            continue;
+                        }
+                    };
+                    let listing =
+                        format_container_listing(kind, &archive_path, &entries, max_entries);
+                    let _ = result_tx.send((id, PreviewContent::Text(listing)));
                 }
             }
         }

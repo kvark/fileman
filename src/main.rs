@@ -30,8 +30,9 @@ use winit::{
 
 use fileman::app_state::{AppState, PanelState, PendingOp};
 use fileman::core::{
-    ActivePanel, DirBatch, DirEntry, EntryLocation, PanelMode, PreviewContent, PreviewRequest,
-    is_zip_path, read_fs_directory, read_zip_directory,
+    ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, PanelMode, PreviewContent,
+    PreviewRequest, container_display_path, container_kind_from_path, read_container_directory,
+    read_fs_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{start_io_worker, start_preview_worker};
@@ -206,13 +207,11 @@ On Linux in CI or headless environments, Vulkan is often unavailable."
 fn panel_path_display(panel: &PanelState) -> String {
     match &panel.mode {
         PanelMode::Fs => panel.current_path.to_string_lossy().into_owned(),
-        PanelMode::Zip { archive_path, cwd } => {
-            if cwd.is_empty() {
-                format!("{}::zip:/", archive_path.to_string_lossy())
-            } else {
-                format!("{}::zip:/{}", archive_path.to_string_lossy(), cwd)
-            }
-        }
+        PanelMode::Container {
+            kind,
+            archive_path,
+            cwd,
+        } => container_display_path(*kind, archive_path, cwd),
     }
 }
 
@@ -409,8 +408,9 @@ fn load_fs_directory_async(
     panel_state.prefer_select_name = remembered;
 }
 
-fn load_zip_directory_async(
+fn load_container_directory_async(
     app: &mut AppState,
+    kind: ContainerKind,
     archive_path: PathBuf,
     cwd: String,
     target_panel: ActivePanel,
@@ -426,7 +426,8 @@ fn load_zip_directory_async(
         initial.push(DirEntry {
             name: "..".into(),
             is_dir: true,
-            location: EntryLocation::Zip {
+            location: EntryLocation::Container {
+                kind,
                 archive_path: archive_path.clone(),
                 inner_path: parent,
             },
@@ -442,12 +443,13 @@ fn load_zip_directory_async(
     let (tx, rx) = mpsc::channel::<DirBatch>();
     let archive_clone = archive_path.clone();
     let cwd_clone = cwd.clone();
+    let kind_clone = kind;
 
     thread::spawn(move || {
-        let all = match read_zip_directory(&archive_clone, &cwd_clone) {
+        let all = match read_container_directory(kind_clone, &archive_clone, &cwd_clone) {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!("Failed to read zip: {e}");
+                eprintln!("Failed to read container: {e}");
                 return;
             }
         };
@@ -471,14 +473,15 @@ fn load_zip_directory_async(
     });
 
     let remembered = prefer_name.clone().or_else(|| {
-        app.zip_last_selected_name
-            .get(&(archive_path.clone(), cwd.clone()))
+        app.container_last_selected_name
+            .get(&(archive_path.clone(), cwd.clone(), kind))
             .cloned()
     });
     let panel_state = app.panel_mut(target_panel);
 
     panel_state.current_path = archive_path.clone();
-    panel_state.mode = PanelMode::Zip {
+    panel_state.mode = PanelMode::Container {
+        kind,
         archive_path: archive_path.clone(),
         cwd: cwd.clone(),
     };
@@ -492,18 +495,18 @@ fn load_zip_directory_async(
 fn open_selected(app: &mut AppState) {
     let active = app.active_panel.clone();
 
-    let (selected_entry, current_path, zip_cwd) = {
+    let (selected_entry, current_path, container_cwd) = {
         let panel = app.get_active_panel();
         if panel.entries.is_empty() {
             return;
         }
         let entry = panel.entries[panel.selected_index].clone();
         let current_path = panel.current_path.clone();
-        let zip_cwd = match &panel.mode {
-            PanelMode::Zip { cwd, .. } => Some(cwd.clone()),
+        let container_cwd = match &panel.mode {
+            PanelMode::Container { cwd, .. } => Some(cwd.clone()),
             _ => None,
         };
-        (entry, current_path, zip_cwd)
+        (entry, current_path, container_cwd)
     };
 
     app.store_current_selection_memory();
@@ -525,17 +528,25 @@ fn open_selected(app: &mut AppState) {
                 {
                     app.select_entry_by_name(active, &name);
                 }
-            } else if is_zip_path(path) {
-                load_zip_directory_async(app, path.clone(), "".to_string(), active, None);
+            } else if let Some(kind) = container_kind_from_path(path) {
+                load_container_directory_async(
+                    app,
+                    kind,
+                    path.clone(),
+                    "".to_string(),
+                    active,
+                    None,
+                );
             }
         }
-        EntryLocation::Zip {
+        EntryLocation::Container {
+            kind,
             archive_path,
             inner_path,
         } => {
             if selected_entry.is_dir {
                 let prefer_name = if selected_entry.name == ".." {
-                    zip_cwd.as_ref().and_then(|cwd| {
+                    container_cwd.as_ref().and_then(|cwd| {
                         cwd.trim_end_matches('/')
                             .rsplit('/')
                             .next()
@@ -544,8 +555,9 @@ fn open_selected(app: &mut AppState) {
                 } else {
                     None
                 };
-                load_zip_directory_async(
+                load_container_directory_async(
                     app,
+                    *kind,
                     archive_path.clone(),
                     inner_path.clone(),
                     active.clone(),
@@ -554,8 +566,8 @@ fn open_selected(app: &mut AppState) {
 
                 if selected_entry.name != ".."
                     && let Some(name) = app
-                        .zip_last_selected_name
-                        .get(&(archive_path.clone(), inner_path.clone()))
+                        .container_last_selected_name
+                        .get(&(archive_path.clone(), inner_path.clone(), *kind))
                         .cloned()
                 {
                     app.select_entry_by_name(active, &name);
@@ -1302,7 +1314,7 @@ impl ApplicationHandler for App {
             io_tx,
             io_rx,
             fs_last_selected_name: Default::default(),
-            zip_last_selected_name: Default::default(),
+            container_last_selected_name: Default::default(),
             theme: Theme::dark(),
             theme_picker_open: false,
             theme_picker_selected: None,
@@ -1695,7 +1707,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         io_tx,
         io_rx,
         fs_last_selected_name: Default::default(),
-        zip_last_selected_name: Default::default(),
+        container_last_selected_name: Default::default(),
         theme: Theme::dark(),
         theme_picker_open: false,
         theme_picker_selected: None,

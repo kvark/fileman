@@ -6,10 +6,91 @@ use std::{
     sync::Arc,
 };
 
+pub trait ContainerPlugin: Sync {
+    fn kind(&self) -> ContainerKind;
+    fn scheme(&self) -> &'static str;
+    fn matches_path(&self, path: &Path) -> bool;
+    fn read_dir(&self, archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>>;
+    fn read_bytes_prefix(
+        &self,
+        archive_path: &Path,
+        inner_path: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<Vec<u8>>;
+    fn read_metadata(
+        &self,
+        archive_path: &Path,
+        inner_path: &str,
+    ) -> anyhow::Result<Option<(u64, Option<u32>)>>;
+}
+
+struct ZipPlugin;
+struct TarGzPlugin;
+
+static ZIP_PLUGIN: ZipPlugin = ZipPlugin;
+static TAR_GZ_PLUGIN: TarGzPlugin = TarGzPlugin;
+
+fn container_plugins() -> &'static [&'static dyn ContainerPlugin] {
+    static PLUGINS: [&dyn ContainerPlugin; 2] = [&ZIP_PLUGIN, &TAR_GZ_PLUGIN];
+    &PLUGINS
+}
+
+fn plugin_for_kind(kind: ContainerKind) -> &'static dyn ContainerPlugin {
+    for plugin in container_plugins() {
+        if plugin.kind() == kind {
+            return *plugin;
+        }
+    }
+    &ZIP_PLUGIN
+}
+
+fn container_scheme(kind: ContainerKind) -> &'static str {
+    plugin_for_kind(kind).scheme()
+}
+
+pub fn container_display_path(
+    kind: ContainerKind,
+    archive_path: &Path,
+    inner_path: &str,
+) -> String {
+    if inner_path.is_empty() {
+        format!(
+            "{}::{}:/",
+            archive_path.to_string_lossy(),
+            container_scheme(kind)
+        )
+    } else {
+        format!(
+            "{}::{}:/{}",
+            archive_path.to_string_lossy(),
+            container_scheme(kind),
+            inner_path
+        )
+    }
+}
+
+pub fn container_kind_from_path(path: &Path) -> Option<ContainerKind> {
+    container_plugins()
+        .iter()
+        .find(|plugin| plugin.matches_path(path))
+        .map(|plugin| plugin.kind())
+}
+
+pub fn is_container_path(p: &Path) -> bool {
+    container_kind_from_path(p).is_some()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContainerKind {
+    Zip,
+    TarGz,
+}
+
 #[derive(Clone)]
 pub enum EntryLocation {
     Fs(path::PathBuf),
-    Zip {
+    Container {
+        kind: ContainerKind,
         archive_path: path::PathBuf,
         inner_path: String, // no leading slash, '' means root
     },
@@ -35,7 +116,8 @@ pub enum ActivePanel {
 
 pub enum PanelMode {
     Fs,
-    Zip {
+    Container {
+        kind: ContainerKind,
         archive_path: path::PathBuf,
         cwd: String,
     },
@@ -51,6 +133,12 @@ pub enum PreviewRequest {
         id: u64,
         location: EntryLocation,
         max_bytes: usize,
+    },
+    ListContainer {
+        id: u64,
+        kind: ContainerKind,
+        archive_path: path::PathBuf,
+        max_entries: usize,
     },
 }
 
@@ -131,7 +219,7 @@ pub fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
     Ok(entries)
 }
 
-pub fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
+fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
     let file = fs::File::open(archive_path)?;
     let mut zip = zip::ZipArchive::new(file)?;
     let mut dirs: HashSet<String> = HashSet::new();
@@ -172,7 +260,8 @@ pub fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
-            location: EntryLocation::Zip {
+            location: EntryLocation::Container {
+                kind: ContainerKind::Zip,
                 archive_path: archive_path.to_path_buf(),
                 inner_path: parent,
             },
@@ -190,7 +279,8 @@ pub fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<
         .map(|d| DirEntry {
             name: d.clone(),
             is_dir: true,
-            location: EntryLocation::Zip {
+            location: EntryLocation::Container {
+                kind: ContainerKind::Zip,
                 archive_path: archive_path.to_path_buf(),
                 inner_path: if cwd.is_empty() {
                     d
@@ -206,7 +296,8 @@ pub fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<
         .map(|f| DirEntry {
             name: f.clone(),
             is_dir: false,
-            location: EntryLocation::Zip {
+            location: EntryLocation::Container {
+                kind: ContainerKind::Zip,
                 archive_path: archive_path.to_path_buf(),
                 inner_path: if cwd.is_empty() {
                     f
@@ -225,27 +316,15 @@ pub fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<
     Ok(entries)
 }
 
-pub fn is_zip_path(p: &Path) -> bool {
-    matches!(
-        p.extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase()),
-        Some(ext) if ext == "zip"
-    )
-}
-
 pub fn format_preview_info(kind: &str, location: &EntryLocation) -> String {
     match location {
         EntryLocation::Fs(path) => format!("{kind}\n{}", path.to_string_lossy()),
-        EntryLocation::Zip {
+        EntryLocation::Container {
+            kind: container_kind,
             archive_path,
             inner_path,
         } => {
-            let display = if inner_path.is_empty() {
-                format!("{}::zip:/", archive_path.to_string_lossy())
-            } else {
-                format!("{}::zip:/{}", archive_path.to_string_lossy(), inner_path)
-            };
+            let display = container_display_path(*container_kind, archive_path, inner_path);
             format!("{kind}\n{display}")
         }
     }
@@ -273,6 +352,120 @@ pub fn is_text_path(p: &Path) -> bool {
     )
 }
 
+pub fn format_container_listing(
+    kind: ContainerKind,
+    archive_path: &Path,
+    entries: &[DirEntry],
+    max_entries: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str("Archive\n");
+    out.push_str(&container_display_path(kind, archive_path, ""));
+    out.push('\n');
+    out.push('\n');
+    out.push_str("Contents:\n");
+    let mut count = 0usize;
+    for entry in entries.iter() {
+        if entry.name == ".." {
+            continue;
+        }
+        if count >= max_entries {
+            out.push_str(&format!(
+                "… and {} more\n",
+                entries.len().saturating_sub(count)
+            ));
+            break;
+        }
+        let size = read_container_metadata(kind, archive_path, entry_name_for_metadata(entry))
+            .ok()
+            .flatten()
+            .map(|(size, mode)| (format_size(size), mode));
+        let mode_str = size.as_ref().and_then(|(_, mode)| mode.map(format_mode));
+        let size_str = size.as_ref().map(|(size, _)| size.as_str());
+
+        let mut line = String::new();
+        if let Some(mode) = mode_str {
+            line.push_str(&mode);
+            line.push(' ');
+        } else {
+            line.push_str("---- ");
+        }
+        if let Some(size) = size_str {
+            line.push_str(size);
+        } else {
+            line.push_str("    -");
+        }
+        line.push(' ');
+        line.push_str(&entry_display_name(entry));
+        line.push('\n');
+        out.push_str(&line);
+        count += 1;
+    }
+    out
+}
+
+fn entry_display_name(entry: &DirEntry) -> String {
+    if entry.is_dir {
+        format!("{}/", entry.name)
+    } else {
+        entry.name.clone()
+    }
+}
+
+fn entry_name_for_metadata(entry: &DirEntry) -> &str {
+    match &entry.location {
+        EntryLocation::Container { inner_path, .. } => inner_path,
+        _ => &entry.name,
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1}G", b / GB)
+    } else if b >= MB {
+        format!("{:.1}M", b / MB)
+    } else if b >= KB {
+        format!("{:.1}K", b / KB)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn format_mode(mode: u32) -> String {
+    let file_type = if mode & 0o40000 != 0 {
+        'd'
+    } else if mode & 0o120000 != 0 {
+        'l'
+    } else {
+        '-'
+    };
+    let mut out = String::with_capacity(10);
+    out.push(file_type);
+    let perms = [
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
+    ];
+    for (mask, ch) in perms {
+        if mode & mask != 0 {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    out
+}
+
 pub fn read_text_preview(path: &Path, max_bytes: usize) -> anyhow::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut buf = Vec::new();
@@ -287,7 +480,7 @@ pub fn read_bytes_prefix(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8
     Ok(buf)
 }
 
-pub fn read_zip_bytes_prefix(
+fn read_zip_bytes_prefix(
     archive_path: &Path,
     inner_path: &str,
     max_bytes: usize,
@@ -313,6 +506,271 @@ pub fn read_zip_bytes_prefix(
             "Entry not found in zip: {}",
             inner_path
         )))
+    }
+}
+
+fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut dirs: HashSet<String> = HashSet::new();
+    let mut files: Vec<String> = Vec::new();
+
+    let prefix = if cwd.is_empty() {
+        "".to_string()
+    } else {
+        format!("{}/", cwd.trim_end_matches('/'))
+    };
+
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let path = entry.path()?;
+        let name = normalize_archive_path(&path);
+        if name.is_empty() || !name.starts_with(&prefix) {
+            continue;
+        }
+        let rem = &name[prefix.len()..];
+        if rem.is_empty() {
+            continue;
+        }
+        if let Some(slash) = rem.find('/') {
+            let dir = rem[..slash].to_string();
+            dirs.insert(dir);
+        } else {
+            files.push(rem.to_string());
+        }
+    }
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+
+    if !cwd.is_empty() {
+        let parent = cwd
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        entries.push(DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            location: EntryLocation::Container {
+                kind: ContainerKind::TarGz,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: parent,
+            },
+        });
+    } else if let Some(parent) = archive_path.parent() {
+        entries.push(DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            location: EntryLocation::Fs(parent.to_path_buf()),
+        });
+    }
+
+    let mut dir_entries: Vec<DirEntry> = dirs
+        .into_iter()
+        .map(|d| DirEntry {
+            name: d.clone(),
+            is_dir: true,
+            location: EntryLocation::Container {
+                kind: ContainerKind::TarGz,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: if cwd.is_empty() {
+                    d
+                } else {
+                    format!("{}/{}", cwd.trim_end_matches('/'), d)
+                },
+            },
+        })
+        .collect();
+
+    let mut file_entries: Vec<DirEntry> = files
+        .into_iter()
+        .map(|f| DirEntry {
+            name: f.clone(),
+            is_dir: false,
+            location: EntryLocation::Container {
+                kind: ContainerKind::TarGz,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: if cwd.is_empty() {
+                    f
+                } else {
+                    format!("{}/{}", cwd.trim_end_matches('/'), f)
+                },
+            },
+        })
+        .collect();
+
+    dir_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    file_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries.extend(dir_entries);
+    entries.extend(file_entries);
+
+    Ok(entries)
+}
+
+fn read_tar_gz_bytes_prefix(
+    archive_path: &Path,
+    inner_path: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let normalized = inner_path.trim_start_matches('/');
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let name = normalize_archive_path(&path);
+        if name == normalized {
+            let mut data = Vec::new();
+            entry
+                .by_ref()
+                .take(max_bytes as u64)
+                .read_to_end(&mut data)?;
+            return Ok(data);
+        }
+    }
+    Err(anyhow::anyhow!(format!(
+        "Entry not found in tar.gz: {}",
+        inner_path
+    )))
+}
+
+fn normalize_archive_path(path: &Path) -> String {
+    let mut s = path.to_string_lossy().replace('\\', "/");
+    while s.starts_with("./") {
+        s = s[2..].to_string();
+    }
+    s.trim_start_matches('/').to_string()
+}
+
+pub fn read_container_directory(
+    kind: ContainerKind,
+    archive_path: &Path,
+    cwd: &str,
+) -> anyhow::Result<Vec<DirEntry>> {
+    plugin_for_kind(kind).read_dir(archive_path, cwd)
+}
+
+pub fn read_container_bytes_prefix(
+    kind: ContainerKind,
+    archive_path: &Path,
+    inner_path: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    plugin_for_kind(kind).read_bytes_prefix(archive_path, inner_path, max_bytes)
+}
+
+pub fn read_container_metadata(
+    kind: ContainerKind,
+    archive_path: &Path,
+    inner_path: &str,
+) -> anyhow::Result<Option<(u64, Option<u32>)>> {
+    plugin_for_kind(kind).read_metadata(archive_path, inner_path)
+}
+
+impl ContainerPlugin for ZipPlugin {
+    fn kind(&self) -> ContainerKind {
+        ContainerKind::Zip
+    }
+
+    fn scheme(&self) -> &'static str {
+        "zip"
+    }
+
+    fn matches_path(&self, path: &Path) -> bool {
+        matches!(
+            path.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase()),
+            Some(ext) if ext == "zip"
+        )
+    }
+
+    fn read_dir(&self, archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
+        read_zip_directory(archive_path, cwd)
+    }
+
+    fn read_bytes_prefix(
+        &self,
+        archive_path: &Path,
+        inner_path: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        read_zip_bytes_prefix(archive_path, inner_path, max_bytes)
+    }
+
+    fn read_metadata(
+        &self,
+        archive_path: &Path,
+        inner_path: &str,
+    ) -> anyhow::Result<Option<(u64, Option<u32>)>> {
+        let file = fs::File::open(archive_path)?;
+        let mut zip = zip::ZipArchive::new(file)?;
+        let normalized = inner_path.trim_start_matches('/');
+        for i in 0..zip.len() {
+            let entry = zip.by_index(i)?;
+            if entry.name() == normalized {
+                let size = entry.size();
+                let mode = entry.unix_mode();
+                return Ok(Some((size, mode)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl ContainerPlugin for TarGzPlugin {
+    fn kind(&self) -> ContainerKind {
+        ContainerKind::TarGz
+    }
+
+    fn scheme(&self) -> &'static str {
+        "tar.gz"
+    }
+
+    fn matches_path(&self, path: &Path) -> bool {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        name.ends_with(".tar.gz") || name.ends_with(".tgz")
+    }
+
+    fn read_dir(&self, archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
+        read_tar_gz_directory(archive_path, cwd)
+    }
+
+    fn read_bytes_prefix(
+        &self,
+        archive_path: &Path,
+        inner_path: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        read_tar_gz_bytes_prefix(archive_path, inner_path, max_bytes)
+    }
+
+    fn read_metadata(
+        &self,
+        archive_path: &Path,
+        inner_path: &str,
+    ) -> anyhow::Result<Option<(u64, Option<u32>)>> {
+        let file = fs::File::open(archive_path)?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let normalized = inner_path.trim_start_matches('/');
+        for entry in archive.entries()? {
+            let entry = entry?;
+            let path = entry.path()?;
+            let name = normalize_archive_path(&path);
+            if name == normalized {
+                let size = entry.size();
+                let mode = entry.header().mode().ok().map(|v| v as u32);
+                return Ok(Some((size, mode)));
+            }
+        }
+        Ok(None)
     }
 }
 
