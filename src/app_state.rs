@@ -29,6 +29,9 @@ pub struct AppState {
     pub preview_request_id: u64,
     pub io_tx: mpsc::Sender<IOTask>,
     pub io_rx: mpsc::Receiver<IOResult>,
+    pub io_cancel_tx: mpsc::Sender<()>,
+    pub io_in_flight: usize,
+    pub io_cancel_requested: bool,
     pub fs_last_selected_name: HashMap<path::PathBuf, String>,
     pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
     pub theme: Theme,
@@ -40,8 +43,9 @@ pub struct AppState {
 #[derive(Clone)]
 pub enum PendingOp {
     Copy {
-        src: path::PathBuf,
+        src: EntryLocation,
         dst_dir: path::PathBuf,
+        kind: CopyKind,
     },
     Move {
         src: path::PathBuf,
@@ -50,6 +54,12 @@ pub enum PendingOp {
     Delete {
         target: path::PathBuf,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CopyKind {
+    File,
+    Directory,
 }
 
 impl AppState {
@@ -280,18 +290,37 @@ impl AppState {
 
     pub fn enqueue_pending_op(&mut self, op: &PendingOp) {
         match op {
-            PendingOp::Copy { src, dst_dir } => {
-                if let Err(e) = self.io_tx.send(IOTask::Copy {
-                    src: src.clone(),
-                    dst_dir: dst_dir.clone(),
-                }) {
+            PendingOp::Copy { src, dst_dir, kind } => {
+                let task = match src {
+                    EntryLocation::Fs(path) => IOTask::Copy {
+                        src: path.clone(),
+                        dst_dir: dst_dir.clone(),
+                    },
+                    EntryLocation::Container {
+                        kind: container_kind,
+                        archive_path,
+                        inner_path,
+                    } => match kind {
+                        CopyKind::File => IOTask::CopyContainer {
+                            kind: *container_kind,
+                            archive_path: archive_path.clone(),
+                            inner_path: inner_path.clone(),
+                            dst_dir: dst_dir.clone(),
+                            display_name: src.display_name(),
+                        },
+                        CopyKind::Directory => IOTask::CopyContainerDir {
+                            kind: *container_kind,
+                            archive_path: archive_path.clone(),
+                            inner_path: inner_path.clone(),
+                            dst_dir: dst_dir.clone(),
+                            display_name: src.display_name(),
+                        },
+                    },
+                };
+                if let Err(e) = self.io_tx.send(task) {
                     eprintln!("Failed to enqueue copy: {e}");
                 } else {
-                    log::info!(
-                        "Enqueued copy: {} -> {}",
-                        src.to_string_lossy(),
-                        dst_dir.to_string_lossy()
-                    );
+                    self.io_in_flight = self.io_in_flight.saturating_add(1);
                 }
             }
             PendingOp::Move { src, dst_dir } => {
@@ -301,6 +330,7 @@ impl AppState {
                 }) {
                     eprintln!("Failed to enqueue move: {e}");
                 } else {
+                    self.io_in_flight = self.io_in_flight.saturating_add(1);
                     log::info!(
                         "Enqueued move: {} -> {}",
                         src.to_string_lossy(),
@@ -314,24 +344,41 @@ impl AppState {
                 }) {
                     eprintln!("Failed to enqueue delete: {e}");
                 } else {
+                    self.io_in_flight = self.io_in_flight.saturating_add(1);
                     log::info!("Enqueued delete: {}", target.to_string_lossy());
                 }
             }
         }
     }
 
+    pub fn on_io_completed(&mut self, count: usize) {
+        self.io_in_flight = self.io_in_flight.saturating_sub(count);
+        if self.io_in_flight == 0 {
+            self.io_cancel_requested = false;
+        }
+    }
+
+    pub fn request_io_cancel(&mut self) {
+        if self.io_in_flight == 0 {
+            return;
+        }
+        self.io_cancel_requested = true;
+        let _ = self.io_cancel_tx.send(());
+    }
+
     fn build_copy_op(&self) -> Option<PendingOp> {
-        let src = {
+        let (src, kind) = {
             let p = self.get_active_panel();
             if p.entries.is_empty() {
                 return None;
             }
-            match &p.entries[p.selected_index].location {
-                EntryLocation::Fs(path) => path.clone(),
-                EntryLocation::Container { .. } => {
-                    return None;
-                }
-            }
+            let entry = &p.entries[p.selected_index];
+            let kind = if entry.is_dir {
+                CopyKind::Directory
+            } else {
+                CopyKind::File
+            };
+            (entry.location.clone(), kind)
         };
 
         let dst_dir = {
@@ -347,7 +394,7 @@ impl AppState {
             }
         };
 
-        Some(PendingOp::Copy { src, dst_dir })
+        Some(PendingOp::Copy { src, dst_dir, kind })
     }
 
     fn build_move_op(&self) -> Option<PendingOp> {

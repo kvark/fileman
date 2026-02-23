@@ -1,20 +1,71 @@
 use std::{sync::mpsc, thread};
 
 use crate::core::{
-    EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, copy_recursively,
-    format_container_listing, hexdump, is_probably_text, read_bytes_prefix,
-    read_container_bytes_prefix, read_container_directory,
+    EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, copy_container_dir,
+    copy_container_entry, copy_recursively, format_container_listing, hexdump, is_probably_text,
+    is_text_name, read_bytes_prefix, read_container_bytes_prefix, read_container_directory,
 };
 
-pub fn start_io_worker() -> (mpsc::Sender<IOTask>, mpsc::Receiver<IOResult>) {
+pub fn start_io_worker() -> (
+    mpsc::Sender<IOTask>,
+    mpsc::Receiver<IOResult>,
+    mpsc::Sender<()>,
+) {
     let (tx, rx) = mpsc::channel::<IOTask>();
     let (result_tx, result_rx) = mpsc::channel::<IOResult>();
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     thread::spawn(move || {
+        let mut cancel_requested = false;
         while let Ok(task) = rx.recv() {
+            while cancel_rx.try_recv().is_ok() {
+                cancel_requested = true;
+            }
+            if cancel_requested {
+                let _ = result_tx.send(IOResult::Completed);
+                while let Ok(_dropped) = rx.try_recv() {
+                    let _ = result_tx.send(IOResult::Completed);
+                }
+                cancel_requested = false;
+                continue;
+            }
             match task {
                 IOTask::Copy { src, dst_dir } => {
                     if let Err(e) = copy_recursively(&src, &dst_dir) {
                         eprintln!("Copy error: {e}");
+                    }
+                }
+                IOTask::CopyContainer {
+                    kind,
+                    archive_path,
+                    inner_path,
+                    dst_dir,
+                    display_name,
+                } => {
+                    if let Err(e) = copy_container_entry(
+                        kind,
+                        &archive_path,
+                        &inner_path,
+                        &dst_dir,
+                        &display_name,
+                    ) {
+                        eprintln!("Copy container error: {e}");
+                    }
+                }
+                IOTask::CopyContainerDir {
+                    kind,
+                    archive_path,
+                    inner_path,
+                    dst_dir,
+                    display_name,
+                } => {
+                    if let Err(e) = copy_container_dir(
+                        kind,
+                        &archive_path,
+                        &inner_path,
+                        &dst_dir,
+                        &display_name,
+                    ) {
+                        eprintln!("Copy container dir error: {e}");
                     }
                 }
                 IOTask::Move { src, dst_dir } => {
@@ -50,7 +101,7 @@ pub fn start_io_worker() -> (mpsc::Sender<IOTask>, mpsc::Receiver<IOResult>) {
             let _ = result_tx.send(IOResult::Completed);
         }
     });
-    (tx, result_rx)
+    (tx, result_rx, cancel_tx)
 }
 
 pub fn start_preview_worker() -> (
@@ -93,7 +144,7 @@ pub fn start_preview_worker() -> (
                             max_bytes,
                         ) {
                             Ok(bytes) => {
-                                if is_probably_text(&bytes) {
+                                if is_text_name(&inner_path) || is_probably_text(&bytes) {
                                     let text = String::from_utf8_lossy(&bytes).into_owned();
                                     PreviewContent::Text(text)
                                 } else {

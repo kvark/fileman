@@ -46,6 +46,35 @@ const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 2;
 struct UiCache {
     left_rows: usize,
     right_rows: usize,
+    scroll_mode: ScrollMode,
+    last_left_selected: usize,
+    last_right_selected: usize,
+    last_active_panel: ActivePanel,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollMode {
+    Default,
+    ForceActive,
+}
+
+impl UiCache {
+    fn update_scroll_mode(&mut self, app: &AppState) {
+        let left_selected = app.left_panel.selected_index;
+        let right_selected = app.right_panel.selected_index;
+        let active = app.active_panel.clone();
+        let selection_changed = left_selected != self.last_left_selected
+            || right_selected != self.last_right_selected
+            || active != self.last_active_panel;
+        self.scroll_mode = if selection_changed {
+            ScrollMode::ForceActive
+        } else {
+            ScrollMode::Default
+        };
+        self.last_left_selected = left_selected;
+        self.last_right_selected = right_selected;
+        self.last_active_panel = active;
+    }
 }
 
 struct ImageRequest {
@@ -222,6 +251,16 @@ fn apply_dir_batch(panel: &mut PanelState, batch: DirBatch) {
         .map(|e| e.name.clone());
 
     match batch {
+        DirBatch::Loading => {
+            panel.entries = vec![DirEntry {
+                name: "Loading…".to_string(),
+                is_dir: false,
+                location: EntryLocation::Fs(panel.current_path.clone()),
+            }];
+            panel.selected_index = 0;
+            panel.top_index = 0;
+            return;
+        }
         DirBatch::Append(mut new_entries) => {
             panel.entries.append(&mut new_entries);
         }
@@ -288,6 +327,7 @@ fn load_fs_directory_async(
     }
 
     let (tx, rx) = mpsc::channel::<DirBatch>();
+    let _ = tx.send(DirBatch::Loading);
     let path_clone = path.clone();
 
     if let Ok(mut rd) = fs::read_dir(&path) {
@@ -441,6 +481,7 @@ fn load_container_directory_async(
     }
 
     let (tx, rx) = mpsc::channel::<DirBatch>();
+    let _ = tx.send(DirBatch::Loading);
     let archive_clone = archive_path.clone();
     let cwd_clone = cwd.clone();
     let kind_clone = kind;
@@ -596,8 +637,13 @@ fn handle_keyboard(
     ctx: &egui::Context,
     input: &egui::InputState,
     app: &mut AppState,
-    cache: &UiCache,
+    cache: &mut UiCache,
 ) {
+    if app.io_in_flight > 0 && input.key_pressed(egui::Key::Escape) {
+        app.request_io_cancel();
+        ctx.request_repaint();
+        return;
+    }
     if app.pending_op.is_some() {
         if input.key_pressed(egui::Key::Enter) {
             confirm_pending_op(app);
@@ -656,6 +702,15 @@ fn handle_keyboard(
             new_index = len - 1;
         }
         app.select_entry(new_index, window_rows);
+    }
+    if input.key_pressed(egui::Key::Home) {
+        app.select_entry(0, window_rows);
+    }
+    if input.key_pressed(egui::Key::End) {
+        let panel = app.get_active_panel();
+        if !panel.entries.is_empty() {
+            app.select_entry(panel.entries.len() - 1, window_rows);
+        }
     }
     if input.key_pressed(egui::Key::F3) {
         app.toggle_preview();
@@ -757,15 +812,46 @@ fn draw_confirmation(ctx: &egui::Context, app: &mut AppState) {
     }
 }
 
+fn draw_progress_modal(ctx: &egui::Context, app: &AppState) {
+    if app.io_in_flight == 0 {
+        return;
+    }
+
+    let colors = app.theme.colors();
+    let screen = ctx.available_rect();
+
+    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "progress_overlay".into());
+    ctx.layer_painter(overlay_layer).rect_filled(
+        screen,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_black_alpha(120),
+    );
+
+    egui::Window::new("Working")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.add_space(6.0);
+            let label = if app.io_cancel_requested {
+                "Cancelling…"
+            } else {
+                "Working…"
+            };
+            ui.colored_label(color32(colors.row_fg_active), label);
+            ui.add_space(8.0);
+            ui.add(egui::ProgressBar::new(0.0).animate(true));
+            ui.add_space(6.0);
+            ui.colored_label(color32(colors.row_fg_inactive), "Esc: cancel");
+        });
+}
 fn pending_op_text(op: &PendingOp) -> (&'static str, String) {
     match op {
-        PendingOp::Copy { src, dst_dir } => (
+        PendingOp::Copy { src, dst_dir, .. } => (
             "Confirm Copy",
             format!(
                 "Copy \"{}\" to\n{}?",
-                src.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("<unknown>"),
+                src.display_name(),
                 dst_dir.to_string_lossy()
             ),
         ),
@@ -939,6 +1025,7 @@ fn draw_panel(
     panel_side: ActivePanel,
     _image_cache: &mut ImageCache,
     _image_req_tx: &mpsc::Sender<ImageRequest>,
+    scroll_mode: ScrollMode,
     min_height: f32,
 ) -> usize {
     let available = ui.available_size();
@@ -1007,88 +1094,108 @@ fn draw_panel(
                 rows = window_rows_for(list_height, ui.spacing().item_spacing.y);
                 let mut visible_range = 0..0;
 
+                let mut scroll_target = None;
+                if is_active && scroll_mode == ScrollMode::ForceActive && entries_len > 0 {
+                    let row_height = ROW_HEIGHT + ui.spacing().item_spacing.y;
+                    let total_height =
+                        (row_height * entries_len as f32 - ui.spacing().item_spacing.y).max(0.0);
+                    let center_offset = (list_height - row_height) * 0.5;
+                    let mut target = selected_index as f32 * row_height - center_offset;
+                    if total_height > list_height {
+                        let max_offset = (total_height - list_height).max(0.0);
+                        if target < 0.0 {
+                            target = 0.0;
+                        } else if target > max_offset {
+                            target = max_offset;
+                        }
+                    } else {
+                        target = 0.0;
+                    }
+                    scroll_target = Some(target);
+                }
+
                 ui.allocate_ui_with_layout(
                     egui::Vec2::new(ui.available_width(), list_height),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
-                        egui::ScrollArea::vertical()
+                        let mut scroll = egui::ScrollArea::vertical()
                             .id_salt(match panel_side_for_closure {
                                 ActivePanel::Left => "left_list",
                                 ActivePanel::Right => "right_list",
                             })
-                            .auto_shrink([false, false])
-                            .show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
-                                visible_range = row_range.clone();
-                                for idx in row_range {
-                                    let entry = &panel.entries[idx];
-                                    let is_selected = selected_index == idx;
-                                    let stripe = idx % 2 == 0;
-                                    let bg = if is_selected {
-                                        if is_active {
-                                            colors.row_bg_selected_active
-                                        } else {
-                                            colors.row_bg_selected_inactive
-                                        }
-                                    } else if stripe {
-                                        Color::rgba(0.0, 0.0, 0.0, 0.06)
+                            .auto_shrink([false, false]);
+                        if let Some(offset) = scroll_target {
+                            scroll = scroll.vertical_scroll_offset(offset);
+                        }
+                        scroll.show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
+                            visible_range = row_range.clone();
+                            for idx in row_range {
+                                let entry = &panel.entries[idx];
+                                let is_selected = selected_index == idx;
+                                let stripe = idx % 2 == 0;
+                                let bg = if is_selected {
+                                    if is_active {
+                                        colors.row_bg_selected_active
                                     } else {
-                                        Color::rgba(0.0, 0.0, 0.0, 0.0)
-                                    };
-                                    let fg = if is_selected {
-                                        colors.row_fg_selected
-                                    } else if is_active {
-                                        colors.row_fg_active
-                                    } else {
-                                        colors.row_fg_inactive
-                                    };
-
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
-                                        egui::Sense::click(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        egui::CornerRadius::same(3),
-                                        color32(bg),
-                                    );
-
-                                    let icon_size = egui::Vec2::splat(10.0);
-                                    let icon_pos = rect.left_center()
-                                        - egui::Vec2::new(0.0, icon_size.y * 0.5)
-                                        + egui::Vec2::new(6.0, 0.0);
-                                    let icon_rect = egui::Rect::from_min_size(icon_pos, icon_size);
-                                    let icon_color = if entry.is_dir {
-                                        colors.panel_border_active
-                                    } else {
-                                        colors.row_fg_inactive
-                                    };
-                                    ui.painter().rect_filled(
-                                        icon_rect,
-                                        egui::CornerRadius::same(2),
-                                        color32(icon_color),
-                                    );
-
-                                    let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                    ui.painter().text(
-                                        rect.left_center() + egui::Vec2::new(22.0, 0.0),
-                                        egui::Align2::LEFT_CENTER,
-                                        entry.name.as_str(),
-                                        font_id,
-                                        color32(fg),
-                                    );
-
-                                    if is_selected && is_active {
-                                        ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
+                                        colors.row_bg_selected_inactive
                                     }
-                                    if response.clicked_by(egui::PointerButton::Primary) {
-                                        clicked_index = Some(idx);
-                                    }
-                                    if response.double_clicked_by(egui::PointerButton::Primary) {
-                                        clicked_index = Some(idx);
-                                        open_on_double_click = true;
-                                    }
+                                } else if stripe {
+                                    Color::rgba(0.0, 0.0, 0.0, 0.06)
+                                } else {
+                                    Color::rgba(0.0, 0.0, 0.0, 0.0)
+                                };
+                                let fg = if is_selected {
+                                    colors.row_fg_selected
+                                } else if is_active {
+                                    colors.row_fg_active
+                                } else {
+                                    colors.row_fg_inactive
+                                };
+
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    egui::CornerRadius::same(3),
+                                    color32(bg),
+                                );
+
+                                let icon_size = egui::Vec2::splat(10.0);
+                                let icon_pos = rect.left_center()
+                                    - egui::Vec2::new(0.0, icon_size.y * 0.5)
+                                    + egui::Vec2::new(6.0, 0.0);
+                                let icon_rect = egui::Rect::from_min_size(icon_pos, icon_size);
+                                let icon_color = if entry.is_dir {
+                                    colors.panel_border_active
+                                } else {
+                                    colors.row_fg_inactive
+                                };
+                                ui.painter().rect_filled(
+                                    icon_rect,
+                                    egui::CornerRadius::same(2),
+                                    color32(icon_color),
+                                );
+
+                                let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                ui.painter().text(
+                                    rect.left_center() + egui::Vec2::new(22.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    entry.name.as_str(),
+                                    font_id,
+                                    color32(fg),
+                                );
+
+                                if response.clicked_by(egui::PointerButton::Primary) {
+                                    clicked_index = Some(idx);
                                 }
-                            });
+                                if response.double_clicked_by(egui::PointerButton::Primary) {
+                                    clicked_index = Some(idx);
+                                    open_on_double_click = true;
+                                }
+                            }
+                        });
                     },
                 );
 
@@ -1257,7 +1364,7 @@ impl ApplicationHandler for App {
         });
 
         let cur_dir = std::env::current_dir().expect("current_dir");
-        let (io_tx, io_rx) = start_io_worker();
+        let (io_tx, io_rx, io_cancel_tx) = start_io_worker();
         let (preview_tx, preview_rx) = start_preview_worker();
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
         let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResult>();
@@ -1313,6 +1420,9 @@ impl ApplicationHandler for App {
             preview_request_id: 0,
             io_tx,
             io_rx,
+            io_cancel_tx,
+            io_in_flight: 0,
+            io_cancel_requested: false,
             fs_last_selected_name: Default::default(),
             container_last_selected_name: Default::default(),
             theme: Theme::dark(),
@@ -1329,6 +1439,10 @@ impl ApplicationHandler for App {
         let ui_cache = UiCache {
             left_rows: 10,
             right_rows: 10,
+            scroll_mode: ScrollMode::Default,
+            last_left_selected: 0,
+            last_right_selected: 0,
+            last_active_panel: ActivePanel::Left,
         };
         let image_cache = ImageCache {
             textures: HashMap::new(),
@@ -1396,11 +1510,12 @@ impl ApplicationHandler for App {
                     .reconfigure_surface(&mut runtime.surface, runtime.surface_config);
             }
             WindowEvent::RedrawRequested => {
-                let mut needs_refresh = false;
+                let mut completed = 0usize;
                 while runtime.app.io_rx.try_recv().is_ok() {
-                    needs_refresh = true;
+                    completed += 1;
                 }
-                if needs_refresh {
+                if completed > 0 {
+                    runtime.app.on_io_completed(completed);
                     refresh_fs_panels(&mut runtime.app);
                 }
                 pump_async(&mut runtime.app);
@@ -1421,7 +1536,8 @@ impl ApplicationHandler for App {
                 let output = runtime.egui_ctx.run(raw_input, |ctx| {
                     apply_theme(ctx, &runtime.app.theme.colors());
                     let input = ctx.input(|i| i.clone());
-                    handle_keyboard(ctx, &input, &mut runtime.app, &runtime.ui_cache);
+                    handle_keyboard(ctx, &input, &mut runtime.app, &mut runtime.ui_cache);
+                    runtime.ui_cache.update_scroll_mode(&runtime.app);
 
                     for decoded in decoded_images.drain(..) {
                         let handle = ctx.load_texture(
@@ -1482,6 +1598,7 @@ impl ApplicationHandler for App {
                                     ActivePanel::Left,
                                     &mut runtime.image_cache,
                                     &runtime.image_req_tx,
+                                    runtime.ui_cache.scroll_mode,
                                     rect.height(),
                                 );
                             }
@@ -1507,6 +1624,7 @@ impl ApplicationHandler for App {
                                     ActivePanel::Right,
                                     &mut runtime.image_cache,
                                     &runtime.image_req_tx,
+                                    runtime.ui_cache.scroll_mode,
                                     rect.height(),
                                 );
                             }
@@ -1526,6 +1644,9 @@ impl ApplicationHandler for App {
                     }
                     if runtime.app.pending_op.is_some() {
                         draw_confirmation(ctx, &mut runtime.app);
+                    }
+                    if runtime.app.io_in_flight > 0 {
+                        draw_progress_modal(ctx, &runtime.app);
                     }
                 });
                 runtime
@@ -1668,6 +1789,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     let (_preview_res_tx, preview_rx) = mpsc::channel::<(u64, PreviewContent)>();
     let (io_tx, _io_rx_unused) = mpsc::channel::<fileman::core::IOTask>();
     let (_io_res_tx, io_rx) = mpsc::channel::<fileman::core::IOResult>();
+    let (io_cancel_tx, _io_cancel_rx) = mpsc::channel::<()>();
     let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
     let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
     let mut image_cache = ImageCache {
@@ -1706,6 +1828,9 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         preview_request_id: 0,
         io_tx,
         io_rx,
+        io_cancel_tx,
+        io_in_flight: 0,
+        io_cancel_requested: false,
         fs_last_selected_name: Default::default(),
         container_last_selected_name: Default::default(),
         theme: Theme::dark(),
@@ -1742,6 +1867,10 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         let _ui_cache = UiCache {
             left_rows: 10,
             right_rows: 10,
+            scroll_mode: ScrollMode::Default,
+            last_left_selected: 0,
+            last_right_selected: 0,
+            last_active_panel: ActivePanel::Left,
         };
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
@@ -1773,6 +1902,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                         ActivePanel::Left,
                         &mut image_cache,
                         &image_req_tx,
+                        ScrollMode::Default,
                         rect.height(),
                     );
                 }
@@ -1796,6 +1926,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                         ActivePanel::Right,
                         &mut image_cache,
                         &image_req_tx,
+                        ScrollMode::Default,
                         rect.height(),
                     );
                 }
@@ -1811,6 +1942,9 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         });
         if app.pending_op.is_some() {
             draw_confirmation(ctx, &mut app);
+        }
+        if app.io_in_flight > 0 {
+            draw_progress_modal(ctx, &app);
         }
     });
 
