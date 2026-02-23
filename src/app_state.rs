@@ -1,13 +1,14 @@
 use std::{collections::HashMap, path, sync::mpsc};
 
 use crate::core::{
-    ActivePanel, DirBatch, DirEntry, EntryLocation, IOResult, IOTask, PanelMode, PreviewContent,
-    PreviewRequest, format_preview_info, is_image_path,
+    ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, IOResult, IOTask, PanelMode,
+    PreviewContent, PreviewRequest, container_display_path, container_kind_from_path,
+    format_preview_info, is_image_path,
 };
 use crate::theme::Theme;
 
 pub struct PanelState {
-    pub current_path: path::PathBuf, // For Fs mode: real fs path. For Zip: archive file path.
+    pub current_path: path::PathBuf, // For Fs mode: real fs path. For Container: archive path.
     pub mode: PanelMode,
     pub selected_index: usize,
     pub entries: Vec<DirEntry>,
@@ -29,7 +30,7 @@ pub struct AppState {
     pub io_tx: mpsc::Sender<IOTask>,
     pub io_rx: mpsc::Receiver<IOResult>,
     pub fs_last_selected_name: HashMap<path::PathBuf, String>,
-    pub zip_last_selected_name: HashMap<(path::PathBuf, String), String>,
+    pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
     pub theme: Theme,
     pub theme_picker_open: bool,
     pub theme_picker_selected: Option<usize>,
@@ -99,7 +100,7 @@ impl AppState {
     }
 
     pub fn store_current_selection_memory(&mut self) {
-        let (fs_key, zip_key, selected_name_opt) = {
+        let (fs_key, container_key, selected_name_opt) = {
             let panel = self.get_active_panel();
             if panel.entries.is_empty() {
                 return;
@@ -107,11 +108,13 @@ impl AppState {
             let selected_name = panel.entries[panel.selected_index].name.clone();
             match &panel.mode {
                 PanelMode::Fs => (Some(panel.current_path.clone()), None, Some(selected_name)),
-                PanelMode::Zip {
-                    archive_path, cwd, ..
+                PanelMode::Container {
+                    archive_path,
+                    cwd,
+                    kind,
                 } => (
                     None,
-                    Some((archive_path.clone(), cwd.clone())),
+                    Some((archive_path.clone(), cwd.clone(), *kind)),
                     Some(selected_name),
                 ),
             }
@@ -119,8 +122,9 @@ impl AppState {
         if let Some(selected_name) = selected_name_opt {
             if let Some(path) = fs_key {
                 self.fs_last_selected_name.insert(path, selected_name);
-            } else if let Some((ap, cwd)) = zip_key {
-                self.zip_last_selected_name.insert((ap, cwd), selected_name);
+            } else if let Some((ap, cwd, kind)) = container_key {
+                self.container_last_selected_name
+                    .insert((ap, cwd, kind), selected_name);
             }
         }
     }
@@ -146,10 +150,11 @@ impl AppState {
                 .map(|ext| ext.to_string());
             let key = match &entry.location {
                 EntryLocation::Fs(path) => path.to_string_lossy().into_owned(),
-                EntryLocation::Zip {
+                EntryLocation::Container {
+                    kind,
                     archive_path,
                     inner_path,
-                } => format!("{}::zip:/{}", archive_path.to_string_lossy(), inner_path),
+                } => container_display_path(*kind, archive_path, inner_path),
             };
             (entry.is_dir, entry.location.clone(), key, ext)
         };
@@ -171,6 +176,25 @@ impl AppState {
                     self.preview = Some(PreviewContent::Image(std::sync::Arc::from(path)));
                     return;
                 }
+                if let Some(kind) = container_kind_from_path(&path) {
+                    self.preview_request_id = self.preview_request_id.wrapping_add(1);
+                    let request_id = self.preview_request_id;
+                    self.preview = Some(PreviewContent::Text(format_preview_info(
+                        "Archive",
+                        &EntryLocation::Container {
+                            kind,
+                            archive_path: path.clone(),
+                            inner_path: String::new(),
+                        },
+                    )));
+                    let _ = self.preview_tx.send(PreviewRequest::ListContainer {
+                        id: request_id,
+                        kind,
+                        archive_path: path,
+                        max_entries: 200,
+                    });
+                    return;
+                }
                 if self.preview.is_none() {
                     self.preview = Some(PreviewContent::Text(format_preview_info(
                         "File",
@@ -183,14 +207,16 @@ impl AppState {
                     max_bytes: MAX_BYTES,
                 });
             }
-            EntryLocation::Zip {
+            EntryLocation::Container {
+                kind,
                 archive_path,
                 inner_path,
             } => {
                 if self.preview.is_none() {
                     self.preview = Some(PreviewContent::Text(format_preview_info(
                         "File",
-                        &EntryLocation::Zip {
+                        &EntryLocation::Container {
+                            kind,
                             archive_path: archive_path.clone(),
                             inner_path: inner_path.clone(),
                         },
@@ -198,7 +224,8 @@ impl AppState {
                 }
                 let _ = self.preview_tx.send(PreviewRequest::Read {
                     id: request_id,
-                    location: EntryLocation::Zip {
+                    location: EntryLocation::Container {
+                        kind,
                         archive_path,
                         inner_path,
                     },
@@ -301,7 +328,7 @@ impl AppState {
             }
             match &p.entries[p.selected_index].location {
                 EntryLocation::Fs(path) => path.clone(),
-                EntryLocation::Zip { .. } => {
+                EntryLocation::Container { .. } => {
                     return None;
                 }
             }
@@ -314,7 +341,7 @@ impl AppState {
             };
             match &other_panel.mode {
                 PanelMode::Fs => other_panel.current_path.clone(),
-                PanelMode::Zip { .. } => {
+                PanelMode::Container { .. } => {
                     return None;
                 }
             }
@@ -331,7 +358,7 @@ impl AppState {
             }
             match &p.entries[p.selected_index].location {
                 EntryLocation::Fs(path) => path.clone(),
-                EntryLocation::Zip { .. } => {
+                EntryLocation::Container { .. } => {
                     return None;
                 }
             }
@@ -344,7 +371,7 @@ impl AppState {
             };
             match &other_panel.mode {
                 PanelMode::Fs => other_panel.current_path.clone(),
-                PanelMode::Zip { .. } => {
+                PanelMode::Container { .. } => {
                     return None;
                 }
             }
@@ -365,7 +392,7 @@ impl AppState {
             }
             match &entry.location {
                 EntryLocation::Fs(path) => path.clone(),
-                EntryLocation::Zip { .. } => {
+                EntryLocation::Container { .. } => {
                     return None;
                 }
             }
