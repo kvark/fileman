@@ -1,8 +1,6 @@
 use std::env;
 use std::path::PathBuf;
 
-use image::GenericImageView;
-
 fn parse_args() -> Result<(PathBuf, PathBuf, u8, f32), String> {
     let mut args = env::args().skip(1);
     let actual = args

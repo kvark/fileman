@@ -1,12 +1,13 @@
 use std::{sync::mpsc, thread};
 
 use crate::core::{
-    EntryLocation, IOTask, PreviewContent, PreviewRequest, copy_recursively, hexdump,
+    EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, copy_recursively, hexdump,
     is_probably_text, read_bytes_prefix, read_zip_bytes_prefix,
 };
 
-pub fn start_io_worker() -> mpsc::Sender<IOTask> {
+pub fn start_io_worker() -> (mpsc::Sender<IOTask>, mpsc::Receiver<IOResult>) {
     let (tx, rx) = mpsc::channel::<IOTask>();
+    let (result_tx, result_rx) = mpsc::channel::<IOResult>();
     thread::spawn(move || {
         while let Ok(task) = rx.recv() {
             match task {
@@ -45,9 +46,10 @@ pub fn start_io_worker() -> mpsc::Sender<IOTask> {
                     }
                 }
             }
+            let _ = result_tx.send(IOResult::Completed);
         }
     });
-    tx
+    (tx, result_rx)
 }
 
 pub fn start_preview_worker() -> (

@@ -68,6 +68,10 @@ pub enum IOTask {
     },
 }
 
+pub enum IOResult {
+    Completed,
+}
+
 pub fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {
     if src.is_dir() {
         let dest = dst_dir.join(src.file_name().unwrap());

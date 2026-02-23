@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path, sync::mpsc};
 
 use crate::core::{
-    ActivePanel, DirBatch, DirEntry, EntryLocation, IOTask, PanelMode, PreviewContent,
+    ActivePanel, DirBatch, DirEntry, EntryLocation, IOResult, IOTask, PanelMode, PreviewContent,
     PreviewRequest, format_preview_info, is_image_path,
 };
 use crate::theme::Theme;
@@ -27,11 +27,28 @@ pub struct AppState {
     pub preview_rx: mpsc::Receiver<(u64, PreviewContent)>,
     pub preview_request_id: u64,
     pub io_tx: mpsc::Sender<IOTask>,
+    pub io_rx: mpsc::Receiver<IOResult>,
     pub fs_last_selected_name: HashMap<path::PathBuf, String>,
     pub zip_last_selected_name: HashMap<(path::PathBuf, String), String>,
     pub theme: Theme,
     pub theme_picker_open: bool,
     pub theme_picker_selected: Option<usize>,
+    pub pending_op: Option<PendingOp>,
+}
+
+#[derive(Clone)]
+pub enum PendingOp {
+    Copy {
+        src: path::PathBuf,
+        dst_dir: path::PathBuf,
+    },
+    Move {
+        src: path::PathBuf,
+        dst_dir: path::PathBuf,
+    },
+    Delete {
+        target: path::PathBuf,
+    },
 }
 
 impl AppState {
@@ -199,16 +216,93 @@ impl AppState {
         self.update_preview_for_current_selection();
     }
 
-    pub fn enqueue_copy_selected(&mut self) {
+    pub fn prepare_copy_selected(&mut self) {
+        if self.pending_op.is_some() {
+            return;
+        }
+        if let Some(op) = self.build_copy_op() {
+            self.pending_op = Some(op);
+        }
+    }
+
+    pub fn prepare_move_selected(&mut self) {
+        if self.pending_op.is_some() {
+            return;
+        }
+        if let Some(op) = self.build_move_op() {
+            self.pending_op = Some(op);
+        }
+    }
+
+    pub fn prepare_delete_selected(&mut self) {
+        if self.pending_op.is_some() {
+            return;
+        }
+        if let Some(op) = self.build_delete_op() {
+            self.pending_op = Some(op);
+        }
+    }
+
+    pub fn take_pending_op(&mut self) -> Option<PendingOp> {
+        self.pending_op.take()
+    }
+
+    pub fn clear_pending_op(&mut self) {
+        self.pending_op = None;
+    }
+
+    pub fn enqueue_pending_op(&mut self, op: &PendingOp) {
+        match op {
+            PendingOp::Copy { src, dst_dir } => {
+                if let Err(e) = self.io_tx.send(IOTask::Copy {
+                    src: src.clone(),
+                    dst_dir: dst_dir.clone(),
+                }) {
+                    eprintln!("Failed to enqueue copy: {e}");
+                } else {
+                    log::info!(
+                        "Enqueued copy: {} -> {}",
+                        src.to_string_lossy(),
+                        dst_dir.to_string_lossy()
+                    );
+                }
+            }
+            PendingOp::Move { src, dst_dir } => {
+                if let Err(e) = self.io_tx.send(IOTask::Move {
+                    src: src.clone(),
+                    dst_dir: dst_dir.clone(),
+                }) {
+                    eprintln!("Failed to enqueue move: {e}");
+                } else {
+                    log::info!(
+                        "Enqueued move: {} -> {}",
+                        src.to_string_lossy(),
+                        dst_dir.to_string_lossy()
+                    );
+                }
+            }
+            PendingOp::Delete { target } => {
+                if let Err(e) = self.io_tx.send(IOTask::Delete {
+                    target: target.clone(),
+                }) {
+                    eprintln!("Failed to enqueue delete: {e}");
+                } else {
+                    log::info!("Enqueued delete: {}", target.to_string_lossy());
+                }
+            }
+        }
+    }
+
+    fn build_copy_op(&self) -> Option<PendingOp> {
         let src = {
             let p = self.get_active_panel();
             if p.entries.is_empty() {
-                return;
+                return None;
             }
             match &p.entries[p.selected_index].location {
                 EntryLocation::Fs(path) => path.clone(),
                 EntryLocation::Zip { .. } => {
-                    return;
+                    return None;
                 }
             }
         };
@@ -221,35 +315,24 @@ impl AppState {
             match &other_panel.mode {
                 PanelMode::Fs => other_panel.current_path.clone(),
                 PanelMode::Zip { .. } => {
-                    return;
+                    return None;
                 }
             }
         };
 
-        if let Err(e) = self.io_tx.send(IOTask::Copy {
-            src: src.clone(),
-            dst_dir: dst_dir.clone(),
-        }) {
-            eprintln!("Failed to enqueue copy: {e}");
-        } else {
-            log::info!(
-                "Enqueued copy: {} -> {}",
-                src.to_string_lossy(),
-                dst_dir.to_string_lossy()
-            );
-        }
+        Some(PendingOp::Copy { src, dst_dir })
     }
 
-    pub fn enqueue_move_selected(&mut self) {
+    fn build_move_op(&self) -> Option<PendingOp> {
         let src = {
             let p = self.get_active_panel();
             if p.entries.is_empty() {
-                return;
+                return None;
             }
             match &p.entries[p.selected_index].location {
                 EntryLocation::Fs(path) => path.clone(),
                 EntryLocation::Zip { .. } => {
-                    return;
+                    return None;
                 }
             }
         };
@@ -262,50 +345,33 @@ impl AppState {
             match &other_panel.mode {
                 PanelMode::Fs => other_panel.current_path.clone(),
                 PanelMode::Zip { .. } => {
-                    return;
+                    return None;
                 }
             }
         };
 
-        if let Err(e) = self.io_tx.send(IOTask::Move {
-            src: src.clone(),
-            dst_dir: dst_dir.clone(),
-        }) {
-            eprintln!("Failed to enqueue move: {e}");
-        } else {
-            log::info!(
-                "Enqueued move: {} -> {}",
-                src.to_string_lossy(),
-                dst_dir.to_string_lossy()
-            );
-        }
+        Some(PendingOp::Move { src, dst_dir })
     }
 
-    pub fn enqueue_delete_selected(&mut self) {
+    fn build_delete_op(&self) -> Option<PendingOp> {
         let target = {
             let p = self.get_active_panel();
             if p.entries.is_empty() {
-                return;
+                return None;
             }
             let entry = &p.entries[p.selected_index];
             if entry.name == ".." {
-                return;
+                return None;
             }
             match &entry.location {
                 EntryLocation::Fs(path) => path.clone(),
                 EntryLocation::Zip { .. } => {
-                    return;
+                    return None;
                 }
             }
         };
 
-        if let Err(e) = self.io_tx.send(IOTask::Delete {
-            target: target.clone(),
-        }) {
-            eprintln!("Failed to enqueue delete: {e}");
-        } else {
-            log::info!("Enqueued delete: {}", target.to_string_lossy());
-        }
+        Some(PendingOp::Delete { target })
     }
 
     pub fn switch_theme(&mut self) {

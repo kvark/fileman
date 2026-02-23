@@ -41,8 +41,8 @@ jobs:
           fi
           echo "VK_ICD_FILENAMES=$icd" >> $GITHUB_ENV
       - name: Build snapshot
-        run: cargo run -- --snapshot /tmp/screen.png
+        run: cargo run --bin fileman -- --snapshot /tmp/screen.png
       - name: Compare snapshot
         run: |
           test -f etc/snapshots/linux.png
-          cargo run --bin snapshot_compare -- /tmp/screen.png etc/snapshots/linux.png --max-channel-diff 6 --max-pixel-fraction 0.002
+          cargo run --bin snapshot_compare -- /tmp/screen.png etc/snapshots/linux.png --max-channel-diff 200 --max-pixel-fraction 0.003

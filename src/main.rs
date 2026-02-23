@@ -28,7 +28,7 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-use fileman::app_state::{AppState, PanelState};
+use fileman::app_state::{AppState, PanelState, PendingOp};
 use fileman::core::{
     ActivePanel, DirBatch, DirEntry, EntryLocation, PanelMode, PreviewContent, PreviewRequest,
     is_zip_path, read_fs_directory, read_zip_directory,
@@ -586,6 +586,16 @@ fn handle_keyboard(
     app: &mut AppState,
     cache: &UiCache,
 ) {
+    if app.pending_op.is_some() {
+        if input.key_pressed(egui::Key::Enter) {
+            confirm_pending_op(app);
+        }
+        if input.key_pressed(egui::Key::Escape) {
+            app.clear_pending_op();
+        }
+        ctx.request_repaint();
+        return;
+    }
     let window_rows = active_window_rows(app, cache);
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
     if tab_pressed {
@@ -646,12 +656,10 @@ fn handle_keyboard(
         }
     }
     if input.key_pressed(egui::Key::F5) {
-        app.enqueue_copy_selected();
-        refresh_fs_panels(app);
+        app.prepare_copy_selected();
     }
     if input.key_pressed(egui::Key::F6) {
-        app.enqueue_move_selected();
-        refresh_fs_panels(app);
+        app.prepare_move_selected();
     }
     if input.key_pressed(egui::Key::F9) {
         app.switch_theme();
@@ -660,8 +668,17 @@ fn handle_keyboard(
         app.open_theme_picker();
     }
     if input.key_pressed(egui::Key::F8) {
-        app.enqueue_delete_selected();
-        refresh_active_panel(app);
+        app.prepare_delete_selected();
+    }
+}
+
+fn confirm_pending_op(app: &mut AppState) {
+    if let Some(op) = app.take_pending_op() {
+        app.enqueue_pending_op(&op);
+        match op {
+            PendingOp::Copy { .. } | PendingOp::Move { .. } => refresh_fs_panels(app),
+            PendingOp::Delete { .. } => refresh_active_panel(app),
+        }
     }
 }
 
@@ -679,6 +696,87 @@ fn refresh_fs_panels(app: &mut AppState) {
             let path = app.panel(which.clone()).current_path.clone();
             load_fs_directory_async(app, path, which, None);
         }
+    }
+}
+
+fn draw_confirmation(ctx: &egui::Context, app: &mut AppState) {
+    let op = match app.pending_op.clone() {
+        Some(op) => op,
+        None => return,
+    };
+
+    let colors = app.theme.colors();
+    let screen = ctx.available_rect();
+
+    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "confirm_overlay".into());
+    ctx.layer_painter(overlay_layer).rect_filled(
+        screen,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_black_alpha(160),
+    );
+
+    let (title, body) = pending_op_text(&op);
+    let mut confirmed = false;
+    let mut cancelled = false;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.colored_label(color32(colors.row_fg_active), body);
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let yes = ui.add(egui::Button::new("Yes").min_size(egui::vec2(80.0, 0.0)));
+                let no = ui.add(egui::Button::new("No").min_size(egui::vec2(80.0, 0.0)));
+                if yes.clicked() {
+                    confirmed = true;
+                }
+                if no.clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+
+    if confirmed {
+        confirm_pending_op(app);
+    } else if cancelled {
+        app.clear_pending_op();
+    }
+}
+
+fn pending_op_text(op: &PendingOp) -> (&'static str, String) {
+    match op {
+        PendingOp::Copy { src, dst_dir } => (
+            "Confirm Copy",
+            format!(
+                "Copy \"{}\" to\n{}?",
+                src.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>"),
+                dst_dir.to_string_lossy()
+            ),
+        ),
+        PendingOp::Move { src, dst_dir } => (
+            "Confirm Move",
+            format!(
+                "Move \"{}\" to\n{}?",
+                src.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>"),
+                dst_dir.to_string_lossy()
+            ),
+        ),
+        PendingOp::Delete { target } => (
+            "Confirm Delete",
+            format!(
+                "Delete \"{}\"?",
+                target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>")
+            ),
+        ),
     }
 }
 
@@ -1147,7 +1245,7 @@ impl ApplicationHandler for App {
         });
 
         let cur_dir = std::env::current_dir().expect("current_dir");
-        let io_tx = start_io_worker();
+        let (io_tx, io_rx) = start_io_worker();
         let (preview_tx, preview_rx) = start_preview_worker();
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
         let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResult>();
@@ -1202,11 +1300,13 @@ impl ApplicationHandler for App {
             preview_rx,
             preview_request_id: 0,
             io_tx,
+            io_rx,
             fs_last_selected_name: Default::default(),
             zip_last_selected_name: Default::default(),
             theme: Theme::dark(),
             theme_picker_open: false,
             theme_picker_selected: None,
+            pending_op: None,
         };
 
         app.theme
@@ -1284,6 +1384,13 @@ impl ApplicationHandler for App {
                     .reconfigure_surface(&mut runtime.surface, runtime.surface_config);
             }
             WindowEvent::RedrawRequested => {
+                let mut needs_refresh = false;
+                while runtime.app.io_rx.try_recv().is_ok() {
+                    needs_refresh = true;
+                }
+                if needs_refresh {
+                    refresh_fs_panels(&mut runtime.app);
+                }
                 pump_async(&mut runtime.app);
                 let mut decoded_images = Vec::new();
                 while decoded_images.len() < MAX_IMAGE_UPLOADS_PER_FRAME {
@@ -1404,6 +1511,9 @@ impl ApplicationHandler for App {
 
                     if runtime.app.theme_picker_open {
                         draw_theme_picker(ctx, &mut runtime.app);
+                    }
+                    if runtime.app.pending_op.is_some() {
+                        draw_confirmation(ctx, &mut runtime.app);
                     }
                 });
                 runtime
@@ -1544,7 +1654,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
 
     let (preview_tx, _preview_req_rx) = mpsc::channel::<PreviewRequest>();
     let (_preview_res_tx, preview_rx) = mpsc::channel::<(u64, PreviewContent)>();
-    let (io_tx, _io_rx) = mpsc::channel();
+    let (io_tx, _io_rx_unused) = mpsc::channel::<fileman::core::IOTask>();
+    let (_io_res_tx, io_rx) = mpsc::channel::<fileman::core::IOResult>();
     let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
     let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
     let mut image_cache = ImageCache {
@@ -1582,11 +1693,13 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         preview_rx,
         preview_request_id: 0,
         io_tx,
+        io_rx,
         fs_last_selected_name: Default::default(),
         zip_last_selected_name: Default::default(),
         theme: Theme::dark(),
         theme_picker_open: false,
         theme_picker_selected: None,
+        pending_op: None,
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));
@@ -1684,6 +1797,9 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                 color32(app.theme.colors().divider),
             );
         });
+        if app.pending_op.is_some() {
+            draw_confirmation(ctx, &mut app);
+        }
     });
 
     let paint_jobs = egui_ctx.tessellate(output.shapes, output.pixels_per_point);

@@ -8,6 +8,9 @@ Fileman is a fast, responsive two-panel file manager built with egui via blade-e
 - Optional previews for text and images.
 - External themes in `themes/` (JSON, YAML, or TOML).
 
+## Screenshot
+![Fileman screenshot](etc/snapshots/linux.png)
+
 ## Build and Run
 ```bash
 cargo build
