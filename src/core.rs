@@ -26,12 +26,14 @@ pub trait ContainerPlugin: Sync {
 
 struct ZipPlugin;
 struct TarGzPlugin;
+struct TarBz2Plugin;
 
 static ZIP_PLUGIN: ZipPlugin = ZipPlugin;
 static TAR_GZ_PLUGIN: TarGzPlugin = TarGzPlugin;
+static TAR_BZ2_PLUGIN: TarBz2Plugin = TarBz2Plugin;
 
 fn container_plugins() -> &'static [&'static dyn ContainerPlugin] {
-    static PLUGINS: [&dyn ContainerPlugin; 2] = [&ZIP_PLUGIN, &TAR_GZ_PLUGIN];
+    static PLUGINS: [&dyn ContainerPlugin; 3] = [&ZIP_PLUGIN, &TAR_GZ_PLUGIN, &TAR_BZ2_PLUGIN];
     &PLUGINS
 }
 
@@ -84,6 +86,7 @@ pub fn is_container_path(p: &Path) -> bool {
 pub enum ContainerKind {
     Zip,
     TarGz,
+    TarBz2,
 }
 
 #[derive(Clone)]
@@ -96,6 +99,23 @@ pub enum EntryLocation {
     },
 }
 
+impl EntryLocation {
+    pub fn display_name(&self) -> String {
+        match self {
+            EntryLocation::Fs(path) => path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unknown>")
+                .to_string(),
+            EntryLocation::Container { inner_path, .. } => inner_path
+                .rsplit('/')
+                .next()
+                .unwrap_or("<unknown>")
+                .to_string(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DirEntry {
     pub name: String,
@@ -106,6 +126,7 @@ pub struct DirEntry {
 pub enum DirBatch {
     Append(Vec<DirEntry>),
     Replace(Vec<DirEntry>),
+    Loading,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -147,6 +168,20 @@ pub enum IOTask {
         src: path::PathBuf,
         dst_dir: path::PathBuf,
     },
+    CopyContainer {
+        kind: ContainerKind,
+        archive_path: path::PathBuf,
+        inner_path: String,
+        dst_dir: path::PathBuf,
+        display_name: String,
+    },
+    CopyContainerDir {
+        kind: ContainerKind,
+        archive_path: path::PathBuf,
+        inner_path: String,
+        dst_dir: path::PathBuf,
+        display_name: String,
+    },
     Move {
         src: path::PathBuf,
         dst_dir: path::PathBuf,
@@ -179,6 +214,231 @@ pub fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {
             fs::create_dir_all(parent)?;
         }
         fs::copy(src, dest)?;
+    }
+    Ok(())
+}
+
+pub fn copy_container_entry(
+    kind: ContainerKind,
+    archive_path: &Path,
+    inner_path: &str,
+    dst_dir: &Path,
+    display_name: &str,
+) -> io::Result<()> {
+    match kind {
+        ContainerKind::Zip => copy_zip_entry(archive_path, inner_path, dst_dir, display_name),
+        ContainerKind::TarGz => copy_tar_entry_gz(archive_path, inner_path, dst_dir, display_name),
+        ContainerKind::TarBz2 => {
+            copy_tar_entry_bz2(archive_path, inner_path, dst_dir, display_name)
+        }
+    }
+}
+
+pub fn copy_container_dir(
+    kind: ContainerKind,
+    archive_path: &Path,
+    inner_path: &str,
+    dst_dir: &Path,
+    display_name: &str,
+) -> io::Result<()> {
+    let root = dst_dir.join(display_name);
+    fs::create_dir_all(&root)?;
+    match kind {
+        ContainerKind::Zip => copy_zip_dir(archive_path, inner_path, &root),
+        ContainerKind::TarGz => copy_tar_dir_gz(archive_path, inner_path, &root),
+        ContainerKind::TarBz2 => copy_tar_dir_bz2(archive_path, inner_path, &root),
+    }
+}
+
+fn safe_rel_path(rel: &str) -> Option<path::PathBuf> {
+    let candidate = path::Path::new(rel);
+    let mut out = path::PathBuf::new();
+    for comp in candidate.components() {
+        match comp {
+            path::Component::Normal(part) => out.push(part),
+            _ => return None,
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn copy_zip_entry(
+    archive_path: &Path,
+    inner_path: &str,
+    dst_dir: &Path,
+    display_name: &str,
+) -> io::Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let normalized = inner_path.trim_start_matches('/');
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if entry.name() == normalized {
+            let target = dst_dir.join(display_name);
+            if entry.is_dir() {
+                fs::create_dir_all(&target)?;
+                return Ok(());
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out = fs::File::create(target)?;
+            io::copy(&mut entry, &mut out)?;
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("Entry not found in zip: {}", inner_path),
+    ))
+}
+
+fn copy_zip_dir(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let normalized = inner_path.trim_matches('/');
+    let prefix = if normalized.is_empty() {
+        "".to_string()
+    } else {
+        format!("{}/", normalized)
+    };
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let name = entry.name().to_string();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let rel = &name[prefix.len()..];
+        if rel.is_empty() {
+            continue;
+        }
+        let rel_path = match safe_rel_path(rel.trim_end_matches('/')) {
+            Some(path) => path,
+            None => continue,
+        };
+        let target = dst_root.join(rel_path);
+        if entry.is_dir() || name.ends_with('/') {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut out = fs::File::create(target)?;
+        io::copy(&mut entry, &mut out)?;
+    }
+    Ok(())
+}
+
+fn copy_tar_entry_gz(
+    archive_path: &Path,
+    inner_path: &str,
+    dst_dir: &Path,
+    display_name: &str,
+) -> io::Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    copy_tar_entry(decoder, inner_path, dst_dir, display_name)
+}
+
+fn copy_tar_entry_bz2(
+    archive_path: &Path,
+    inner_path: &str,
+    dst_dir: &Path,
+    display_name: &str,
+) -> io::Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = bzip2::read::BzDecoder::new(file);
+    copy_tar_entry(decoder, inner_path, dst_dir, display_name)
+}
+
+fn copy_tar_entry<R: Read>(
+    reader: R,
+    inner_path: &str,
+    dst_dir: &Path,
+    display_name: &str,
+) -> io::Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    let normalized = inner_path.trim_start_matches('/');
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let name = normalize_archive_path(&path);
+        if name == normalized {
+            let target = dst_dir.join(display_name);
+            if entry.header().entry_type().is_dir() {
+                fs::create_dir_all(&target)?;
+                return Ok(());
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out = fs::File::create(target)?;
+            io::copy(&mut entry, &mut out)?;
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("Entry not found in tar: {}", inner_path),
+    ))
+}
+
+fn copy_tar_dir_gz(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    copy_tar_dir(decoder, inner_path, dst_root)
+}
+
+fn copy_tar_dir_bz2(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = bzip2::read::BzDecoder::new(file);
+    copy_tar_dir(decoder, inner_path, dst_root)
+}
+
+fn copy_tar_dir<R: Read>(reader: R, inner_path: &str, dst_root: &Path) -> io::Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    let normalized = inner_path.trim_matches('/');
+    let prefix = if normalized.is_empty() {
+        "".to_string()
+    } else {
+        format!("{}/", normalized)
+    };
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let name = normalize_archive_path(&path);
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let rel = &name[prefix.len()..];
+        if rel.is_empty() {
+            continue;
+        }
+        let rel_path = match safe_rel_path(rel) {
+            Some(path) => path,
+            None => continue,
+        };
+        let target = dst_root.join(rel_path);
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut out = fs::File::create(target)?;
+        io::copy(&mut entry, &mut out)?;
     }
     Ok(())
 }
@@ -352,6 +612,10 @@ pub fn is_text_path(p: &Path) -> bool {
     )
 }
 
+pub fn is_text_name(name: &str) -> bool {
+    is_text_path(Path::new(name))
+}
+
 pub fn format_container_listing(
     kind: ContainerKind,
     archive_path: &Path,
@@ -359,10 +623,6 @@ pub fn format_container_listing(
     max_entries: usize,
 ) -> String {
     let mut out = String::new();
-    out.push_str("Archive\n");
-    out.push_str(&container_display_path(kind, archive_path, ""));
-    out.push('\n');
-    out.push('\n');
     out.push_str("Contents:\n");
     let mut count = 0usize;
     for entry in entries.iter() {
@@ -644,6 +904,133 @@ fn normalize_archive_path(path: &Path) -> String {
     s.trim_start_matches('/').to_string()
 }
 
+fn read_tar_bz2_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = bzip2::read::BzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut dirs: HashSet<String> = HashSet::new();
+    let mut files: Vec<String> = Vec::new();
+
+    let prefix = if cwd.is_empty() {
+        "".to_string()
+    } else {
+        format!("{}/", cwd.trim_end_matches('/'))
+    };
+
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let path = entry.path()?;
+        let name = normalize_archive_path(&path);
+        if name.is_empty() || !name.starts_with(&prefix) {
+            continue;
+        }
+        let rem = &name[prefix.len()..];
+        if rem.is_empty() {
+            continue;
+        }
+        if let Some(slash) = rem.find('/') {
+            let dir = rem[..slash].to_string();
+            dirs.insert(dir);
+        } else {
+            files.push(rem.to_string());
+        }
+    }
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+
+    if !cwd.is_empty() {
+        let parent = cwd
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        entries.push(DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            location: EntryLocation::Container {
+                kind: ContainerKind::TarBz2,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: parent,
+            },
+        });
+    } else if let Some(parent) = archive_path.parent() {
+        entries.push(DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            location: EntryLocation::Fs(parent.to_path_buf()),
+        });
+    }
+
+    let mut dir_entries: Vec<DirEntry> = dirs
+        .into_iter()
+        .map(|d| DirEntry {
+            name: d.clone(),
+            is_dir: true,
+            location: EntryLocation::Container {
+                kind: ContainerKind::TarBz2,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: if cwd.is_empty() {
+                    d
+                } else {
+                    format!("{}/{}", cwd.trim_end_matches('/'), d)
+                },
+            },
+        })
+        .collect();
+
+    let mut file_entries: Vec<DirEntry> = files
+        .into_iter()
+        .map(|f| DirEntry {
+            name: f.clone(),
+            is_dir: false,
+            location: EntryLocation::Container {
+                kind: ContainerKind::TarBz2,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: if cwd.is_empty() {
+                    f
+                } else {
+                    format!("{}/{}", cwd.trim_end_matches('/'), f)
+                },
+            },
+        })
+        .collect();
+
+    dir_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    file_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries.extend(dir_entries);
+    entries.extend(file_entries);
+
+    Ok(entries)
+}
+
+fn read_tar_bz2_bytes_prefix(
+    archive_path: &Path,
+    inner_path: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let file = fs::File::open(archive_path)?;
+    let decoder = bzip2::read::BzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let normalized = inner_path.trim_start_matches('/');
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let name = normalize_archive_path(&path);
+        if name == normalized {
+            let mut data = Vec::new();
+            entry
+                .by_ref()
+                .take(max_bytes as u64)
+                .read_to_end(&mut data)?;
+            return Ok(data);
+        }
+    }
+    Err(anyhow::anyhow!(format!(
+        "Entry not found in tar.bz2: {}",
+        inner_path
+    )))
+}
+
 pub fn read_container_directory(
     kind: ContainerKind,
     archive_path: &Path,
@@ -758,6 +1145,60 @@ impl ContainerPlugin for TarGzPlugin {
     ) -> anyhow::Result<Option<(u64, Option<u32>)>> {
         let file = fs::File::open(archive_path)?;
         let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let normalized = inner_path.trim_start_matches('/');
+        for entry in archive.entries()? {
+            let entry = entry?;
+            let path = entry.path()?;
+            let name = normalize_archive_path(&path);
+            if name == normalized {
+                let size = entry.size();
+                let mode = entry.header().mode().ok().map(|v| v as u32);
+                return Ok(Some((size, mode)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl ContainerPlugin for TarBz2Plugin {
+    fn kind(&self) -> ContainerKind {
+        ContainerKind::TarBz2
+    }
+
+    fn scheme(&self) -> &'static str {
+        "tar.bz2"
+    }
+
+    fn matches_path(&self, path: &Path) -> bool {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        name.ends_with(".tar.bz2") || name.ends_with(".tbz") || name.ends_with(".tbz2")
+    }
+
+    fn read_dir(&self, archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
+        read_tar_bz2_directory(archive_path, cwd)
+    }
+
+    fn read_bytes_prefix(
+        &self,
+        archive_path: &Path,
+        inner_path: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        read_tar_bz2_bytes_prefix(archive_path, inner_path, max_bytes)
+    }
+
+    fn read_metadata(
+        &self,
+        archive_path: &Path,
+        inner_path: &str,
+    ) -> anyhow::Result<Option<(u64, Option<u32>)>> {
+        let file = fs::File::open(archive_path)?;
+        let decoder = bzip2::read::BzDecoder::new(file);
         let mut archive = tar::Archive::new(decoder);
         let normalized = inner_path.trim_start_matches('/');
         for entry in archive.entries()? {

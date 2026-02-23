@@ -1108,6 +1108,7 @@ dependencies = [
  "anyhow",
  "blade-egui",
  "blade-graphics",
+ "bzip2",
  "egui",
  "egui-winit",
  "env_logger",
