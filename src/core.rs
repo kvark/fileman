@@ -146,7 +146,17 @@ pub enum PanelMode {
 
 pub enum PreviewContent {
     Text(String),
-    Image(Arc<Path>),
+    Image(ImageLocation),
+}
+
+#[derive(Clone)]
+pub enum ImageLocation {
+    Fs(Arc<Path>),
+    Container {
+        kind: ContainerKind,
+        archive_path: path::PathBuf,
+        inner_path: String,
+    },
 }
 
 pub enum PreviewRequest {
@@ -526,11 +536,15 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                 inner_path: parent,
             },
         });
-    } else if let Some(parent) = archive_path.parent() {
+    } else {
+        let parent = archive_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
-            location: EntryLocation::Fs(parent.to_path_buf()),
+            location: EntryLocation::Fs(parent),
         });
     }
 
@@ -599,6 +613,10 @@ pub fn is_image_path(p: &Path) -> bool {
     )
 }
 
+pub fn is_image_name(name: &str) -> bool {
+    is_image_path(Path::new(name))
+}
+
 pub fn is_text_path(p: &Path) -> bool {
     matches!(
         p.extension()
@@ -607,7 +625,17 @@ pub fn is_text_path(p: &Path) -> bool {
         Some(ext)
             if matches!(
                 ext.as_str(),
-                "txt" | "md" | "json" | "toml" | "yaml" | "yml" | "rs" | "log" | "ini" | "csv"
+                "txt"
+                    | "md"
+                    | "json"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "rs"
+                    | "log"
+                    | "ini"
+                    | "csv"
+                    | "nix"
             )
     )
 }
@@ -818,11 +846,15 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
                 inner_path: parent,
             },
         });
-    } else if let Some(parent) = archive_path.parent() {
+    } else {
+        let parent = archive_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
-            location: EntryLocation::Fs(parent.to_path_buf()),
+            location: EntryLocation::Fs(parent),
         });
     }
 
@@ -953,11 +985,15 @@ fn read_tar_bz2_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<
                 inner_path: parent,
             },
         });
-    } else if let Some(parent) = archive_path.parent() {
+    } else {
+        let parent = archive_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
-            location: EntryLocation::Fs(parent.to_path_buf()),
+            location: EntryLocation::Fs(parent),
         });
     }
 

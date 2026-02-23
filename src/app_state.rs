@@ -1,9 +1,9 @@
 use std::{collections::HashMap, path, sync::mpsc};
 
 use crate::core::{
-    ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, IOResult, IOTask, PanelMode,
-    PreviewContent, PreviewRequest, container_display_path, container_kind_from_path,
-    format_preview_info, is_image_path,
+    ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, IOResult, IOTask, ImageLocation,
+    PanelMode, PreviewContent, PreviewRequest, container_display_path, container_kind_from_path,
+    format_preview_info, is_image_name, is_image_path, is_text_name, is_text_path,
 };
 use crate::theme::Theme;
 
@@ -172,7 +172,8 @@ impl AppState {
         self.preview_ext = ext;
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let request_id = self.preview_request_id;
-        const MAX_BYTES: usize = 64 * 1024;
+        const MAX_BYTES_TEXT: usize = 64 * 1024;
+        const MAX_BYTES_BINARY: usize = 4 * 1024;
         if is_dir {
             self.preview = Some(PreviewContent::Text(format_preview_info(
                 "Directory",
@@ -183,7 +184,9 @@ impl AppState {
         match location {
             EntryLocation::Fs(path) => {
                 if is_image_path(&path) {
-                    self.preview = Some(PreviewContent::Image(std::sync::Arc::from(path)));
+                    self.preview = Some(PreviewContent::Image(ImageLocation::Fs(
+                        std::sync::Arc::from(path),
+                    )));
                     return;
                 }
                 if let Some(kind) = container_kind_from_path(&path) {
@@ -211,10 +214,15 @@ impl AppState {
                         &EntryLocation::Fs(path.clone()),
                     )));
                 }
+                let max_bytes = if is_text_path(&path) {
+                    MAX_BYTES_TEXT
+                } else {
+                    MAX_BYTES_BINARY
+                };
                 let _ = self.preview_tx.send(PreviewRequest::Read {
                     id: request_id,
                     location: EntryLocation::Fs(path),
-                    max_bytes: MAX_BYTES,
+                    max_bytes,
                 });
             }
             EntryLocation::Container {
@@ -222,6 +230,14 @@ impl AppState {
                 archive_path,
                 inner_path,
             } => {
+                if is_image_name(&inner_path) {
+                    self.preview = Some(PreviewContent::Image(ImageLocation::Container {
+                        kind,
+                        archive_path: archive_path.clone(),
+                        inner_path: inner_path.clone(),
+                    }));
+                    return;
+                }
                 if self.preview.is_none() {
                     self.preview = Some(PreviewContent::Text(format_preview_info(
                         "File",
@@ -232,6 +248,11 @@ impl AppState {
                         },
                     )));
                 }
+                let max_bytes = if is_text_name(&inner_path) {
+                    MAX_BYTES_TEXT
+                } else {
+                    MAX_BYTES_BINARY
+                };
                 let _ = self.preview_tx.send(PreviewRequest::Read {
                     id: request_id,
                     location: EntryLocation::Container {
@@ -239,7 +260,7 @@ impl AppState {
                         archive_path,
                         inner_path,
                     },
-                    max_bytes: MAX_BYTES,
+                    max_bytes,
                 });
             }
         }

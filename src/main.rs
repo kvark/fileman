@@ -6,6 +6,7 @@ use blade_graphics::{
     TextureSubresources, TextureUsage, TextureViewDesc, ViewDimension,
 };
 use egui_winit::State as EguiWinitState;
+use image::GenericImageView;
 use once_cell::sync::Lazy;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -30,9 +31,9 @@ use winit::{
 
 use fileman::app_state::{AppState, PanelState, PendingOp};
 use fileman::core::{
-    ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, PanelMode, PreviewContent,
-    PreviewRequest, container_display_path, container_kind_from_path, read_container_directory,
-    read_fs_directory,
+    ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, ImageLocation, PanelMode,
+    PreviewContent, PreviewRequest, container_display_path, container_kind_from_path,
+    read_container_directory, read_fs_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{start_io_worker, start_preview_worker};
@@ -42,6 +43,7 @@ const SNAPSHOT_WIDTH: u32 = 1280;
 const SNAPSHOT_HEIGHT: u32 = 720;
 const MAX_IMAGE_TEXTURES: usize = 64;
 const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 2;
+const MAX_TEXTURE_SIDE: u32 = 1024;
 
 struct UiCache {
     left_rows: usize,
@@ -78,12 +80,22 @@ impl UiCache {
 }
 
 struct ImageRequest {
-    path: PathBuf,
+    key: String,
+    source: ImageSource,
 }
 
 struct ImageResult {
-    path: PathBuf,
+    key: String,
     image: egui::ColorImage,
+}
+
+enum ImageSource {
+    Fs(PathBuf),
+    Container {
+        kind: ContainerKind,
+        archive_path: PathBuf,
+        inner_path: String,
+    },
 }
 
 struct HighlightRequest {
@@ -99,15 +111,15 @@ struct HighlightResult {
 }
 
 struct ImageCache {
-    textures: HashMap<PathBuf, egui::TextureHandle>,
-    pending: HashSet<PathBuf>,
-    order: VecDeque<PathBuf>,
+    textures: HashMap<String, egui::TextureHandle>,
+    pending: HashSet<String>,
+    order: VecDeque<String>,
 }
 
-fn touch_image(cache: &mut ImageCache, key: &PathBuf) {
+fn touch_image(cache: &mut ImageCache, key: &str) {
     if let Some(pos) = cache.order.iter().position(|p| p == key) {
         cache.order.remove(pos);
-        cache.order.push_back(key.clone());
+        cache.order.push_back(key.to_string());
     }
 }
 
@@ -118,6 +130,18 @@ fn color32(c: Color) -> egui::Color32 {
         (c.b.clamp(0.0, 1.0) * 255.0) as u8,
         (c.a.clamp(0.0, 1.0) * 255.0) as u8,
     )
+}
+
+fn resize_image(image: image::DynamicImage, max_side: u32) -> image::DynamicImage {
+    let (w, h) = image.dimensions();
+    let max_dim = w.max(h);
+    if max_dim <= max_side {
+        return image;
+    }
+    let scale = max_side as f32 / max_dim as f32;
+    let new_w = (w as f32 * scale).round().max(1.0) as u32;
+    let new_h = (h as f32 * scale).round().max(1.0) as u32;
+    image.resize(new_w, new_h, image::imageops::FilterType::Triangle)
 }
 
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
@@ -168,6 +192,9 @@ fn highlight_text_job(
     let ext = extension.map(|ext| ext.to_ascii_lowercase());
     if ext.as_deref() == Some("toml") {
         return fileman::syntax::toml::highlight_toml_job(text, theme_kind);
+    }
+    if ext.as_deref() == Some("nix") {
+        return fileman::syntax::nix::highlight_nix_job(text, theme_kind);
     }
     let by_name_ci = |name: &str| {
         let needle = name.to_ascii_lowercase();
@@ -327,7 +354,9 @@ fn load_fs_directory_async(
     }
 
     let (tx, rx) = mpsc::channel::<DirBatch>();
-    let _ = tx.send(DirBatch::Loading);
+    if initial.is_empty() {
+        let _ = tx.send(DirBatch::Loading);
+    }
     let path_clone = path.clone();
 
     if let Ok(mut rd) = fs::read_dir(&path) {
@@ -472,16 +501,22 @@ fn load_container_directory_async(
                 inner_path: parent,
             },
         });
-    } else if let Some(parent) = archive_path.parent() {
+    } else {
+        let parent = archive_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
         initial.push(DirEntry {
             name: "..".into(),
             is_dir: true,
-            location: EntryLocation::Fs(parent.to_path_buf()),
+            location: EntryLocation::Fs(parent),
         });
     }
 
     let (tx, rx) = mpsc::channel::<DirBatch>();
-    let _ = tx.send(DirBatch::Loading);
+    if initial.is_empty() {
+        let _ = tx.send(DirBatch::Loading);
+    }
     let archive_clone = archive_path.clone();
     let cwd_clone = cwd.clone();
     let kind_clone = kind;
@@ -494,13 +529,9 @@ fn load_container_directory_async(
                 return;
             }
         };
-        let mut all = all;
-        if !all.is_empty() && all[0].name == ".." {
-            all.remove(0);
-        }
         let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
         if !initial.is_empty() {
-            let _ = tx.send(DirBatch::Append(initial));
+            let _ = tx.send(DirBatch::Replace(initial));
         }
         thread::spawn(move || {
             let chunk = 500usize;
@@ -931,7 +962,45 @@ fn draw_preview(
                     }
                 }
                 Some(PreviewContent::Image(path)) => {
-                    let key = path.to_path_buf();
+                    let (key, request) = match path {
+                        ImageLocation::Fs(path) => {
+                            let key = path.to_string_lossy().into_owned();
+                            (
+                                key.clone(),
+                                ImageRequest {
+                                    key,
+                                    source: ImageSource::Fs(path.as_ref().to_path_buf()),
+                                },
+                            )
+                        }
+                        ImageLocation::Container {
+                            kind,
+                            archive_path,
+                            inner_path,
+                        } => {
+                            let key = format!(
+                                "{}::{}:/{}",
+                                archive_path.to_string_lossy(),
+                                match kind {
+                                    ContainerKind::Zip => "zip",
+                                    ContainerKind::TarGz => "tar.gz",
+                                    ContainerKind::TarBz2 => "tar.bz2",
+                                },
+                                inner_path
+                            );
+                            (
+                                key.clone(),
+                                ImageRequest {
+                                    key,
+                                    source: ImageSource::Container {
+                                        kind: *kind,
+                                        archive_path: archive_path.clone(),
+                                        inner_path: inner_path.clone(),
+                                    },
+                                },
+                            )
+                        }
+                    };
                     if let Some(handle) = image_cache.textures.get(&key).cloned() {
                         touch_image(image_cache, &key);
                         let sized = egui::load::SizedTexture::from_handle(&handle);
@@ -944,12 +1013,9 @@ fn draw_preview(
                         ui.add(egui::Image::new(sized).fit_to_exact_size(size));
                     } else {
                         if image_cache.pending.insert(key.clone()) {
-                            let _ = image_req_tx.send(ImageRequest { path: key.clone() });
+                            let _ = image_req_tx.send(request);
                         }
-                        ui.colored_label(
-                            text_color,
-                            format!("Loading image...\n{}", key.to_string_lossy()),
-                        );
+                        ui.colored_label(text_color, format!("Loading image...\n{}", key));
                     }
                 }
                 None => {
@@ -1373,11 +1439,29 @@ impl ApplicationHandler for App {
 
         thread::spawn(move || {
             while let Ok(req) = image_req_rx.recv() {
-                if let Ok(img) = image::open(&req.path) {
-                    let rgba = img.to_rgba8();
+                let image = match req.source {
+                    ImageSource::Fs(path) => image::open(path).ok(),
+                    ImageSource::Container {
+                        kind,
+                        archive_path,
+                        inner_path,
+                    } => {
+                        let bytes = fileman::core::read_container_bytes_prefix(
+                            kind,
+                            &archive_path,
+                            &inner_path,
+                            usize::MAX,
+                        )
+                        .ok();
+                        bytes.and_then(|data| image::load_from_memory(&data).ok())
+                    }
+                };
+                if let Some(img) = image {
+                    let resized = resize_image(img, MAX_TEXTURE_SIDE);
+                    let rgba = resized.to_rgba8();
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let result = ImageResult {
-                        path: req.path,
+                        key: req.key,
                         image: egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
                     };
                     let _ = image_res_tx.send(result);
@@ -1541,21 +1625,21 @@ impl ApplicationHandler for App {
 
                     for decoded in decoded_images.drain(..) {
                         let handle = ctx.load_texture(
-                            format!("preview:{}", decoded.path.to_string_lossy()),
+                            format!("preview:{}", decoded.key),
                             decoded.image,
                             egui::TextureOptions::LINEAR,
                         );
-                        if !runtime.image_cache.textures.contains_key(&decoded.path) {
-                            runtime.image_cache.order.push_back(decoded.path.clone());
+                        if !runtime.image_cache.textures.contains_key(&decoded.key) {
+                            runtime.image_cache.order.push_back(decoded.key.clone());
                         }
                         runtime
                             .image_cache
                             .textures
-                            .insert(decoded.path.clone(), handle);
-                        runtime.image_cache.pending.remove(&decoded.path);
+                            .insert(decoded.key.clone(), handle);
+                        runtime.image_cache.pending.remove(&decoded.key);
                         while runtime.image_cache.order.len() > MAX_IMAGE_TEXTURES {
                             if let Some(old) = runtime.image_cache.order.pop_front()
-                                && old != decoded.path
+                                && old != decoded.key
                             {
                                 runtime.image_cache.textures.remove(&old);
                             }
