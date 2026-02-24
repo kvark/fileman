@@ -127,6 +127,8 @@ pub enum DirBatch {
     Append(Vec<DirEntry>),
     Replace(Vec<DirEntry>),
     Loading,
+    Progress { loaded: usize, total: Option<usize> },
+    Error(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -928,7 +930,7 @@ fn read_tar_gz_bytes_prefix(
     )))
 }
 
-fn normalize_archive_path(path: &Path) -> String {
+pub fn normalize_archive_path(path: &Path) -> String {
     let mut s = path.to_string_lossy().replace('\\', "/");
     while s.starts_with("./") {
         s = s[2..].to_string();
@@ -936,12 +938,18 @@ fn normalize_archive_path(path: &Path) -> String {
     s.trim_start_matches('/').to_string()
 }
 
-fn read_tar_bz2_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
+fn read_tar_bz2_directory_with_progress(
+    archive_path: &Path,
+    cwd: &str,
+    progress: &mut dyn FnMut(usize),
+) -> anyhow::Result<Vec<DirEntry>> {
     let file = fs::File::open(archive_path)?;
     let decoder = bzip2::read::BzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
     let mut dirs: HashSet<String> = HashSet::new();
     let mut files: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+    const PROGRESS_INTERVAL: usize = 1000;
 
     let prefix = if cwd.is_empty() {
         "".to_string()
@@ -954,10 +962,18 @@ fn read_tar_bz2_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<
         let path = entry.path()?;
         let name = normalize_archive_path(&path);
         if name.is_empty() || !name.starts_with(&prefix) {
+            seen += 1;
+            if seen % PROGRESS_INTERVAL == 0 {
+                progress(seen);
+            }
             continue;
         }
         let rem = &name[prefix.len()..];
         if rem.is_empty() {
+            seen += 1;
+            if seen % PROGRESS_INTERVAL == 0 {
+                progress(seen);
+            }
             continue;
         }
         if let Some(slash) = rem.find('/') {
@@ -966,7 +982,12 @@ fn read_tar_bz2_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<
         } else {
             files.push(rem.to_string());
         }
+        seen += 1;
+        if seen % PROGRESS_INTERVAL == 0 {
+            progress(seen);
+        }
     }
+    progress(seen);
 
     let mut entries: Vec<DirEntry> = Vec::new();
 
@@ -1039,6 +1060,10 @@ fn read_tar_bz2_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<
     Ok(entries)
 }
 
+fn read_tar_bz2_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
+    read_tar_bz2_directory_with_progress(archive_path, cwd, &mut |_| {})
+}
+
 fn read_tar_bz2_bytes_prefix(
     archive_path: &Path,
     inner_path: &str,
@@ -1073,6 +1098,24 @@ pub fn read_container_directory(
     cwd: &str,
 ) -> anyhow::Result<Vec<DirEntry>> {
     plugin_for_kind(kind).read_dir(archive_path, cwd)
+}
+
+pub fn read_container_directory_with_progress(
+    kind: ContainerKind,
+    archive_path: &Path,
+    cwd: &str,
+    mut progress: impl FnMut(usize),
+) -> anyhow::Result<Vec<DirEntry>> {
+    match kind {
+        ContainerKind::TarBz2 => {
+            read_tar_bz2_directory_with_progress(archive_path, cwd, &mut progress)
+        }
+        _ => {
+            let entries = read_container_directory(kind, archive_path, cwd)?;
+            progress(entries.len());
+            Ok(entries)
+        }
+    }
 }
 
 pub fn read_container_bytes_prefix(
