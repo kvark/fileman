@@ -15,6 +15,9 @@ pub struct PanelState {
     pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
     pub prefer_select_name: Option<String>,
     pub top_index: usize,
+    pub loading: bool,
+    pub loading_progress: Option<(usize, Option<usize>)>,
+    pub dir_token: u64,
 }
 
 pub struct AppState {

@@ -33,7 +33,7 @@ use fileman::app_state::{AppState, PanelState, PendingOp};
 use fileman::core::{
     ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, ImageLocation, PanelMode,
     PreviewContent, PreviewRequest, container_display_path, container_kind_from_path,
-    read_container_directory, read_fs_directory,
+    read_container_directory_with_progress, read_fs_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{start_io_worker, start_preview_worker};
@@ -52,6 +52,8 @@ struct UiCache {
     last_left_selected: usize,
     last_right_selected: usize,
     last_active_panel: ActivePanel,
+    last_left_dir_token: u64,
+    last_right_dir_token: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,9 +67,13 @@ impl UiCache {
         let left_selected = app.left_panel.selected_index;
         let right_selected = app.right_panel.selected_index;
         let active = app.active_panel.clone();
+        let left_dir = app.left_panel.dir_token;
+        let right_dir = app.right_panel.dir_token;
         let selection_changed = left_selected != self.last_left_selected
             || right_selected != self.last_right_selected
-            || active != self.last_active_panel;
+            || active != self.last_active_panel
+            || left_dir != self.last_left_dir_token
+            || right_dir != self.last_right_dir_token;
         self.scroll_mode = if selection_changed {
             ScrollMode::ForceActive
         } else {
@@ -76,6 +82,8 @@ impl UiCache {
         self.last_left_selected = left_selected;
         self.last_right_selected = right_selected;
         self.last_active_panel = active;
+        self.last_left_dir_token = left_dir;
+        self.last_right_dir_token = right_dir;
     }
 }
 
@@ -212,7 +220,7 @@ fn highlight_text_job(
                 "yml" | "yaml" => by_name_ci("yaml"),
                 "rs" => SYNTAX_SET.find_syntax_by_name("Rust"),
                 "md" => SYNTAX_SET.find_syntax_by_name("Markdown"),
-                "json" => SYNTAX_SET.find_syntax_by_name("JSON"),
+                "json" | "gltf" => SYNTAX_SET.find_syntax_by_name("JSON"),
                 "js" => SYNTAX_SET.find_syntax_by_name("JavaScript"),
                 "ts" => SYNTAX_SET.find_syntax_by_name("TypeScript"),
                 "css" => SYNTAX_SET.find_syntax_by_name("CSS"),
@@ -279,22 +287,36 @@ fn apply_dir_batch(panel: &mut PanelState, batch: DirBatch) {
 
     match batch {
         DirBatch::Loading => {
+            panel.loading = true;
+            panel.loading_progress = None;
+            return;
+        }
+        DirBatch::Error(message) => {
             panel.entries = vec![DirEntry {
-                name: "Loading…".to_string(),
+                name: message,
                 is_dir: false,
                 location: EntryLocation::Fs(panel.current_path.clone()),
             }];
             panel.selected_index = 0;
             panel.top_index = 0;
+            panel.loading = false;
+            panel.loading_progress = None;
+            return;
+        }
+        DirBatch::Progress { loaded, total } => {
+            panel.loading_progress = Some((loaded, total));
+            panel.loading = total.map(|t| loaded < t).unwrap_or(true);
             return;
         }
         DirBatch::Append(mut new_entries) => {
             panel.entries.append(&mut new_entries);
+            panel.loading = false;
         }
         DirBatch::Replace(new_entries) => {
             panel.entries = new_entries;
             panel.selected_index = 0;
             panel.top_index = 0;
+            panel.loading = false;
         }
     }
 
@@ -345,18 +367,17 @@ fn load_fs_directory_async(
     prefer_name: Option<String>,
 ) {
     let mut initial: Vec<DirEntry> = Vec::new();
+    let mut has_parent_entry = false;
     if path.parent().is_some() {
         initial.push(DirEntry {
             name: "..".to_string(),
             is_dir: true,
             location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
         });
+        has_parent_entry = true;
     }
 
     let (tx, rx) = mpsc::channel::<DirBatch>();
-    if initial.is_empty() {
-        let _ = tx.send(DirBatch::Loading);
-    }
     let path_clone = path.clone();
 
     if let Ok(mut rd) = fs::read_dir(&path) {
@@ -468,13 +489,17 @@ fn load_fs_directory_async(
         .clone()
         .or_else(|| app.fs_last_selected_name.get(&path).cloned());
     let panel_state = app.panel_mut(target_panel);
+    let initial_loading = initial.is_empty() || has_parent_entry;
     panel_state.current_path = path.clone();
     panel_state.mode = PanelMode::Fs;
     panel_state.entries = initial;
     panel_state.selected_index = 0;
     panel_state.top_index = 0;
+    panel_state.dir_token = panel_state.dir_token.wrapping_add(1);
     panel_state.entries_rx = Some(rx);
     panel_state.prefer_select_name = remembered;
+    panel_state.loading = initial_loading;
+    panel_state.loading_progress = None;
 }
 
 fn load_container_directory_async(
@@ -514,35 +539,267 @@ fn load_container_directory_async(
     }
 
     let (tx, rx) = mpsc::channel::<DirBatch>();
-    if initial.is_empty() {
-        let _ = tx.send(DirBatch::Loading);
-    }
     let archive_clone = archive_path.clone();
     let cwd_clone = cwd.clone();
     let kind_clone = kind;
 
-    thread::spawn(move || {
-        let all = match read_container_directory(kind_clone, &archive_clone, &cwd_clone) {
-            Ok(entries) => entries,
-            Err(e) => {
-                eprintln!("Failed to read container: {e}");
-                return;
-            }
-        };
-        let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
-        if !initial.is_empty() {
-            let _ = tx.send(DirBatch::Replace(initial));
-        }
+    if kind == ContainerKind::TarBz2 {
         thread::spawn(move || {
-            let chunk = 500usize;
-            let mut start = 128.min(all.len());
-            while start < all.len() {
-                let end = (start + chunk).min(all.len());
-                let _ = tx.send(DirBatch::Append(all[start..end].to_vec()));
-                start = end;
+            let prefix = if cwd_clone.is_empty() {
+                "".to_string()
+            } else {
+                format!("{}/", cwd_clone.trim_end_matches('/'))
+            };
+            let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_files: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut pending: Vec<DirEntry> = Vec::new();
+            let mut loaded = 0usize;
+            let mut sent_first = false;
+            const BATCH: usize = 200;
+            const DECIDE_LIMIT: usize = 64;
+            let mut decided = false;
+            let mut implicit_root: Option<String> = None;
+            let mut buffered: Vec<String> = Vec::new();
+            let mut root_candidate: Option<String> = None;
+            let mut seen_root_file = false;
+            let mut seen_other_root = false;
+
+            fn emit_name(
+                name: &str,
+                implicit_prefix: Option<&str>,
+                cwd: &str,
+                kind: ContainerKind,
+                archive_path: &PathBuf,
+                pending: &mut Vec<DirEntry>,
+                seen_dirs: &mut std::collections::HashSet<String>,
+                seen_files: &mut std::collections::HashSet<String>,
+                loaded: &mut usize,
+            ) {
+                let rem = if let Some(prefix) = implicit_prefix {
+                    if !name.starts_with(prefix) {
+                        return;
+                    }
+                    let trimmed = name[prefix.len()..].trim_start_matches('/');
+                    if trimmed.is_empty() {
+                        return;
+                    }
+                    trimmed
+                } else {
+                    name
+                };
+
+                if let Some(slash) = rem.find('/') {
+                    let dir = rem[..slash].to_string();
+                    if seen_dirs.insert(dir.clone()) {
+                        pending.push(DirEntry {
+                            name: dir.clone(),
+                            is_dir: true,
+                            location: EntryLocation::Container {
+                                kind,
+                                archive_path: archive_path.clone(),
+                                inner_path: if let Some(prefix) = implicit_prefix {
+                                    format!("{}{}", prefix, dir)
+                                } else if cwd.is_empty() {
+                                    dir
+                                } else {
+                                    format!("{}/{}", cwd.trim_end_matches('/'), dir)
+                                },
+                            },
+                        });
+                        *loaded += 1;
+                    }
+                } else if seen_files.insert(rem.to_string()) {
+                    let file_name = rem.to_string();
+                    pending.push(DirEntry {
+                        name: file_name.clone(),
+                        is_dir: false,
+                        location: EntryLocation::Container {
+                            kind,
+                            archive_path: archive_path.clone(),
+                            inner_path: if let Some(prefix) = implicit_prefix {
+                                format!("{}{}", prefix, file_name)
+                            } else if cwd.is_empty() {
+                                file_name
+                            } else {
+                                format!("{}/{}", cwd.trim_end_matches('/'), file_name)
+                            },
+                        },
+                    });
+                    *loaded += 1;
+                }
             }
+
+            let file = match std::fs::File::open(&archive_clone) {
+                Ok(file) => file,
+                Err(e) => {
+                    let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
+                    return;
+                }
+            };
+            let decoder = bzip2::read::BzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            let entries = match archive.entries() {
+                Ok(entries) => entries,
+                Err(e) => {
+                    let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
+                    return;
+                }
+            };
+
+            for entry in entries.flatten() {
+                let path = match entry.path() {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                };
+                let name = fileman::core::normalize_archive_path(&path);
+                if name.is_empty() || !name.starts_with(&prefix) {
+                    continue;
+                }
+                let rem = &name[prefix.len()..];
+                if rem.is_empty() {
+                    continue;
+                }
+                if !decided && cwd_clone.is_empty() {
+                    buffered.push(name.clone());
+                    if let Some(slash) = rem.find('/') {
+                        let root = rem[..slash].to_string();
+                        match root_candidate.as_ref() {
+                            None => root_candidate = Some(root),
+                            Some(existing) if existing != &root => seen_other_root = true,
+                            _ => {}
+                        }
+                    } else {
+                        seen_root_file = true;
+                    }
+
+                    if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
+                        decided = true;
+                        if !seen_root_file && !seen_other_root {
+                            implicit_root = root_candidate.clone();
+                        }
+                        let root_ref = implicit_root
+                            .as_ref()
+                            .map(|root| format!("{}/", root.trim_end_matches('/')));
+                        for buffered_name in buffered.drain(..) {
+                            emit_name(
+                                &buffered_name,
+                                root_ref.as_deref(),
+                                &cwd_clone,
+                                kind_clone,
+                                &archive_clone,
+                                &mut pending,
+                                &mut seen_dirs,
+                                &mut seen_files,
+                                &mut loaded,
+                            );
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    emit_name(
+                        &name,
+                        implicit_root
+                            .as_ref()
+                            .map(|root| format!("{}/", root.trim_end_matches('/')))
+                            .as_deref(),
+                        &cwd_clone,
+                        kind_clone,
+                        &archive_clone,
+                        &mut pending,
+                        &mut seen_dirs,
+                        &mut seen_files,
+                        &mut loaded,
+                    );
+                }
+
+                if pending.len() >= BATCH || (!sent_first && !pending.is_empty()) {
+                    let _ = tx.send(DirBatch::Append(pending));
+                    pending = Vec::new();
+                    sent_first = true;
+                    let _ = tx.send(DirBatch::Progress {
+                        loaded,
+                        total: None,
+                    });
+                }
+            }
+
+            if !decided && cwd_clone.is_empty() {
+                if !seen_root_file && !seen_other_root {
+                    implicit_root = root_candidate.clone();
+                }
+                let root_ref = implicit_root
+                    .as_ref()
+                    .map(|root| format!("{}/", root.trim_end_matches('/')));
+                for buffered_name in buffered.drain(..) {
+                    emit_name(
+                        &buffered_name,
+                        root_ref.as_deref(),
+                        &cwd_clone,
+                        kind_clone,
+                        &archive_clone,
+                        &mut pending,
+                        &mut seen_dirs,
+                        &mut seen_files,
+                        &mut loaded,
+                    );
+                }
+            }
+
+            if !pending.is_empty() {
+                let _ = tx.send(DirBatch::Append(pending));
+            }
+            let _ = tx.send(DirBatch::Progress {
+                loaded,
+                total: Some(loaded),
+            });
         });
-    });
+    } else {
+        thread::spawn(move || {
+            let all = match read_container_directory_with_progress(
+                kind_clone,
+                &archive_clone,
+                &cwd_clone,
+                |loaded| {
+                    let _ = tx.send(DirBatch::Progress {
+                        loaded,
+                        total: None,
+                    });
+                },
+            ) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    eprintln!("Failed to read container: {e}");
+                    let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
+                    return;
+                }
+            };
+            let total = all.len();
+            let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
+            let loaded = initial.len().min(total);
+            if !initial.is_empty() {
+                let _ = tx.send(DirBatch::Replace(initial));
+                let _ = tx.send(DirBatch::Progress {
+                    loaded,
+                    total: Some(total),
+                });
+            }
+            thread::spawn(move || {
+                let chunk = 500usize;
+                let mut start = 128.min(all.len());
+                while start < all.len() {
+                    let end = (start + chunk).min(all.len());
+                    let _ = tx.send(DirBatch::Append(all[start..end].to_vec()));
+                    let _ = tx.send(DirBatch::Progress {
+                        loaded: end,
+                        total: Some(total),
+                    });
+                    start = end;
+                }
+            });
+        });
+    }
 
     let remembered = prefer_name.clone().or_else(|| {
         app.container_last_selected_name
@@ -550,6 +807,7 @@ fn load_container_directory_async(
             .cloned()
     });
     let panel_state = app.panel_mut(target_panel);
+    let initial_loading = true;
 
     panel_state.current_path = archive_path.clone();
     panel_state.mode = PanelMode::Container {
@@ -560,8 +818,11 @@ fn load_container_directory_async(
     panel_state.entries = initial;
     panel_state.selected_index = 0;
     panel_state.top_index = 0;
+    panel_state.dir_token = panel_state.dir_token.wrapping_add(1);
     panel_state.entries_rx = Some(rx);
     panel_state.prefer_select_name = remembered;
+    panel_state.loading = initial_loading;
+    panel_state.loading_progress = None;
 }
 
 fn open_selected(app: &mut AppState) {
@@ -1156,6 +1417,24 @@ fn draw_panel(
                     },
                 );
 
+                if panel.loading {
+                    let progress = panel.loading_progress.unwrap_or((0, None));
+                    let ratio = match progress.1 {
+                        Some(total) if total > 0 => progress.0 as f32 / total as f32,
+                        _ => 0.0,
+                    };
+                    ui.add_space(4.0);
+                    let label = match progress.1 {
+                        Some(total) => format!("Loading… {}/{}", progress.0, total),
+                        None => format!("Loading… {}", progress.0),
+                    };
+                    let mut bar = egui::ProgressBar::new(ratio).text(label);
+                    if progress.1.is_some() {
+                        bar = bar.show_percentage();
+                    }
+                    ui.add(bar);
+                }
+
                 let list_height = (ui.available_height() - footer_height - spacing).max(0.0);
                 rows = window_rows_for(list_height, ui.spacing().item_spacing.y);
                 let mut visible_range = 0..0;
@@ -1485,6 +1764,9 @@ impl ApplicationHandler for App {
                 entries_rx: None,
                 prefer_select_name: None,
                 top_index: 0,
+                loading: false,
+                loading_progress: None,
+                dir_token: 0,
             },
             right_panel: PanelState {
                 current_path: cur_dir.clone(),
@@ -1494,6 +1776,9 @@ impl ApplicationHandler for App {
                 entries_rx: None,
                 prefer_select_name: None,
                 top_index: 0,
+                loading: false,
+                loading_progress: None,
+                dir_token: 0,
             },
             active_panel: ActivePanel::Left,
             preview: None,
@@ -1527,6 +1812,8 @@ impl ApplicationHandler for App {
             last_left_selected: 0,
             last_right_selected: 0,
             last_active_panel: ActivePanel::Left,
+            last_left_dir_token: 0,
+            last_right_dir_token: 0,
         };
         let image_cache = ImageCache {
             textures: HashMap::new(),
@@ -1893,6 +2180,9 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             entries_rx: None,
             prefer_select_name: None,
             top_index: 0,
+            loading: false,
+            loading_progress: None,
+            dir_token: 0,
         },
         right_panel: PanelState {
             current_path: cur_dir.clone(),
@@ -1902,6 +2192,9 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             entries_rx: None,
             prefer_select_name: None,
             top_index: 0,
+            loading: false,
+            loading_progress: None,
+            dir_token: 0,
         },
         active_panel: ActivePanel::Left,
         preview: None,
@@ -1955,6 +2248,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             last_left_selected: 0,
             last_right_selected: 0,
             last_active_panel: ActivePanel::Left,
+            last_left_dir_token: 0,
+            last_right_dir_token: 0,
         };
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
