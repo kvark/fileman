@@ -6,7 +6,6 @@ use blade_graphics::{
     TextureSubresources, TextureUsage, TextureViewDesc, ViewDimension,
 };
 use egui_winit::State as EguiWinitState;
-use image::GenericImageView;
 use once_cell::sync::Lazy;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -28,12 +27,15 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowAttributes, WindowId},
 };
+use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
+use zune_image::codecs::ImageFormat;
+use zune_image::image::Image as ZuneImage;
 
 use fileman::app_state::{AppState, PanelState, PendingOp};
 use fileman::core::{
     ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, ImageLocation, PanelMode,
     PreviewContent, PreviewRequest, container_display_path, container_kind_from_path,
-    read_container_directory_with_progress, read_fs_directory,
+    is_media_name, is_text_name, read_container_directory_with_progress, read_fs_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{start_io_worker, start_preview_worker};
@@ -140,16 +142,133 @@ fn color32(c: Color) -> egui::Color32 {
     )
 }
 
-fn resize_image(image: image::DynamicImage, max_side: u32) -> image::DynamicImage {
-    let (w, h) = image.dimensions();
-    let max_dim = w.max(h);
-    if max_dim <= max_side {
-        return image;
+fn blend_color(base: Color, tint: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color::rgba(
+        base.r + (tint.r - base.r) * t,
+        base.g + (tint.g - base.g) * t,
+        base.b + (tint.b - base.b) * t,
+        base.a,
+    )
+}
+
+fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<egui::ColorImage> {
+    let image = ZuneImage::read(bytes, DecoderOptions::default()).ok()?;
+    let (width, height) = image.dimensions();
+    let colorspace = image.colorspace();
+    let mut frames = image.flatten_to_u8();
+    let data = frames.pop()?;
+    let rgba = convert_to_rgba(&data, width, height, colorspace)?;
+    let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [out_w, out_h],
+        &out_rgba,
+    ))
+}
+
+fn convert_to_rgba(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    colorspace: ColorSpace,
+) -> Option<Vec<u8>> {
+    let pixels = width.checked_mul(height)?;
+    match colorspace {
+        ColorSpace::RGBA => {
+            if data.len() == pixels * 4 {
+                Some(data.to_vec())
+            } else {
+                None
+            }
+        }
+        ColorSpace::RGB => {
+            if data.len() != pixels * 3 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(pixels * 4);
+            for chunk in data.chunks_exact(3) {
+                out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            Some(out)
+        }
+        ColorSpace::BGR => {
+            if data.len() != pixels * 3 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(pixels * 4);
+            for chunk in data.chunks_exact(3) {
+                out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], 255]);
+            }
+            Some(out)
+        }
+        ColorSpace::BGRA => {
+            if data.len() != pixels * 4 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(pixels * 4);
+            for chunk in data.chunks_exact(4) {
+                out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
+            }
+            Some(out)
+        }
+        ColorSpace::ARGB => {
+            if data.len() != pixels * 4 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(pixels * 4);
+            for chunk in data.chunks_exact(4) {
+                out.extend_from_slice(&[chunk[1], chunk[2], chunk[3], chunk[0]]);
+            }
+            Some(out)
+        }
+        ColorSpace::Luma => {
+            if data.len() != pixels {
+                return None;
+            }
+            let mut out = Vec::with_capacity(pixels * 4);
+            for &v in data {
+                out.extend_from_slice(&[v, v, v, 255]);
+            }
+            Some(out)
+        }
+        ColorSpace::LumaA => {
+            if data.len() != pixels * 2 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(pixels * 4);
+            for chunk in data.chunks_exact(2) {
+                out.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn downscale_rgba(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    max_side: u32,
+) -> (usize, usize, Vec<u8>) {
+    let max_dim = width.max(height);
+    if max_dim <= max_side as usize {
+        return (width, height, rgba.to_vec());
     }
     let scale = max_side as f32 / max_dim as f32;
-    let new_w = (w as f32 * scale).round().max(1.0) as u32;
-    let new_h = (h as f32 * scale).round().max(1.0) as u32;
-    image.resize(new_w, new_h, image::imageops::FilterType::Triangle)
+    let out_w = (width as f32 * scale).round().max(1.0) as usize;
+    let out_h = (height as f32 * scale).round().max(1.0) as usize;
+    let mut out = vec![0u8; out_w * out_h * 4];
+    for y in 0..out_h {
+        let src_y = y * height / out_h;
+        for x in 0..out_w {
+            let src_x = x * width / out_w;
+            let src_idx = (src_y * width + src_x) * 4;
+            let dst_idx = (y * out_w + x) * 4;
+            out[dst_idx..dst_idx + 4].copy_from_slice(&rgba[src_idx..src_idx + 4]);
+        }
+    }
+    (out_w, out_h, out)
 }
 
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
@@ -637,7 +756,8 @@ fn load_container_directory_async(
                     return;
                 }
             };
-            let decoder = bzip2::read::BzDecoder::new(file);
+            let reader = std::io::BufReader::new(file);
+            let decoder = bzip2::read::BzDecoder::new(reader);
             let mut archive = tar::Archive::new(decoder);
             let entries = match archive.entries() {
                 Ok(entries) => entries,
@@ -1496,6 +1616,20 @@ fn draw_panel(
                                 } else {
                                     colors.row_fg_inactive
                                 };
+                                let mut fg = fg;
+                                if !is_selected && !entry.is_dir {
+                                    let tint = if is_text_name(&entry.name) {
+                                        Some(Color::rgba(0.25, 0.75, 0.55, 1.0))
+                                    } else if is_media_name(&entry.name) {
+                                        Some(Color::rgba(0.35, 0.65, 0.98, 1.0))
+                                    } else {
+                                        Some(Color::rgba(0.9, 0.7, 0.3, 1.0))
+                                    };
+                                    if let Some(tint) = tint {
+                                        let factor = if is_active { 0.32 } else { 0.22 };
+                                        fg = blend_color(fg, tint, factor);
+                                    }
+                                }
 
                                 let (rect, response) = ui.allocate_exact_size(
                                     egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
@@ -1515,7 +1649,7 @@ fn draw_panel(
                                 let icon_color = if entry.is_dir {
                                     colors.panel_border_active
                                 } else {
-                                    colors.row_fg_inactive
+                                    fg
                                 };
                                 ui.painter().rect_filled(
                                     icon_rect,
@@ -1719,7 +1853,9 @@ impl ApplicationHandler for App {
         thread::spawn(move || {
             while let Ok(req) = image_req_rx.recv() {
                 let image = match req.source {
-                    ImageSource::Fs(path) => image::open(path).ok(),
+                    ImageSource::Fs(path) => std::fs::read(path)
+                        .ok()
+                        .and_then(|data| decode_image_bytes(&data, MAX_TEXTURE_SIDE)),
                     ImageSource::Container {
                         kind,
                         archive_path,
@@ -1732,16 +1868,13 @@ impl ApplicationHandler for App {
                             usize::MAX,
                         )
                         .ok();
-                        bytes.and_then(|data| image::load_from_memory(&data).ok())
+                        bytes.and_then(|data| decode_image_bytes(&data, MAX_TEXTURE_SIDE))
                     }
                 };
-                if let Some(img) = image {
-                    let resized = resize_image(img, MAX_TEXTURE_SIDE);
-                    let rgba = resized.to_rgba8();
-                    let size = [rgba.width() as usize, rgba.height() as usize];
+                if let Some(image) = image {
                     let result = ImageResult {
                         key: req.key,
-                        image: egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+                        image,
                     };
                     let _ = image_res_tx.send(result);
                 }
@@ -2414,9 +2547,10 @@ fn save_snapshot_png(
         dst_row.copy_from_slice(src_row);
     }
 
-    let image = image::RgbaImage::from_raw(width, height, data)
-        .ok_or_else(|| anyhow::anyhow!("Failed to create image from snapshot data"))?;
-    image.save(path)?;
+    let image = ZuneImage::from_u8(&data, width as usize, height as usize, ColorSpace::RGBA);
+    image
+        .save_to(path, ImageFormat::PNG)
+        .map_err(|err| anyhow::anyhow!(format!("Failed to encode snapshot: {err:?}")))?;
     Ok(())
 }
 
