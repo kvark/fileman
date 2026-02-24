@@ -8,11 +8,12 @@ default-run = "fileman"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
-image = "0.25"
-zip = "0.6"
+zune-core = "0.4"
+zune-image = { version = "0.4", default-features = false, features = ["jpeg", "png", "metadata"] }
+zip = { version = "0.6", default-features = false, features = ["deflate", "time"] }
 tar = "0.4"
 flate2 = "1.0"
-bzip2 = "0.4"
+bzip2 = "0.6.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
