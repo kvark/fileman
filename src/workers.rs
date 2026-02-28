@@ -1,4 +1,4 @@
-use std::{sync::mpsc, thread};
+use std::{path::PathBuf, sync::mpsc, thread};
 
 use crate::core::{
     EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, copy_container_dir,
@@ -181,4 +181,45 @@ pub fn start_preview_worker() -> (
         }
     });
     (tx, result_rx)
+}
+
+pub fn start_dir_size_worker() -> (mpsc::Sender<PathBuf>, mpsc::Receiver<(PathBuf, u64)>) {
+    let (tx, rx) = mpsc::channel::<PathBuf>();
+    let (result_tx, result_rx) = mpsc::channel::<(PathBuf, u64)>();
+    thread::spawn(move || {
+        while let Ok(path) = rx.recv() {
+            let size = compute_dir_size(&path);
+            let _ = result_tx.send((path, size));
+        }
+    });
+    (tx, result_rx)
+}
+
+fn compute_dir_size(root: &PathBuf) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    total
 }

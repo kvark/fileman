@@ -34,13 +34,14 @@ use zune_image::image::Image as ZuneImage;
 use fileman::app_state::{AppState, PanelState, PendingOp};
 use fileman::core::{
     ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, ImageLocation, PanelMode,
-    PreviewContent, PreviewRequest, container_display_path, container_kind_from_path,
+    PreviewContent, PreviewRequest, container_display_path, container_kind_from_path, format_size,
     is_media_name, is_text_name, read_container_directory_with_progress, read_fs_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
-use fileman::workers::{start_io_worker, start_preview_worker};
+use fileman::workers::{start_dir_size_worker, start_io_worker, start_preview_worker};
 
 const ROW_HEIGHT: f32 = 24.0;
+const SIZE_COL_WIDTH: f32 = 84.0;
 const SNAPSHOT_WIDTH: u32 = 1280;
 const SNAPSHOT_HEIGHT: u32 = 720;
 const MAX_IMAGE_TEXTURES: usize = 64;
@@ -415,6 +416,7 @@ fn apply_dir_batch(panel: &mut PanelState, batch: DirBatch) {
                 name: message,
                 is_dir: false,
                 location: EntryLocation::Fs(panel.current_path.clone()),
+                size: None,
             }];
             panel.selected_index = 0;
             panel.top_index = 0;
@@ -447,7 +449,8 @@ fn apply_dir_batch(panel: &mut PanelState, batch: DirBatch) {
     }
 }
 
-fn pump_async(app: &mut AppState) {
+fn pump_async(app: &mut AppState) -> bool {
+    let mut changed = false;
     for side in [ActivePanel::Left, ActivePanel::Right] {
         let panel = app.panel_mut(side.clone());
         if let Some(rx) = panel.entries_rx.take() {
@@ -457,6 +460,7 @@ fn pump_async(app: &mut AppState) {
                     Ok(batch) => {
                         apply_dir_batch(panel, batch);
                         handled += 1;
+                        changed = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
                         panel.entries_rx = Some(rx);
@@ -472,11 +476,32 @@ fn pump_async(app: &mut AppState) {
         Ok((id, content)) => {
             if id == app.preview_request_id {
                 app.preview = Some(content);
+                changed = true;
             }
         }
         Err(mpsc::TryRecvError::Empty) => {}
         Err(mpsc::TryRecvError::Disconnected) => {}
     }
+
+    while let Ok((path, size)) = app.dir_size_rx.try_recv() {
+        app.dir_size_pending.remove(&path);
+        app.dir_sizes.insert(path.clone(), size);
+        for side in [ActivePanel::Left, ActivePanel::Right] {
+            let panel = app.panel_mut(side.clone());
+            for entry in &mut panel.entries {
+                if entry.is_dir {
+                    if let EntryLocation::Fs(p) = &entry.location {
+                        if *p == path {
+                            entry.size = Some(size);
+                        }
+                    }
+                }
+            }
+        }
+        changed = true;
+    }
+
+    changed
 }
 
 fn load_fs_directory_async(
@@ -492,12 +517,15 @@ fn load_fs_directory_async(
             name: "..".to_string(),
             is_dir: true,
             location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
+            size: None,
         });
         has_parent_entry = true;
     }
 
     let (tx, rx) = mpsc::channel::<DirBatch>();
     let path_clone = path.clone();
+    let dir_sizes_snapshot = app.dir_sizes.clone();
+    let dir_sizes_fallback = app.dir_sizes.clone();
 
     if let Ok(mut rd) = fs::read_dir(&path) {
         let mut snapshot: Vec<DirEntry> = Vec::with_capacity(128);
@@ -506,10 +534,16 @@ fn load_fs_directory_async(
                 Some(Ok(entry)) => {
                     let file_name = entry.file_name().to_string_lossy().to_string();
                     let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    let size = if is_dir {
+                        dir_sizes_snapshot.get(&entry.path()).copied()
+                    } else {
+                        entry.metadata().ok().map(|m| m.len())
+                    };
                     snapshot.push(DirEntry {
                         name: file_name,
                         is_dir,
                         location: EntryLocation::Fs(entry.path()),
+                        size,
                     });
                 }
                 Some(Err(_)) | None => break,
@@ -527,10 +561,16 @@ fn load_fs_directory_async(
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if let Ok(file_type) = entry.file_type() {
                     let is_dir = file_type.is_dir();
+                    let size = if is_dir {
+                        dir_sizes_snapshot.get(&entry.path()).copied()
+                    } else {
+                        entry.metadata().ok().map(|m| m.len())
+                    };
                     all.push(DirEntry {
                         name: file_name,
                         is_dir,
                         location: EntryLocation::Fs(entry.path()),
+                        size,
                     });
                 }
             }
@@ -541,6 +581,7 @@ fn load_fs_directory_async(
                     name: "..".to_string(),
                     is_dir: true,
                     location: EntryLocation::Fs(parent.to_path_buf()),
+                    size: None,
                 });
             }
             sorted.extend(all);
@@ -569,10 +610,16 @@ fn load_fs_directory_async(
                     let file_name = entry.file_name().to_string_lossy().to_string();
                     if let Ok(file_type) = entry.file_type() {
                         let is_dir = file_type.is_dir();
+                        let size = if is_dir {
+                            dir_sizes_fallback.get(&entry.path()).copied()
+                        } else {
+                            entry.metadata().ok().map(|m| m.len())
+                        };
                         all.push(DirEntry {
                             name: file_name,
                             is_dir,
                             location: EntryLocation::Fs(entry.path()),
+                            size,
                         });
                     }
                 }
@@ -584,6 +631,7 @@ fn load_fs_directory_async(
                     name: "..".to_string(),
                     is_dir: true,
                     location: EntryLocation::Fs(parent.to_path_buf()),
+                    size: None,
                 });
             }
             sorted.extend(all);
@@ -644,6 +692,7 @@ fn load_container_directory_async(
                 archive_path: archive_path.clone(),
                 inner_path: parent,
             },
+            size: None,
         });
     } else {
         let parent = archive_path
@@ -654,6 +703,7 @@ fn load_container_directory_async(
             name: "..".into(),
             is_dir: true,
             location: EntryLocation::Fs(parent),
+            size: None,
         });
     }
 
@@ -725,6 +775,7 @@ fn load_container_directory_async(
                                     format!("{}/{}", cwd.trim_end_matches('/'), dir)
                                 },
                             },
+                            size: None,
                         });
                         *loaded += 1;
                     }
@@ -744,6 +795,7 @@ fn load_container_directory_async(
                                 format!("{}/{}", cwd.trim_end_matches('/'), file_name)
                             },
                         },
+                        size: None,
                     });
                     *loaded += 1;
                 }
@@ -948,8 +1000,12 @@ fn load_container_directory_async(
 fn open_selected(app: &mut AppState) {
     let active = app.active_panel.clone();
 
+    open_selected_from_to(app, active.clone(), active);
+}
+
+fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: ActivePanel) {
     let (selected_entry, current_path, container_cwd) = {
-        let panel = app.get_active_panel();
+        let panel = app.panel(source.clone());
         if panel.entries.is_empty() {
             return;
         }
@@ -962,7 +1018,7 @@ fn open_selected(app: &mut AppState) {
         (entry, current_path, container_cwd)
     };
 
-    app.store_current_selection_memory();
+    app.store_selection_memory_for(source);
 
     match &selected_entry.location {
         EntryLocation::Fs(path) => {
@@ -974,12 +1030,12 @@ fn open_selected(app: &mut AppState) {
                 } else {
                     None
                 };
-                load_fs_directory_async(app, path.clone(), active.clone(), prefer_name);
+                load_fs_directory_async(app, path.clone(), target.clone(), prefer_name);
 
                 if selected_entry.name != ".."
                     && let Some(name) = app.fs_last_selected_name.get(path).cloned()
                 {
-                    app.select_entry_by_name(active, &name);
+                    app.select_entry_by_name(target, &name);
                 }
             } else if let Some(kind) = container_kind_from_path(path) {
                 load_container_directory_async(
@@ -987,7 +1043,7 @@ fn open_selected(app: &mut AppState) {
                     kind,
                     path.clone(),
                     "".to_string(),
-                    active,
+                    target,
                     None,
                 );
             }
@@ -1013,7 +1069,7 @@ fn open_selected(app: &mut AppState) {
                     *kind,
                     archive_path.clone(),
                     inner_path.clone(),
-                    active.clone(),
+                    target.clone(),
                     prefer_name,
                 );
 
@@ -1023,7 +1079,24 @@ fn open_selected(app: &mut AppState) {
                         .get(&(archive_path.clone(), inner_path.clone(), *kind))
                         .cloned()
                 {
-                    app.select_entry_by_name(active, &name);
+                    app.select_entry_by_name(target, &name);
+                }
+            }
+        }
+    }
+
+    while let Ok((path, size)) = app.dir_size_rx.try_recv() {
+        app.dir_size_pending.remove(&path);
+        app.dir_sizes.insert(path.clone(), size);
+        for side in [ActivePanel::Left, ActivePanel::Right] {
+            let panel = app.panel_mut(side.clone());
+            for entry in &mut panel.entries {
+                if entry.is_dir {
+                    if let EntryLocation::Fs(p) = &entry.location {
+                        if *p == path {
+                            entry.size = Some(size);
+                        }
+                    }
                 }
             }
         }
@@ -1068,11 +1141,52 @@ fn handle_keyboard(
     }
     let window_rows = active_window_rows(app, cache);
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
-    if tab_pressed {
+    let ctrl_tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
+    if tab_pressed || ctrl_tab_pressed {
         app.switch_panel();
         if app.preview.is_some() {
             app.update_preview_for_current_selection();
         }
+    }
+    let ctrl_pgup = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
+    if ctrl_pgup || input.key_pressed(egui::Key::Backspace) {
+        open_parent(app, window_rows);
+    }
+    let ctrl_pgdn = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
+    if ctrl_pgdn {
+        open_selected(app);
+    }
+    let ctrl_r = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R));
+    if ctrl_r {
+        refresh_active_panel(app);
+    }
+    let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+    if space {
+        let target_path = {
+            let panel = app.get_active_panel();
+            panel.entries.get(panel.selected_index).and_then(|entry| {
+                if entry.is_dir {
+                    if let EntryLocation::Fs(path) = &entry.location {
+                        return Some(path.clone());
+                    }
+                }
+                None
+            })
+        };
+        if let Some(path) = target_path {
+            if !app.dir_size_pending.contains(&path) {
+                app.dir_size_pending.insert(path.clone());
+                let _ = app.dir_size_tx.send(path);
+            }
+        }
+    }
+    let ctrl_left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
+    if ctrl_left && app.active_panel == ActivePanel::Right {
+        open_selected_from_to(app, ActivePanel::Right, ActivePanel::Left);
+    }
+    let ctrl_right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
+    if ctrl_right && app.active_panel == ActivePanel::Left {
+        open_selected_from_to(app, ActivePanel::Left, ActivePanel::Right);
     }
     if input.key_pressed(egui::Key::Enter) {
         if app.theme_picker_open {
@@ -1149,6 +1263,16 @@ fn handle_keyboard(
     if input.key_pressed(egui::Key::F8) {
         app.prepare_delete_selected();
     }
+}
+
+fn open_parent(app: &mut AppState, window_rows: usize) {
+    let panel = app.get_active_panel();
+    let parent_index = panel.entries.iter().position(|e| e.name == "..");
+    let Some(idx) = parent_index else { return };
+    if panel.selected_index != idx {
+        app.select_entry(idx, window_rows);
+    }
+    open_selected(app);
 }
 
 fn confirm_pending_op(app: &mut AppState) {
@@ -1658,8 +1782,30 @@ fn draw_panel(
                                 );
 
                                 let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                ui.painter().text(
-                                    rect.left_center() + egui::Vec2::new(22.0, 0.0),
+                                let mut size_text = entry.size.map(format_size).unwrap_or_default();
+                                if size_text.is_empty() && entry.is_dir {
+                                    if let EntryLocation::Fs(path) = &entry.location {
+                                        if app.dir_size_pending.contains(path) {
+                                            size_text = "…".to_string();
+                                        }
+                                    }
+                                }
+                                if !size_text.is_empty() {
+                                    ui.painter().text(
+                                        egui::pos2(rect.right() - 8.0, rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        size_text,
+                                        font_id.clone(),
+                                        color32(fg),
+                                    );
+                                }
+                                let name_min = rect.left_center() + egui::Vec2::new(22.0, 0.0);
+                                let name_rect = egui::Rect::from_min_max(
+                                    egui::pos2(name_min.x, rect.top()),
+                                    egui::pos2(rect.right() - SIZE_COL_WIDTH, rect.bottom()),
+                                );
+                                ui.painter().with_clip_rect(name_rect).text(
+                                    name_min,
                                     egui::Align2::LEFT_CENTER,
                                     entry.name.as_str(),
                                     font_id,
@@ -1845,6 +1991,7 @@ impl ApplicationHandler for App {
         let cur_dir = std::env::current_dir().expect("current_dir");
         let (io_tx, io_rx, io_cancel_tx) = start_io_worker();
         let (preview_tx, preview_rx) = start_preview_worker();
+        let (dir_size_tx, dir_size_rx) = start_dir_size_worker();
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
         let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResult>();
         let (highlight_req_tx, highlight_req_rx) = mpsc::channel::<HighlightRequest>();
@@ -1925,6 +2072,10 @@ impl ApplicationHandler for App {
             io_cancel_tx,
             io_in_flight: 0,
             io_cancel_requested: false,
+            dir_size_tx,
+            dir_size_rx,
+            dir_sizes: Default::default(),
+            dir_size_pending: Default::default(),
             fs_last_selected_name: Default::default(),
             container_last_selected_name: Default::default(),
             theme: Theme::dark(),
@@ -2022,7 +2173,9 @@ impl ApplicationHandler for App {
                     runtime.app.on_io_completed(completed);
                     refresh_fs_panels(&mut runtime.app);
                 }
-                pump_async(&mut runtime.app);
+                if pump_async(&mut runtime.app) {
+                    runtime.egui_ctx.request_repaint();
+                }
                 let mut decoded_images = Vec::new();
                 while decoded_images.len() < MAX_IMAGE_UPLOADS_PER_FRAME {
                     match runtime.image_res_rx.try_recv() {
@@ -2294,6 +2447,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     let (io_tx, _io_rx_unused) = mpsc::channel::<fileman::core::IOTask>();
     let (_io_res_tx, io_rx) = mpsc::channel::<fileman::core::IOResult>();
     let (io_cancel_tx, _io_cancel_rx) = mpsc::channel::<()>();
+    let (dir_size_tx, _dir_size_req_rx) = mpsc::channel::<PathBuf>();
+    let (_dir_size_res_tx, dir_size_rx) = mpsc::channel::<(PathBuf, u64)>();
     let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
     let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
     let mut image_cache = ImageCache {
@@ -2341,6 +2496,10 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         io_cancel_tx,
         io_in_flight: 0,
         io_cancel_requested: false,
+        dir_size_tx,
+        dir_size_rx,
+        dir_sizes: Default::default(),
+        dir_size_pending: Default::default(),
         fs_last_selected_name: Default::default(),
         container_last_selected_name: Default::default(),
         theme: Theme::dark(),
