@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path, sync::mpsc};
+use std::{
+    collections::{HashMap, HashSet},
+    path,
+    sync::mpsc,
+};
 
 use crate::core::{
     ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, IOResult, IOTask, ImageLocation,
@@ -35,6 +39,10 @@ pub struct AppState {
     pub io_cancel_tx: mpsc::Sender<()>,
     pub io_in_flight: usize,
     pub io_cancel_requested: bool,
+    pub dir_size_tx: mpsc::Sender<path::PathBuf>,
+    pub dir_size_rx: mpsc::Receiver<(path::PathBuf, u64)>,
+    pub dir_sizes: HashMap<path::PathBuf, u64>,
+    pub dir_size_pending: HashSet<path::PathBuf>,
     pub fs_last_selected_name: HashMap<path::PathBuf, String>,
     pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
     pub theme: Theme,
@@ -113,8 +121,12 @@ impl AppState {
     }
 
     pub fn store_current_selection_memory(&mut self) {
+        self.store_selection_memory_for(self.active_panel.clone());
+    }
+
+    pub fn store_selection_memory_for(&mut self, which: ActivePanel) {
         let (fs_key, container_key, selected_name_opt) = {
-            let panel = self.get_active_panel();
+            let panel = self.panel(which);
             if panel.entries.is_empty() {
                 return;
             }

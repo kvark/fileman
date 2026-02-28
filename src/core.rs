@@ -121,6 +121,7 @@ pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
     pub location: EntryLocation,
+    pub size: Option<u64>,
 }
 
 pub enum DirBatch {
@@ -475,10 +476,16 @@ pub fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
         let file_type = entry.file_type()?;
         let is_dir = file_type.is_dir();
 
+        let size = if is_dir {
+            None
+        } else {
+            entry.metadata().ok().map(|m| m.len())
+        };
         dir_entries.push(DirEntry {
             name: file_name,
             is_dir,
             location: EntryLocation::Fs(entry.path()),
+            size,
         });
     }
 
@@ -489,6 +496,7 @@ pub fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
             name: "..".to_string(),
             is_dir: true,
             location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
+            size: None,
         });
     }
 
@@ -544,6 +552,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                 archive_path: archive_path.to_path_buf(),
                 inner_path: parent,
             },
+            size: None,
         });
     } else {
         let parent = archive_path
@@ -554,6 +563,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
             name: "..".into(),
             is_dir: true,
             location: EntryLocation::Fs(parent),
+            size: None,
         });
     }
 
@@ -571,6 +581,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                     format!("{}/{}", cwd.trim_end_matches('/'), d)
                 },
             },
+            size: None,
         })
         .collect();
 
@@ -588,6 +599,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                     format!("{}/{}", cwd.trim_end_matches('/'), f)
                 },
             },
+            size: None,
         })
         .collect();
 
@@ -764,7 +776,7 @@ fn entry_name_for_metadata(entry: &DirEntry) -> &str {
     }
 }
 
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
@@ -904,6 +916,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
                 archive_path: archive_path.to_path_buf(),
                 inner_path: parent,
             },
+            size: None,
         });
     } else {
         let parent = archive_path
@@ -914,6 +927,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
             name: "..".into(),
             is_dir: true,
             location: EntryLocation::Fs(parent),
+            size: None,
         });
     }
 
@@ -931,6 +945,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
                     format!("{}/{}", cwd.trim_end_matches('/'), d)
                 },
             },
+            size: None,
         })
         .collect();
 
@@ -948,6 +963,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
                     format!("{}/{}", cwd.trim_end_matches('/'), f)
                 },
             },
+            size: None,
         })
         .collect();
 
@@ -1064,6 +1080,7 @@ fn read_tar_bz2_directory_with_progress(
                 archive_path: archive_path.to_path_buf(),
                 inner_path: parent,
             },
+            size: None,
         });
     } else {
         let parent = archive_path
@@ -1074,6 +1091,7 @@ fn read_tar_bz2_directory_with_progress(
             name: "..".into(),
             is_dir: true,
             location: EntryLocation::Fs(parent),
+            size: None,
         });
     }
 
@@ -1091,6 +1109,7 @@ fn read_tar_bz2_directory_with_progress(
                     format!("{}/{}", cwd.trim_end_matches('/'), d)
                 },
             },
+            size: None,
         })
         .collect();
 
@@ -1108,6 +1127,7 @@ fn read_tar_bz2_directory_with_progress(
                     format!("{}/{}", cwd.trim_end_matches('/'), f)
                 },
             },
+            size: None,
         })
         .collect();
 
