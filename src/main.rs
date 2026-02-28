@@ -1233,6 +1233,29 @@ fn open_search(app: &mut AppState, mode: SearchMode) {
     app.search_mode = mode;
 }
 
+fn preview_find_next(app: &mut AppState) {
+    let Some(PreviewContent::Text(text)) = app.preview.as_ref() else {
+        return;
+    };
+    let query = app.preview_find_query.trim();
+    if query.is_empty() {
+        return;
+    }
+    let lower_text = text.to_ascii_lowercase();
+    let lower_query = query.to_ascii_lowercase();
+    let start = app.preview_find_index.min(lower_text.len());
+    let mut found = lower_text[start..].find(&lower_query).map(|i| i + start);
+    if found.is_none() && start > 0 {
+        found = lower_text.find(&lower_query);
+    }
+    if let Some(idx) = found {
+        app.preview_find_index = idx + lower_query.len();
+        let line = text[..idx].bytes().filter(|b| *b == b'\n').count();
+        let line_height = app.preview_line_height.max(14.0);
+        app.preview_scroll = line as f32 * line_height;
+    }
+}
+
 fn apply_panel_snapshot(
     app: &mut AppState,
     which: ActivePanel,
@@ -1391,9 +1414,16 @@ fn handle_keyboard(
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
     let ctrl_tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
     if tab_pressed || ctrl_tab_pressed {
-        app.switch_panel();
         if app.preview.is_some() {
-            app.update_preview_for_current_selection();
+            app.preview_focus = !app.preview_focus;
+            if app.preview_focus {
+                app.preview_find_open = false;
+            }
+        } else {
+            app.switch_panel();
+            if app.preview.is_some() {
+                app.update_preview_for_current_selection();
+            }
         }
         ctx.request_repaint();
     }
@@ -1498,7 +1528,52 @@ fn handle_keyboard(
             open_selected(app);
         }
     }
-    if input.key_pressed(egui::Key::ArrowDown) {
+    if app.preview_focus {
+        let line = app.preview_line_height.max(16.0);
+        let page = app.preview_page_height.max(200.0);
+        let mut consumed = false;
+        let can_scroll = app.preview_can_scroll;
+        if can_scroll && input.key_pressed(egui::Key::ArrowDown) {
+            app.preview_scroll += line;
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::ArrowUp) {
+            app.preview_scroll = (app.preview_scroll - line).max(0.0);
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::PageDown) {
+            app.preview_scroll += page;
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::PageUp) {
+            app.preview_scroll = (app.preview_scroll - page).max(0.0);
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::Home) {
+            app.preview_scroll = 0.0;
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::End) {
+            app.preview_scroll = app.preview_scroll + page * 10.0;
+            consumed = true;
+        }
+        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        if enter && app.preview_find_open {
+            preview_find_next(app);
+            consumed = true;
+        }
+        if consumed {
+            ctx.request_repaint();
+            return;
+        }
+    }
+    let ctrl_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F));
+    if ctrl_f && app.preview_focus {
+        app.preview_find_open = true;
+        app.preview_find_focus = true;
+        ctx.request_repaint();
+    }
+    if input.key_pressed(egui::Key::ArrowDown) && !app.preview_focus {
         if app.theme_picker_open {
             app.select_next_theme();
         } else {
@@ -1508,7 +1583,7 @@ fn handle_keyboard(
             }
         }
     }
-    if input.key_pressed(egui::Key::ArrowUp) {
+    if input.key_pressed(egui::Key::ArrowUp) && !app.preview_focus {
         if app.theme_picker_open {
             app.select_prev_theme();
         } else {
@@ -1518,12 +1593,12 @@ fn handle_keyboard(
             }
         }
     }
-    if input.key_pressed(egui::Key::PageUp) {
+    if input.key_pressed(egui::Key::PageUp) && !app.preview_focus {
         let panel = app.get_active_panel();
         let new_index = panel.selected_index.saturating_sub(window_rows);
         app.select_entry(new_index, window_rows);
     }
-    if input.key_pressed(egui::Key::PageDown) {
+    if input.key_pressed(egui::Key::PageDown) && !app.preview_focus {
         let panel = app.get_active_panel();
         let len = panel.entries.len();
         let mut new_index = panel.selected_index.saturating_add(window_rows);
@@ -1532,10 +1607,10 @@ fn handle_keyboard(
         }
         app.select_entry(new_index, window_rows);
     }
-    if input.key_pressed(egui::Key::Home) {
+    if input.key_pressed(egui::Key::Home) && !app.preview_focus {
         app.select_entry(0, window_rows);
     }
-    if input.key_pressed(egui::Key::End) {
+    if input.key_pressed(egui::Key::End) && !app.preview_focus {
         let panel = app.get_active_panel();
         if !panel.entries.is_empty() {
             app.select_entry(panel.entries.len() - 1, window_rows);
@@ -1791,7 +1866,7 @@ fn pending_op_text(op: &PendingOp) -> (&'static str, String) {
 
 fn draw_preview(
     ui: &mut egui::Ui,
-    app: &AppState,
+    app: &mut AppState,
     image_cache: &mut ImageCache,
     image_req_tx: &mpsc::Sender<ImageRequest>,
     highlight_cache: &HashMap<String, egui::text::LayoutJob>,
@@ -1806,105 +1881,135 @@ fn draw_preview(
 
     egui::Frame::NONE
         .fill(color32(colors.preview_bg))
+        .stroke(egui::Stroke::new(
+            1.0,
+            color32(if app.preview_focus {
+                colors.panel_border_active
+            } else {
+                colors.panel_border_inactive
+            }),
+        ))
         .show(ui, |ui| {
             ui.set_min_height(min_height);
             egui::Frame::NONE.fill(header_bg).show(ui, |ui| {
-                ui.colored_label(header_fg, "Preview (F3/Esc to close)");
+                if app.preview_focus {
+                    ui.colored_label(header_fg, "● Preview (Tab to return)");
+                } else {
+                    ui.colored_label(header_fg, "Preview (Tab to focus)");
+                }
             });
             ui.add_space(4.0);
 
-            egui::ScrollArea::both().show(ui, |ui| match app.preview.as_ref() {
-                Some(PreviewContent::Text(text)) => {
-                    let ext = app.preview_ext.clone();
-                    let base_key = app
-                        .preview_key
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let key = format!("{base_key}:{:x}", hash_text(text));
-                    if let Some(job) = highlight_cache.get(&key) {
-                        ui.add(egui::Label::new(job.clone()).selectable(true));
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new());
-                            ui.colored_label(text_color, "Highlighting…");
-                        });
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(120));
-                        ui.add_space(6.0);
-                        if highlight_pending.insert(key.clone()) {
-                            let _ = highlight_req_tx.send(HighlightRequest {
-                                key: key.clone(),
-                                text: text.clone(),
-                                ext,
-                                theme_kind: app.theme.kind,
+            let page_height = ui.available_height();
+            let output = egui::ScrollArea::both()
+                .vertical_scroll_offset(app.preview_scroll)
+                .show(ui, |ui| match app.preview.as_ref() {
+                    Some(PreviewContent::Text(text)) => {
+                        if app.preview_find_open {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(text_color, "Find:");
+                                let response = ui.text_edit_singleline(&mut app.preview_find_query);
+                                if app.preview_find_focus {
+                                    response.request_focus();
+                                    app.preview_find_focus = false;
+                                }
                             });
+                            ui.add_space(4.0);
                         }
-                        ui.colored_label(text_color, text);
+                        let ext = app.preview_ext.clone();
+                        let base_key = app
+                            .preview_key
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let key = format!("{base_key}:{:x}", hash_text(text));
+                        if let Some(job) = highlight_cache.get(&key) {
+                            ui.add(egui::Label::new(job.clone()).selectable(true));
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new());
+                                ui.colored_label(text_color, "Highlighting…");
+                            });
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(120));
+                            ui.add_space(6.0);
+                            if highlight_pending.insert(key.clone()) {
+                                let _ = highlight_req_tx.send(HighlightRequest {
+                                    key: key.clone(),
+                                    text: text.clone(),
+                                    ext,
+                                    theme_kind: app.theme.kind,
+                                });
+                            }
+                            ui.colored_label(text_color, text);
+                        }
                     }
-                }
-                Some(PreviewContent::Image(path)) => {
-                    let (key, request) = match path {
-                        ImageLocation::Fs(path) => {
-                            let key = path.to_string_lossy().into_owned();
-                            (
-                                key.clone(),
-                                ImageRequest {
-                                    key,
-                                    source: ImageSource::Fs(path.as_ref().to_path_buf()),
-                                },
-                            )
-                        }
-                        ImageLocation::Container {
-                            kind,
-                            archive_path,
-                            inner_path,
-                        } => {
-                            let key = format!(
-                                "{}::{}:/{}",
-                                archive_path.to_string_lossy(),
-                                match kind {
-                                    ContainerKind::Zip => "zip",
-                                    ContainerKind::TarGz => "tar.gz",
-                                    ContainerKind::TarBz2 => "tar.bz2",
-                                },
-                                inner_path
-                            );
-                            (
-                                key.clone(),
-                                ImageRequest {
-                                    key,
-                                    source: ImageSource::Container {
-                                        kind: *kind,
-                                        archive_path: archive_path.clone(),
-                                        inner_path: inner_path.clone(),
+                    Some(PreviewContent::Image(path)) => {
+                        let (key, request) = match path {
+                            ImageLocation::Fs(path) => {
+                                let key = path.to_string_lossy().into_owned();
+                                (
+                                    key.clone(),
+                                    ImageRequest {
+                                        key,
+                                        source: ImageSource::Fs(path.as_ref().to_path_buf()),
                                     },
-                                },
-                            )
+                                )
+                            }
+                            ImageLocation::Container {
+                                kind,
+                                archive_path,
+                                inner_path,
+                            } => {
+                                let key = format!(
+                                    "{}::{}:/{}",
+                                    archive_path.to_string_lossy(),
+                                    match kind {
+                                        ContainerKind::Zip => "zip",
+                                        ContainerKind::TarGz => "tar.gz",
+                                        ContainerKind::TarBz2 => "tar.bz2",
+                                    },
+                                    inner_path
+                                );
+                                (
+                                    key.clone(),
+                                    ImageRequest {
+                                        key,
+                                        source: ImageSource::Container {
+                                            kind: *kind,
+                                            archive_path: archive_path.clone(),
+                                            inner_path: inner_path.clone(),
+                                        },
+                                    },
+                                )
+                            }
+                        };
+                        if let Some(handle) = image_cache.textures.get(&key).cloned() {
+                            touch_image(image_cache, &key);
+                            let sized = egui::load::SizedTexture::from_handle(&handle);
+                            let available = ui.available_size();
+                            let tex = sized.size;
+                            let scale = (available.x / tex.x)
+                                .min(available.y / tex.y)
+                                .clamp(0.01, 1.0);
+                            let size = egui::Vec2::new(tex.x * scale, tex.y * scale);
+                            ui.add(egui::Image::new(sized).fit_to_exact_size(size));
+                        } else {
+                            if image_cache.pending.insert(key.clone()) {
+                                let _ = image_req_tx.send(request);
+                            }
+                            ui.colored_label(text_color, format!("Loading image...\n{}", key));
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(120));
                         }
-                    };
-                    if let Some(handle) = image_cache.textures.get(&key).cloned() {
-                        touch_image(image_cache, &key);
-                        let sized = egui::load::SizedTexture::from_handle(&handle);
-                        let available = ui.available_size();
-                        let tex = sized.size;
-                        let scale = (available.x / tex.x)
-                            .min(available.y / tex.y)
-                            .clamp(0.01, 1.0);
-                        let size = egui::Vec2::new(tex.x * scale, tex.y * scale);
-                        ui.add(egui::Image::new(sized).fit_to_exact_size(size));
-                    } else {
-                        if image_cache.pending.insert(key.clone()) {
-                            let _ = image_req_tx.send(request);
-                        }
-                        ui.colored_label(text_color, format!("Loading image...\n{}", key));
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(120));
                     }
-                }
-                None => {
-                    ui.colored_label(text_color, "No preview");
-                }
-            });
+                    None => {
+                        ui.colored_label(text_color, "No preview");
+                    }
+                });
+            app.preview_scroll = output.state.offset.y;
+            app.preview_page_height = page_height;
+            app.preview_line_height = ui.text_style_height(&egui::TextStyle::Body);
+            app.preview_can_scroll = output.content_size.y > output.inner_rect.height();
         });
 }
 
@@ -1981,7 +2086,7 @@ fn draw_panel(
     ui.set_min_size(available);
     let panel_height = available.y.max(0.0).max(min_height);
     let colors = app.theme.colors();
-    let is_active = app.active_panel == panel_side;
+    let is_active = app.active_panel == panel_side && !app.preview_focus;
 
     let (entries_len, selected_index, header_text, selected_label, loading, loading_progress) = {
         let panel = app.panel(panel_side.clone());
@@ -2261,6 +2366,7 @@ fn draw_panel(
         });
 
     if panel_response.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
+        app.preview_focus = false;
         app.active_panel = panel_side.clone();
     }
 
@@ -2478,6 +2584,15 @@ impl ApplicationHandler for App {
             preview: None,
             preview_key: None,
             preview_ext: None,
+            preview_focus: false,
+            preview_scroll: 0.0,
+            preview_line_height: 16.0,
+            preview_page_height: 240.0,
+            preview_can_scroll: false,
+            preview_find_open: false,
+            preview_find_query: String::new(),
+            preview_find_index: 0,
+            preview_find_focus: false,
             preview_tx: preview_tx.clone(),
             preview_rx,
             preview_request_id: 0,
@@ -2646,7 +2761,7 @@ impl ApplicationHandler for App {
                             {
                                 draw_preview(
                                     ui,
-                                    &runtime.app,
+                                    &mut runtime.app,
                                     &mut runtime.image_cache,
                                     &runtime.image_req_tx,
                                     &runtime.highlight_cache,
@@ -2672,7 +2787,7 @@ impl ApplicationHandler for App {
                             {
                                 draw_preview(
                                     ui,
-                                    &runtime.app,
+                                    &mut runtime.app,
                                     &mut runtime.image_cache,
                                     &runtime.image_req_tx,
                                     &runtime.highlight_cache,
@@ -2933,6 +3048,15 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         preview: None,
         preview_key: None,
         preview_ext: None,
+        preview_focus: false,
+        preview_scroll: 0.0,
+        preview_line_height: 16.0,
+        preview_page_height: 240.0,
+        preview_can_scroll: false,
+        preview_find_open: false,
+        preview_find_query: String::new(),
+        preview_find_index: 0,
+        preview_find_focus: false,
         preview_tx,
         preview_rx,
         preview_request_id: 0,
@@ -3016,7 +3140,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                 if app.preview.is_some() && app.active_panel == ActivePanel::Right {
                     draw_preview(
                         ui,
-                        &app,
+                        &mut app,
                         &mut image_cache,
                         &image_req_tx,
                         &highlight_cache,
@@ -3040,7 +3164,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                 if app.preview.is_some() && app.active_panel == ActivePanel::Left {
                     draw_preview(
                         ui,
-                        &app,
+                        &mut app,
                         &mut image_cache,
                         &image_req_tx,
                         &highlight_cache,

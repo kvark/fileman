@@ -41,6 +41,15 @@ pub struct AppState {
     pub preview: Option<PreviewContent>,
     pub preview_key: Option<String>,
     pub preview_ext: Option<String>,
+    pub preview_focus: bool,
+    pub preview_scroll: f32,
+    pub preview_line_height: f32,
+    pub preview_page_height: f32,
+    pub preview_can_scroll: bool,
+    pub preview_find_open: bool,
+    pub preview_find_query: String,
+    pub preview_find_index: usize,
+    pub preview_find_focus: bool,
     pub preview_tx: mpsc::Sender<PreviewRequest>,
     pub preview_rx: mpsc::Receiver<(u64, PreviewContent)>,
     pub preview_request_id: u64,
@@ -313,6 +322,10 @@ impl AppState {
         };
         self.preview_key = Some(key);
         self.preview_ext = ext;
+        self.preview_scroll = 0.0;
+        self.preview_find_index = 0;
+        self.preview_find_open = false;
+        self.preview_find_focus = false;
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let request_id = self.preview_request_id;
         const MAX_BYTES_TEXT: usize = 64 * 1024;
@@ -689,6 +702,12 @@ impl AppState {
         self.preview = None;
         self.preview_key = None;
         self.preview_ext = None;
+        self.preview_focus = false;
+        self.preview_scroll = 0.0;
+        self.preview_find_index = 0;
+        self.preview_find_open = false;
+        self.preview_find_focus = false;
+        self.preview_can_scroll = false;
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
     }
 }
