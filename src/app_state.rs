@@ -49,6 +49,8 @@ pub struct AppState {
     pub theme_picker_open: bool,
     pub theme_picker_selected: Option<usize>,
     pub pending_op: Option<PendingOp>,
+    pub rename_input: Option<String>,
+    pub rename_focus: bool,
 }
 
 #[derive(Clone)]
@@ -64,6 +66,9 @@ pub enum PendingOp {
     },
     Delete {
         target: path::PathBuf,
+    },
+    Rename {
+        src: path::PathBuf,
     },
 }
 
@@ -158,6 +163,34 @@ impl AppState {
         let panel = self.panel_mut(which);
         if let Some(idx) = panel.entries.iter().position(|e| e.name == name) {
             panel.selected_index = idx;
+        }
+    }
+
+    pub fn prepare_rename_selected(&mut self) {
+        let (path, name) = {
+            let panel = self.get_active_panel();
+            if panel.entries.is_empty() {
+                return;
+            }
+            let entry = &panel.entries[panel.selected_index];
+            if entry.name == ".." || entry.is_dir && !matches!(entry.location, EntryLocation::Fs(_))
+            {
+                return;
+            }
+            if let EntryLocation::Fs(path) = &entry.location {
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string());
+                (Some(path.clone()), name)
+            } else {
+                (None, None)
+            }
+        };
+        if let (Some(path), Some(name)) = (path, name) {
+            self.rename_input = Some(name);
+            self.pending_op = Some(PendingOp::Rename { src: path });
+            self.rename_focus = true;
         }
     }
 
@@ -322,6 +355,8 @@ impl AppState {
 
     pub fn clear_pending_op(&mut self) {
         self.pending_op = None;
+        self.rename_input = None;
+        self.rename_focus = false;
     }
 
     pub fn enqueue_pending_op(&mut self, op: &PendingOp) {
@@ -382,6 +417,19 @@ impl AppState {
                 } else {
                     self.io_in_flight = self.io_in_flight.saturating_add(1);
                     log::info!("Enqueued delete: {}", target.to_string_lossy());
+                }
+            }
+            PendingOp::Rename { src } => {
+                if let Some(new_name) = self.rename_input.clone() {
+                    if let Err(e) = self.io_tx.send(IOTask::Rename {
+                        src: src.clone(),
+                        new_name,
+                    }) {
+                        eprintln!("Failed to enqueue rename: {e}");
+                    } else {
+                        self.io_in_flight = self.io_in_flight.saturating_add(1);
+                        log::info!("Enqueued rename: {}", src.to_string_lossy());
+                    }
                 }
             }
         }

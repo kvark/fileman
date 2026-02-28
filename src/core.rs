@@ -202,6 +202,10 @@ pub enum IOTask {
     Delete {
         target: path::PathBuf,
     },
+    Rename {
+        src: path::PathBuf,
+        new_name: String,
+    },
 }
 
 pub enum IOResult {

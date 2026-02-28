@@ -1254,6 +1254,10 @@ fn handle_keyboard(
     if input.key_pressed(egui::Key::F6) {
         app.prepare_move_selected();
     }
+    let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
+    if shift_f6 {
+        app.prepare_rename_selected();
+    }
     if input.key_pressed(egui::Key::F9) {
         app.switch_theme();
     }
@@ -1277,9 +1281,36 @@ fn open_parent(app: &mut AppState, window_rows: usize) {
 
 fn confirm_pending_op(app: &mut AppState) {
     if let Some(op) = app.take_pending_op() {
+        if let PendingOp::Rename { src } = &op {
+            let name = app.rename_input.clone().unwrap_or_default();
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\\')
+            {
+                app.clear_pending_op();
+                return;
+            }
+            if let Some(current) = src.file_name().and_then(|n| n.to_str()) {
+                if current == name {
+                    app.clear_pending_op();
+                    return;
+                }
+            }
+            app.store_selection_memory_for(app.active_panel.clone());
+            app.fs_last_selected_name.insert(
+                src.parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf(),
+                name,
+            );
+        }
         app.enqueue_pending_op(&op);
         match op {
-            PendingOp::Copy { .. } | PendingOp::Move { .. } => refresh_fs_panels(app),
+            PendingOp::Copy { .. } | PendingOp::Move { .. } | PendingOp::Rename { .. } => {
+                refresh_fs_panels(app)
+            }
             PendingOp::Delete { .. } => refresh_active_panel(app),
         }
     }
@@ -1321,6 +1352,7 @@ fn draw_confirmation(ctx: &egui::Context, app: &mut AppState) {
     let (title, body) = pending_op_text(&op);
     let mut confirmed = false;
     let mut cancelled = false;
+    let is_rename = matches!(op, PendingOp::Rename { .. });
     egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
@@ -1328,17 +1360,47 @@ fn draw_confirmation(ctx: &egui::Context, app: &mut AppState) {
         .show(ctx, |ui| {
             ui.add_space(4.0);
             ui.colored_label(color32(colors.row_fg_active), body);
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let yes = ui.add(egui::Button::new("Yes").min_size(egui::vec2(80.0, 0.0)));
-                let no = ui.add(egui::Button::new("No").min_size(egui::vec2(80.0, 0.0)));
-                if yes.clicked() {
+            if is_rename {
+                ui.add_space(8.0);
+                let mut name = app.rename_input.clone().unwrap_or_default();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut name)
+                        .desired_width(260.0)
+                        .hint_text("New name"),
+                );
+                if app.rename_focus {
+                    response.request_focus();
+                    app.rename_focus = false;
+                }
+                app.rename_input = Some(name);
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     confirmed = true;
                 }
-                if no.clicked() {
-                    cancelled = true;
-                }
-            });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let ok = ui.add(egui::Button::new("OK").min_size(egui::vec2(80.0, 0.0)));
+                    let cancel =
+                        ui.add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 0.0)));
+                    if ok.clicked() {
+                        confirmed = true;
+                    }
+                    if cancel.clicked() {
+                        cancelled = true;
+                    }
+                });
+            } else {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let yes = ui.add(egui::Button::new("Yes").min_size(egui::vec2(80.0, 0.0)));
+                    let no = ui.add(egui::Button::new("No").min_size(egui::vec2(80.0, 0.0)));
+                    if yes.clicked() {
+                        confirmed = true;
+                    }
+                    if no.clicked() {
+                        cancelled = true;
+                    }
+                });
+            }
         });
 
     if confirmed {
@@ -1407,6 +1469,15 @@ fn pending_op_text(op: &PendingOp) -> (&'static str, String) {
                 "Delete \"{}\"?",
                 target
                     .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>")
+            ),
+        ),
+        PendingOp::Rename { src } => (
+            "Rename",
+            format!(
+                "Rename \"{}\" to:",
+                src.file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("<unknown>")
             ),
@@ -2082,6 +2153,8 @@ impl ApplicationHandler for App {
             theme_picker_open: false,
             theme_picker_selected: None,
             pending_op: None,
+            rename_input: None,
+            rename_focus: false,
         };
 
         app.theme
@@ -2506,6 +2579,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         theme_picker_open: false,
         theme_picker_selected: None,
         pending_op: None,
+        rename_input: None,
+        rename_focus: false,
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));

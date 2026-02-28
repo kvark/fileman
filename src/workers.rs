@@ -97,6 +97,12 @@ pub fn start_io_worker() -> (
                         eprintln!("Delete error: {e}");
                     }
                 }
+                IOTask::Rename { src, new_name } => {
+                    let target = src.with_file_name(new_name);
+                    if let Err(e) = std::fs::rename(&src, &target) {
+                        eprintln!("Rename error: {e}");
+                    }
+                }
             }
             let _ = result_tx.send(IOResult::Completed);
         }
