@@ -296,6 +296,7 @@ fn parse_theme_bytes(name_hint: &str, bytes: &[u8]) -> Option<(String, ThemeColo
 
 fn load_themes_from_dir(dir: &std::path::Path) -> Vec<(String, ThemeColors)> {
     let mut out = Vec::new();
+    let mut candidates = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             let path = entry.path();
@@ -315,11 +316,15 @@ fn load_themes_from_dir(dir: &std::path::Path) -> Vec<(String, ThemeColors)> {
             if !matches!(ext.as_str(), "json" | "yaml" | "yml" | "toml") {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&path)
-                && let Some((name, colors)) = parse_theme_bytes(&name_hint, &bytes)
-            {
-                out.push((name, colors));
-            }
+            candidates.push((name_hint, path));
+        }
+    }
+    candidates.sort_by(|(a, _), (b, _)| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    for (name_hint, path) in candidates {
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Some((name, colors)) = parse_theme_bytes(&name_hint, &bytes)
+        {
+            out.push((name, colors));
         }
     }
     out

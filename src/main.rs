@@ -1147,6 +1147,7 @@ fn handle_keyboard(
         if app.preview.is_some() {
             app.update_preview_for_current_selection();
         }
+        ctx.request_repaint();
     }
     let ctrl_pgup = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
     if ctrl_pgup || input.key_pressed(egui::Key::Backspace) {
@@ -1438,7 +1439,8 @@ fn draw_progress_modal(ctx: &egui::Context, app: &AppState) {
             };
             ui.colored_label(color32(colors.row_fg_active), label);
             ui.add_space(8.0);
-            ui.add(egui::ProgressBar::new(0.0).animate(true));
+            ui.add(egui::ProgressBar::new(0.0).animate(false));
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
             ui.add_space(6.0);
             ui.colored_label(color32(colors.row_fg_inactive), "Esc: cancel");
         });
@@ -1524,6 +1526,8 @@ fn draw_preview(
                             ui.add(egui::Spinner::new());
                             ui.colored_label(text_color, "Highlighting…");
                         });
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(120));
                         ui.add_space(6.0);
                         if highlight_pending.insert(key.clone()) {
                             let _ = highlight_req_tx.send(HighlightRequest {
@@ -1534,7 +1538,6 @@ fn draw_preview(
                             });
                         }
                         ui.colored_label(text_color, text);
-                        ui.ctx().request_repaint();
                     }
                 }
                 Some(PreviewContent::Image(path)) => {
@@ -1592,6 +1595,8 @@ fn draw_preview(
                             let _ = image_req_tx.send(request);
                         }
                         ui.colored_label(text_color, format!("Loading image...\n{}", key));
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(120));
                     }
                 }
                 None => {
@@ -1964,6 +1969,7 @@ struct Runtime {
     highlight_res_rx: mpsc::Receiver<HighlightResult>,
     image_req_tx: mpsc::Sender<ImageRequest>,
     image_res_rx: mpsc::Receiver<ImageResult>,
+    needs_redraw: bool,
 }
 
 impl Runtime {
@@ -2202,6 +2208,7 @@ impl ApplicationHandler for App {
             highlight_res_rx,
             image_req_tx,
             image_res_rx,
+            needs_redraw: true,
         });
     }
 
@@ -2216,27 +2223,7 @@ impl ApplicationHandler for App {
             _ => return,
         };
 
-        if runtime
-            .egui_state
-            .on_window_event(&runtime.window, &event)
-            .consumed
-        {
-            return;
-        }
-
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(new_size) => {
-                runtime.size = new_size;
-                runtime.surface_config.size = Extent {
-                    width: runtime.size.width.max(1),
-                    height: runtime.size.height.max(1),
-                    depth: 1,
-                };
-                runtime
-                    .context
-                    .reconfigure_surface(&mut runtime.surface, runtime.surface_config);
-            }
             WindowEvent::RedrawRequested => {
                 let mut completed = 0usize;
                 while runtime.app.io_rx.try_recv().is_ok() {
@@ -2246,9 +2233,7 @@ impl ApplicationHandler for App {
                     runtime.app.on_io_completed(completed);
                     refresh_fs_panels(&mut runtime.app);
                 }
-                if pump_async(&mut runtime.app) {
-                    runtime.egui_ctx.request_repaint();
-                }
+                let _ = pump_async(&mut runtime.app);
                 let mut decoded_images = Vec::new();
                 while decoded_images.len() < MAX_IMAGE_UPLOADS_PER_FRAME {
                     match runtime.image_res_rx.try_recv() {
@@ -2438,14 +2423,47 @@ impl ApplicationHandler for App {
                 runtime.painter.after_submit(&sync);
                 runtime.context.destroy_texture_view(view);
             }
-            _ => {}
+            other => {
+                let event_response = runtime.egui_state.on_window_event(&runtime.window, &other);
+                if event_response.repaint {
+                    runtime.needs_redraw = true;
+                }
+                if event_response.consumed {
+                    return;
+                }
+
+                match other {
+                    WindowEvent::CloseRequested => event_loop.exit(),
+                    WindowEvent::Resized(new_size) => {
+                        runtime.size = new_size;
+                        runtime.surface_config.size = Extent {
+                            width: runtime.size.width.max(1),
+                            height: runtime.size.height.max(1),
+                            depth: 1,
+                        };
+                        runtime
+                            .context
+                            .reconfigure_surface(&mut runtime.surface, runtime.surface_config);
+                        runtime.needs_redraw = true;
+                    }
+                    _ => {
+                        runtime.needs_redraw = true;
+                    }
+                }
+            }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::Poll);
-        if let Some(runtime) = self.runtime.as_ref() {
-            runtime.window.request_redraw();
+        event_loop.set_control_flow(ControlFlow::Wait);
+        if let Some(runtime) = self.runtime.as_mut() {
+            if pump_async(&mut runtime.app) {
+                runtime.needs_redraw = true;
+            }
+            if runtime.needs_redraw {
+                runtime.window.request_redraw();
+                runtime.needs_redraw = false;
+            }
         }
     }
 
