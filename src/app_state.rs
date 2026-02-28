@@ -6,8 +6,9 @@ use std::{
 
 use crate::core::{
     ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, IOResult, IOTask, ImageLocation,
-    PanelMode, PreviewContent, PreviewRequest, container_display_path, container_kind_from_path,
-    format_preview_info, is_image_name, is_image_path, is_text_name, is_text_path,
+    PanelMode, PreviewContent, PreviewRequest, SearchCase, SearchMode, SearchResult,
+    container_display_path, container_kind_from_path, format_preview_info, is_image_name,
+    is_image_path, is_text_name, is_text_path,
 };
 use crate::theme::Theme;
 
@@ -22,6 +23,15 @@ pub struct PanelState {
     pub loading: bool,
     pub loading_progress: Option<(usize, Option<usize>)>,
     pub dir_token: u64,
+    pub history_back: Vec<PanelSnapshot>,
+    pub history_forward: Vec<PanelSnapshot>,
+}
+
+#[derive(Clone)]
+pub struct PanelSnapshot {
+    pub mode: PanelMode,
+    pub current_path: path::PathBuf,
+    pub selected_name: Option<String>,
 }
 
 pub struct AppState {
@@ -51,6 +61,17 @@ pub struct AppState {
     pub pending_op: Option<PendingOp>,
     pub rename_input: Option<String>,
     pub rename_focus: bool,
+    pub search_query: String,
+    pub search_focus: bool,
+    pub search_case: SearchCase,
+    pub search_mode: SearchMode,
+    pub search_results: Vec<SearchResult>,
+    pub search_selected: usize,
+    pub search_request_id: u64,
+    pub search_status: SearchStatus,
+    pub search_ui: SearchUiState,
+    pub search_tx: mpsc::Sender<crate::core::SearchRequest>,
+    pub search_rx: mpsc::Receiver<crate::core::SearchEvent>,
 }
 
 #[derive(Clone)]
@@ -76,6 +97,19 @@ pub enum PendingOp {
 pub enum CopyKind {
     File,
     Directory,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SearchUiState {
+    Closed,
+    Open,
+}
+
+#[derive(Clone, Copy)]
+pub enum SearchStatus {
+    Idle,
+    Running(crate::core::SearchProgress),
+    Done(crate::core::SearchProgress),
 }
 
 impl AppState {
@@ -147,6 +181,7 @@ impl AppState {
                     Some((archive_path.clone(), cwd.clone(), *kind)),
                     Some(selected_name),
                 ),
+                PanelMode::Search { .. } => (None, None, None),
             }
         };
         if let Some(selected_name) = selected_name_opt {
@@ -164,6 +199,66 @@ impl AppState {
         if let Some(idx) = panel.entries.iter().position(|e| e.name == name) {
             panel.selected_index = idx;
         }
+    }
+
+    pub fn push_history(&mut self, which: ActivePanel) {
+        let snapshot = {
+            let panel = self.panel(which.clone());
+            let selected = panel
+                .entries
+                .get(panel.selected_index)
+                .map(|e| e.name.clone());
+            PanelSnapshot {
+                mode: panel.mode.clone(),
+                current_path: panel.current_path.clone(),
+                selected_name: selected,
+            }
+        };
+        let panel = self.panel_mut(which);
+        panel.history_back.push(snapshot);
+        panel.history_forward.clear();
+    }
+
+    pub fn pop_history_back(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
+        let current = {
+            let panel = self.panel(which.clone());
+            let selected = panel
+                .entries
+                .get(panel.selected_index)
+                .map(|e| e.name.clone());
+            PanelSnapshot {
+                mode: panel.mode.clone(),
+                current_path: panel.current_path.clone(),
+                selected_name: selected,
+            }
+        };
+        let panel = self.panel_mut(which);
+        let prev = panel.history_back.pop();
+        if prev.is_some() {
+            panel.history_forward.push(current);
+        }
+        prev
+    }
+
+    pub fn pop_history_forward(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
+        let current = {
+            let panel = self.panel(which.clone());
+            let selected = panel
+                .entries
+                .get(panel.selected_index)
+                .map(|e| e.name.clone());
+            PanelSnapshot {
+                mode: panel.mode.clone(),
+                current_path: panel.current_path.clone(),
+                selected_name: selected,
+            }
+        };
+        let panel = self.panel_mut(which);
+        let next = panel.history_forward.pop();
+        if next.is_some() {
+            panel.history_back.push(current);
+        }
+        next
     }
 
     pub fn prepare_rename_selected(&mut self) {
@@ -475,6 +570,9 @@ impl AppState {
                 PanelMode::Container { .. } => {
                     return None;
                 }
+                PanelMode::Search { .. } => {
+                    return None;
+                }
             }
         };
 
@@ -503,6 +601,9 @@ impl AppState {
             match &other_panel.mode {
                 PanelMode::Fs => other_panel.current_path.clone(),
                 PanelMode::Container { .. } => {
+                    return None;
+                }
+                PanelMode::Search { .. } => {
                     return None;
                 }
             }
