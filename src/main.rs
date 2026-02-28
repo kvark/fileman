@@ -31,14 +31,17 @@ use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
 use zune_image::codecs::ImageFormat;
 use zune_image::image::Image as ZuneImage;
 
-use fileman::app_state::{AppState, PanelState, PendingOp};
+use fileman::app_state::{AppState, PanelState, PendingOp, SearchStatus, SearchUiState};
 use fileman::core::{
     ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, ImageLocation, PanelMode,
-    PreviewContent, PreviewRequest, container_display_path, container_kind_from_path, format_size,
-    is_media_name, is_text_name, read_container_directory_with_progress, read_fs_directory,
+    PreviewContent, PreviewRequest, SearchCase, SearchEvent, SearchMode, SearchProgress,
+    SearchRequest, container_display_path, container_kind_from_path, format_size, is_media_name,
+    is_text_name, read_container_directory_with_progress, read_fs_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
-use fileman::workers::{start_dir_size_worker, start_io_worker, start_preview_worker};
+use fileman::workers::{
+    start_dir_size_worker, start_io_worker, start_preview_worker, start_search_worker,
+};
 
 const ROW_HEIGHT: f32 = 24.0;
 const SIZE_COL_WIDTH: f32 = 84.0;
@@ -396,6 +399,25 @@ fn panel_path_display(panel: &PanelState) -> String {
             archive_path,
             cwd,
         } => container_display_path(*kind, archive_path, cwd),
+        PanelMode::Search {
+            root,
+            query,
+            mode,
+            case,
+        } => {
+            let mode_label = match mode {
+                SearchMode::Name => "name",
+                SearchMode::Content => "content",
+            };
+            let case_label = match case {
+                SearchCase::Sensitive => "Aa",
+                SearchCase::Insensitive => "aA",
+            };
+            format!(
+                "Search ({mode_label}/{case_label}): \"{query}\" in {}",
+                root.to_string_lossy()
+            )
+        }
     }
 }
 
@@ -499,6 +521,92 @@ fn pump_async(app: &mut AppState) -> bool {
             }
         }
         changed = true;
+    }
+
+    while let Ok(event) = app.search_rx.try_recv() {
+        match event {
+            SearchEvent::Match { id, result } => {
+                if id == app.search_request_id {
+                    app.search_results.push(result);
+                    let result = app.search_results.last().unwrap().clone();
+                    let progress_for_panel = match app.search_status {
+                        SearchStatus::Running(mut progress) => {
+                            progress.matched = progress.matched.saturating_add(1);
+                            app.search_status = SearchStatus::Running(progress);
+                            Some((progress.matched, None))
+                        }
+                        SearchStatus::Done(mut progress) => {
+                            progress.matched = progress.matched.saturating_add(1);
+                            app.search_status = SearchStatus::Done(progress);
+                            Some((progress.matched, None))
+                        }
+                        SearchStatus::Idle => None,
+                    };
+                    let panel = app.get_active_panel_mut();
+                    let display_name = match &panel.mode {
+                        PanelMode::Search { root, .. } => result
+                            .path
+                            .strip_prefix(root)
+                            .ok()
+                            .and_then(|p| p.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                result
+                                    .path
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("<unknown>")
+                                    .to_string()
+                            }),
+                        _ => result
+                            .path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("<unknown>")
+                            .to_string(),
+                    };
+                    panel.entries.push(DirEntry {
+                        name: display_name,
+                        is_dir: result.is_dir,
+                        location: EntryLocation::Fs(result.path),
+                        size: result.size,
+                    });
+                    if let Some(progress) = progress_for_panel {
+                        panel.loading_progress = Some(progress);
+                    }
+                    changed = true;
+                }
+            }
+            SearchEvent::Progress { id, progress } => {
+                if id == app.search_request_id {
+                    app.search_status = SearchStatus::Running(progress);
+                    let panel = app.get_active_panel_mut();
+                    panel.loading_progress = Some((progress.matched, Some(progress.scanned)));
+                    changed = true;
+                }
+            }
+            SearchEvent::Done { id, progress } => {
+                if id == app.search_request_id {
+                    app.search_status = SearchStatus::Done(progress);
+                    let panel = app.get_active_panel_mut();
+                    panel.loading = false;
+                    panel.loading_progress = Some((progress.matched, Some(progress.scanned)));
+                    changed = true;
+                }
+            }
+            SearchEvent::Error { id, message } => {
+                if id == app.search_request_id {
+                    eprintln!("Search error: {message}");
+                    app.search_status = SearchStatus::Done(SearchProgress {
+                        scanned: 0,
+                        matched: 0,
+                    });
+                    let panel = app.get_active_panel_mut();
+                    panel.loading = false;
+                    changed = true;
+                }
+            }
+        }
     }
 
     changed
@@ -1019,6 +1127,7 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
     };
 
     app.store_selection_memory_for(source);
+    app.push_history(target.clone());
 
     match &selected_entry.location {
         EntryLocation::Fs(path) => {
@@ -1118,6 +1227,132 @@ fn active_window_rows(app: &AppState, cache: &UiCache) -> usize {
     }
 }
 
+fn open_search(app: &mut AppState, mode: SearchMode) {
+    app.search_ui = SearchUiState::Open;
+    app.search_focus = true;
+    app.search_mode = mode;
+}
+
+fn apply_panel_snapshot(
+    app: &mut AppState,
+    which: ActivePanel,
+    snapshot: fileman::app_state::PanelSnapshot,
+) {
+    match snapshot.mode {
+        PanelMode::Fs => {
+            load_fs_directory_async(app, snapshot.current_path, which, snapshot.selected_name);
+        }
+        PanelMode::Container {
+            kind,
+            archive_path,
+            cwd,
+        } => {
+            load_container_directory_async(
+                app,
+                kind,
+                archive_path,
+                cwd,
+                which,
+                snapshot.selected_name,
+            );
+        }
+        PanelMode::Search { .. } => {
+            let results = app.search_results.clone();
+            let panel = app.panel_mut(which);
+            panel.mode = snapshot.mode;
+            panel.current_path = snapshot.current_path;
+            panel.entries.clear();
+            panel.entries.extend(results.iter().map(|result| {
+                let display_name = match &panel.mode {
+                    PanelMode::Search { root, .. } => result
+                        .path
+                        .strip_prefix(root)
+                        .ok()
+                        .and_then(|p| p.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            result
+                                .path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("<unknown>")
+                                .to_string()
+                        }),
+                    _ => result
+                        .path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("<unknown>")
+                        .to_string(),
+                };
+                DirEntry {
+                    name: display_name,
+                    is_dir: result.is_dir,
+                    location: EntryLocation::Fs(result.path.clone()),
+                    size: result.size,
+                }
+            }));
+            panel.entries_rx = None;
+            panel.selected_index = snapshot
+                .selected_name
+                .and_then(|name| panel.entries.iter().position(|e| e.name == name))
+                .unwrap_or(0);
+            panel.top_index = 0;
+            panel.loading = false;
+            panel.loading_progress = None;
+            panel.dir_token = panel.dir_token.wrapping_add(1);
+        }
+    }
+}
+
+fn cancel_search(app: &mut AppState) {
+    app.search_request_id = app.search_request_id.wrapping_add(1);
+    app.search_status = SearchStatus::Idle;
+}
+
+fn start_search(app: &mut AppState) {
+    let needle = app.search_query.trim().to_string();
+    if needle.is_empty() {
+        return;
+    }
+    let search_mode = app.search_mode;
+    let search_case = app.search_case;
+    let id = app.search_request_id.wrapping_add(1);
+    app.search_request_id = id;
+    app.search_results.clear();
+    app.search_selected = 0;
+    app.search_status = SearchStatus::Running(SearchProgress {
+        scanned: 0,
+        matched: 0,
+    });
+    let root = app.get_active_panel().current_path.clone();
+    {
+        app.push_history(app.active_panel.clone());
+        let panel = app.get_active_panel_mut();
+        panel.current_path = root.clone();
+        panel.mode = PanelMode::Search {
+            root: root.clone(),
+            query: needle.clone(),
+            mode: search_mode,
+            case: search_case,
+        };
+        panel.entries.clear();
+        panel.entries_rx = None;
+        panel.selected_index = 0;
+        panel.top_index = 0;
+        panel.loading = true;
+        panel.loading_progress = Some((0, None));
+        panel.dir_token = panel.dir_token.wrapping_add(1);
+    }
+    let _ = app.search_tx.send(SearchRequest {
+        id,
+        root,
+        needle,
+        case: search_case,
+        mode: search_mode,
+    });
+}
+
 fn handle_keyboard(
     ctx: &egui::Context,
     input: &egui::InputState,
@@ -1138,6 +1373,19 @@ fn handle_keyboard(
         }
         ctx.request_repaint();
         return;
+    }
+    if app.search_ui == SearchUiState::Open {
+        if input.key_pressed(egui::Key::Escape) {
+            cancel_search(app);
+            app.search_ui = SearchUiState::Closed;
+            ctx.request_repaint();
+            return;
+        }
+        let ctrl_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
+        if ctrl_enter {
+            start_search(app);
+            ctx.request_repaint();
+        }
     }
     let window_rows = active_window_rows(app, cache);
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
@@ -1189,8 +1437,62 @@ fn handle_keyboard(
     if ctrl_right && app.active_panel == ActivePanel::Left {
         open_selected_from_to(app, ActivePanel::Left, ActivePanel::Right);
     }
+    let alt_left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft));
+    if alt_left {
+        if let Some(snapshot) = app.pop_history_back(app.active_panel.clone()) {
+            apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
+        }
+    }
+    let alt_right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight));
+    if alt_right {
+        if let Some(snapshot) = app.pop_history_forward(app.active_panel.clone()) {
+            apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
+        }
+    }
+    let alt_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F7));
+    if alt_f7 {
+        open_search(app, SearchMode::Name);
+    }
+    let shift_alt_f7 = ctx
+        .input_mut(|i| i.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::F7));
+    if shift_alt_f7 {
+        open_search(app, SearchMode::Content);
+    }
     if input.key_pressed(egui::Key::Enter) {
-        if app.theme_picker_open {
+        if app.search_ui == SearchUiState::Open {
+            if matches!(app.get_active_panel().mode, PanelMode::Search { .. }) {
+                // Open selected result.
+            } else {
+                start_search(app);
+            }
+        }
+        if matches!(app.get_active_panel().mode, PanelMode::Search { .. }) {
+            app.push_history(app.active_panel.clone());
+            let entry = app
+                .get_active_panel()
+                .entries
+                .get(app.get_active_panel().selected_index)
+                .cloned();
+            if let Some(entry) = entry {
+                if let EntryLocation::Fs(path) = entry.location {
+                    if entry.is_dir {
+                        load_fs_directory_async(app, path, app.active_panel.clone(), None);
+                    } else if let Some(parent) = path.parent() {
+                        let name = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string());
+                        load_fs_directory_async(
+                            app,
+                            parent.to_path_buf(),
+                            app.active_panel.clone(),
+                            name,
+                        );
+                    }
+                }
+            }
+            app.search_ui = SearchUiState::Closed;
+        } else if app.theme_picker_open {
             app.apply_selected_theme();
         } else {
             open_selected(app);
@@ -1681,19 +1983,34 @@ fn draw_panel(
     let colors = app.theme.colors();
     let is_active = app.active_panel == panel_side;
 
-    let panel = app.panel(panel_side.clone());
-    let entries_len = panel.entries.len();
-    let selected_index = panel.selected_index;
-    let header_text = format!(
-        "{}    {}/{}",
-        panel_path_display(panel),
-        if entries_len == 0 {
-            0
-        } else {
-            selected_index + 1
-        },
-        entries_len
-    );
+    let (entries_len, selected_index, header_text, selected_label, loading, loading_progress) = {
+        let panel = app.panel(panel_side.clone());
+        let entries_len = panel.entries.len();
+        let selected_index = panel.selected_index;
+        let header_text = format!(
+            "{}    {}/{}",
+            panel_path_display(panel),
+            if entries_len == 0 {
+                0
+            } else {
+                selected_index + 1
+            },
+            entries_len
+        );
+        let selected_label = panel
+            .entries
+            .get(selected_index)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "-".to_string());
+        (
+            entries_len,
+            selected_index,
+            header_text,
+            selected_label,
+            panel.loading,
+            panel.loading_progress,
+        )
+    };
 
     let mut rows = 10usize;
     let mut clicked_index: Option<usize> = None;
@@ -1737,16 +2054,23 @@ fn draw_panel(
                     },
                 );
 
-                if panel.loading {
-                    let progress = panel.loading_progress.unwrap_or((0, None));
+                if loading {
+                    let progress = loading_progress.unwrap_or((0, None));
                     let ratio = match progress.1 {
                         Some(total) if total > 0 => progress.0 as f32 / total as f32,
                         _ => 0.0,
                     };
                     ui.add_space(4.0);
+                    let loading_label =
+                        matches!(app.panel(panel_side.clone()).mode, PanelMode::Search { .. });
+                    let prefix = if loading_label {
+                        "Searching…"
+                    } else {
+                        "Loading…"
+                    };
                     let label = match progress.1 {
-                        Some(total) => format!("Loading… {}/{}", progress.0, total),
-                        None => format!("Loading… {}", progress.0),
+                        Some(total) => format!("{prefix} {}/{}", progress.0, total),
+                        None => format!("{prefix} {}", progress.0),
                     };
                     let mut bar = egui::ProgressBar::new(ratio).text(label);
                     if progress.1.is_some() {
@@ -1795,7 +2119,7 @@ fn draw_panel(
                         scroll.show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
                             visible_range = row_range.clone();
                             for idx in row_range {
-                                let entry = &panel.entries[idx];
+                                let entry = &app.panel(panel_side_for_closure.clone()).entries[idx];
                                 let is_selected = selected_index == idx;
                                 let stripe = idx % 2 == 0;
                                 let bg = if is_selected {
@@ -1906,13 +2230,6 @@ fn draw_panel(
                     new_top_index = Some(0);
                 }
 
-                let selected_label = panel
-                    .entries
-                    .get(selected_index)
-                    .map(|e| e.name.as_str())
-                    .unwrap_or("-");
-                let footer_text = format!("items: {entries_len} | selected: {selected_label}");
-
                 ui.allocate_ui_with_layout(
                     egui::Vec2::new(ui.available_width(), footer_height),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -1921,7 +2238,22 @@ fn draw_panel(
                             .fill(color32(colors.footer_bg))
                             .corner_radius(egui::CornerRadius::same(4))
                             .show(ui, |ui| {
-                                ui.colored_label(color32(colors.footer_fg), footer_text);
+                                if is_active && app.search_ui == SearchUiState::Open {
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(color32(colors.footer_fg), "Search:");
+                                        let response =
+                                            ui.text_edit_singleline(&mut app.search_query);
+                                        if app.search_focus {
+                                            response.request_focus();
+                                            app.search_focus = false;
+                                        }
+                                    });
+                                } else {
+                                    let footer_text = format!(
+                                        "items: {entries_len} | selected: {selected_label}"
+                                    );
+                                    ui.colored_label(color32(colors.footer_fg), footer_text);
+                                }
                             });
                     },
                 );
@@ -2069,6 +2401,7 @@ impl ApplicationHandler for App {
         let (io_tx, io_rx, io_cancel_tx) = start_io_worker();
         let (preview_tx, preview_rx) = start_preview_worker();
         let (dir_size_tx, dir_size_rx) = start_dir_size_worker();
+        let (search_tx, search_rx) = start_search_worker();
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
         let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResult>();
         let (highlight_req_tx, highlight_req_rx) = mpsc::channel::<HighlightRequest>();
@@ -2124,6 +2457,8 @@ impl ApplicationHandler for App {
                 loading: false,
                 loading_progress: None,
                 dir_token: 0,
+                history_back: Vec::new(),
+                history_forward: Vec::new(),
             },
             right_panel: PanelState {
                 current_path: cur_dir.clone(),
@@ -2136,6 +2471,8 @@ impl ApplicationHandler for App {
                 loading: false,
                 loading_progress: None,
                 dir_token: 0,
+                history_back: Vec::new(),
+                history_forward: Vec::new(),
             },
             active_panel: ActivePanel::Left,
             preview: None,
@@ -2161,6 +2498,17 @@ impl ApplicationHandler for App {
             pending_op: None,
             rename_input: None,
             rename_focus: false,
+            search_query: String::new(),
+            search_focus: false,
+            search_case: SearchCase::Insensitive,
+            search_mode: SearchMode::Name,
+            search_results: Vec::new(),
+            search_selected: 0,
+            search_request_id: 0,
+            search_status: SearchStatus::Idle,
+            search_ui: SearchUiState::Closed,
+            search_tx,
+            search_rx,
         };
 
         app.theme
@@ -2540,6 +2888,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     let (io_cancel_tx, _io_cancel_rx) = mpsc::channel::<()>();
     let (dir_size_tx, _dir_size_req_rx) = mpsc::channel::<PathBuf>();
     let (_dir_size_res_tx, dir_size_rx) = mpsc::channel::<(PathBuf, u64)>();
+    let (search_tx, _search_req_rx) = mpsc::channel::<SearchRequest>();
+    let (_search_res_tx, search_rx) = mpsc::channel::<SearchEvent>();
     let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
     let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
     let mut image_cache = ImageCache {
@@ -2562,6 +2912,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             loading: false,
             loading_progress: None,
             dir_token: 0,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
         },
         right_panel: PanelState {
             current_path: cur_dir.clone(),
@@ -2574,6 +2926,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             loading: false,
             loading_progress: None,
             dir_token: 0,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
         },
         active_panel: ActivePanel::Left,
         preview: None,
@@ -2599,6 +2953,17 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         pending_op: None,
         rename_input: None,
         rename_focus: false,
+        search_query: String::new(),
+        search_focus: false,
+        search_case: SearchCase::Insensitive,
+        search_mode: SearchMode::Name,
+        search_results: Vec::new(),
+        search_selected: 0,
+        search_request_id: 0,
+        search_status: SearchStatus::Idle,
+        search_ui: SearchUiState::Closed,
+        search_tx,
+        search_rx,
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));

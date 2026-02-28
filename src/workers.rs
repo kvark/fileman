@@ -1,7 +1,8 @@
-use std::{path::PathBuf, sync::mpsc, thread};
+use std::{fs::File, io::Read, path::PathBuf, sync::mpsc, thread};
 
 use crate::core::{
-    EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, copy_container_dir,
+    EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
+    SearchMode, SearchProgress, SearchRequest, SearchResult, copy_container_dir,
     copy_container_entry, copy_recursively, format_container_listing, hexdump, is_probably_text,
     is_text_name, read_bytes_prefix, read_container_bytes_prefix, read_container_directory,
 };
@@ -199,6 +200,211 @@ pub fn start_dir_size_worker() -> (mpsc::Sender<PathBuf>, mpsc::Receiver<(PathBu
         }
     });
     (tx, result_rx)
+}
+
+pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<SearchEvent>) {
+    let (tx, rx) = mpsc::channel::<SearchRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<SearchEvent>();
+    thread::spawn(move || {
+        let mut pending: Option<SearchRequest> = None;
+        'worker: loop {
+            let request = match pending.take() {
+                Some(request) => request,
+                None => match rx.recv() {
+                    Ok(request) => request,
+                    Err(_) => break,
+                },
+            };
+            let mut progress = SearchProgress {
+                scanned: 0,
+                matched: 0,
+            };
+            let mut stack = vec![request.root.clone()];
+            let mut needle = request.needle.clone();
+            if request.case == SearchCase::Insensitive {
+                needle = needle.to_ascii_lowercase();
+            }
+            let use_wildcard = needle.contains('*') || needle.contains('?');
+            let mut tick = 0usize;
+
+            loop {
+                if let Ok(new_request) = rx.try_recv() {
+                    pending = Some(new_request);
+                    continue 'worker;
+                }
+                let dir = match stack.pop() {
+                    Some(dir) => dir,
+                    None => {
+                        let _ = result_tx.send(SearchEvent::Done {
+                            id: request.id,
+                            progress,
+                        });
+                        continue 'worker;
+                    }
+                };
+                let read_dir = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd,
+                    Err(_) => continue,
+                };
+                for entry in read_dir.flatten() {
+                    tick = tick.wrapping_add(1);
+                    if tick % 256 == 0 {
+                        if let Ok(new_request) = rx.try_recv() {
+                            pending = Some(new_request);
+                            continue 'worker;
+                        }
+                        let _ = result_tx.send(SearchEvent::Progress {
+                            id: request.id,
+                            progress,
+                        });
+                    }
+                    progress.scanned = progress.scanned.saturating_add(1);
+                    let path = entry.path();
+                    let file_type = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(_) => continue,
+                    };
+                    match request.mode {
+                        SearchMode::Name => {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let haystack = if request.case == SearchCase::Insensitive {
+                                name.to_ascii_lowercase()
+                            } else {
+                                name.clone()
+                            };
+                            let matched = if use_wildcard {
+                                wildcard_match(&haystack, &needle)
+                            } else {
+                                haystack.contains(&needle)
+                            };
+                            if matched {
+                                let size = if file_type.is_file() {
+                                    entry.metadata().ok().map(|m| m.len())
+                                } else {
+                                    None
+                                };
+                                let _ = result_tx.send(SearchEvent::Match {
+                                    id: request.id,
+                                    result: SearchResult {
+                                        path: path.clone(),
+                                        is_dir: file_type.is_dir(),
+                                        size,
+                                    },
+                                });
+                                progress.matched = progress.matched.saturating_add(1);
+                            }
+                            if file_type.is_dir() {
+                                stack.push(path);
+                            }
+                        }
+                        SearchMode::Content => {
+                            if file_type.is_dir() {
+                                stack.push(path);
+                                continue;
+                            }
+                            if !file_type.is_file() {
+                                continue;
+                            }
+                            if file_contains(&path, &needle, request.case).unwrap_or(false) {
+                                let size = entry.metadata().ok().map(|m| m.len());
+                                let _ = result_tx.send(SearchEvent::Match {
+                                    id: request.id,
+                                    result: SearchResult {
+                                        path: path.clone(),
+                                        is_dir: false,
+                                        size,
+                                    },
+                                });
+                                progress.matched = progress.matched.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (tx, result_rx)
+}
+
+fn file_contains(path: &PathBuf, needle: &str, case: SearchCase) -> std::io::Result<bool> {
+    if needle.is_empty() {
+        return Ok(false);
+    }
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut carry: Vec<u8> = Vec::new();
+    let needle_bytes = needle.as_bytes();
+    let needle_lower = if case == SearchCase::Insensitive {
+        Some(needle.to_ascii_lowercase().into_bytes())
+    } else {
+        None
+    };
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        let mut window = Vec::with_capacity(carry.len() + read);
+        if !carry.is_empty() {
+            window.extend_from_slice(&carry);
+        }
+        window.extend_from_slice(&buf[..read]);
+
+        let found = if let Some(needle_lower) = needle_lower.as_ref() {
+            let mut lowered = window.clone();
+            for byte in &mut lowered {
+                *byte = byte.to_ascii_lowercase();
+            }
+            memchr::memmem::find(&lowered, needle_lower).is_some()
+        } else {
+            memchr::memmem::find(&window, needle_bytes).is_some()
+        };
+        if found {
+            return Ok(true);
+        }
+
+        let keep = needle_bytes.len().saturating_sub(1);
+        if keep > 0 {
+            if window.len() >= keep {
+                carry = window[window.len() - keep..].to_vec();
+            } else {
+                carry = window;
+            }
+        } else {
+            carry.clear();
+        }
+    }
+    Ok(false)
+}
+
+fn wildcard_match(text: &str, pattern: &str) -> bool {
+    let mut t = 0usize;
+    let mut p = 0usize;
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0usize;
+    let text_bytes = text.as_bytes();
+    let pat_bytes = pattern.as_bytes();
+
+    while t < text_bytes.len() {
+        if p < pat_bytes.len() && (pat_bytes[p] == b'?' || pat_bytes[p] == text_bytes[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat_bytes.len() && pat_bytes[p] == b'*' {
+            star_idx = Some(p);
+            match_idx = t;
+            p += 1;
+        } else if let Some(star) = star_idx {
+            p = star + 1;
+            match_idx += 1;
+            t = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while p < pat_bytes.len() && pat_bytes[p] == b'*' {
+        p += 1;
+    }
+    p == pat_bytes.len()
 }
 
 fn compute_dir_size(root: &PathBuf) -> u64 {

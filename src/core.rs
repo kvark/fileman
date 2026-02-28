@@ -138,12 +138,19 @@ pub enum ActivePanel {
     Right,
 }
 
+#[derive(Clone)]
 pub enum PanelMode {
     Fs,
     Container {
         kind: ContainerKind,
         archive_path: path::PathBuf,
         cwd: String,
+    },
+    Search {
+        root: path::PathBuf,
+        query: String,
+        mode: SearchMode,
+        case: SearchCase,
     },
 }
 
@@ -210,6 +217,46 @@ pub enum IOTask {
 
 pub enum IOResult {
     Completed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Name,
+    Content,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SearchCase {
+    Sensitive,
+    Insensitive,
+}
+
+pub struct SearchRequest {
+    pub id: u64,
+    pub root: path::PathBuf,
+    pub needle: String,
+    pub case: SearchCase,
+    pub mode: SearchMode,
+}
+
+#[derive(Clone)]
+pub struct SearchResult {
+    pub path: path::PathBuf,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SearchProgress {
+    pub scanned: usize,
+    pub matched: usize,
+}
+
+pub enum SearchEvent {
+    Match { id: u64, result: SearchResult },
+    Progress { id: u64, progress: SearchProgress },
+    Done { id: u64, progress: SearchProgress },
+    Error { id: u64, message: String },
 }
 
 pub fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {
