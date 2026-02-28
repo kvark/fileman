@@ -46,3 +46,9 @@ jobs:
         run: |
           test -f etc/snapshots/linux.png
           cargo run --bin snapshot_compare -- /tmp/screen.png etc/snapshots/linux.png --max-channel-diff 200 --max-pixel-fraction 0.003
+      - name: Upload snapshot artifact on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-failure
+          path: /tmp/screen.png
