@@ -101,13 +101,13 @@ pub enum EntryLocation {
 
 impl EntryLocation {
     pub fn display_name(&self) -> String {
-        match self {
-            EntryLocation::Fs(path) => path
+        match *self {
+            EntryLocation::Fs(ref path) => path
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("<unknown>")
                 .to_string(),
-            EntryLocation::Container { inner_path, .. } => inner_path
+            EntryLocation::Container { ref inner_path, .. } => inner_path
                 .rsplit('/')
                 .next()
                 .unwrap_or("<unknown>")
@@ -353,13 +353,10 @@ fn copy_zip_entry(
 ) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
     let reader = std::io::BufReader::new(file);
-    let mut zip =
-        zip::ZipArchive::new(reader).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut zip = zip::ZipArchive::new(reader).map_err(io::Error::other)?;
     let normalized = inner_path.trim_start_matches('/');
     for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut entry = zip.by_index(i).map_err(io::Error::other)?;
         if entry.name() == normalized {
             let target = dst_dir.join(display_name);
             if entry.is_dir() {
@@ -383,8 +380,7 @@ fn copy_zip_entry(
 fn copy_zip_dir(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
     let reader = std::io::BufReader::new(file);
-    let mut zip =
-        zip::ZipArchive::new(reader).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut zip = zip::ZipArchive::new(reader).map_err(io::Error::other)?;
     let normalized = inner_path.trim_matches('/');
     let prefix = if normalized.is_empty() {
         "".to_string()
@@ -392,9 +388,7 @@ fn copy_zip_dir(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::R
         format!("{}/", normalized)
     };
     for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut entry = zip.by_index(i).map_err(io::Error::other)?;
         let name = entry.name().to_string();
         if !name.starts_with(&prefix) {
             continue;
@@ -678,14 +672,14 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
 }
 
 pub fn format_preview_info(kind: &str, location: &EntryLocation) -> String {
-    match location {
-        EntryLocation::Fs(path) => format!("{kind}\n{}", path.to_string_lossy()),
+    match *location {
+        EntryLocation::Fs(ref path) => format!("{kind}\n{}", path.to_string_lossy()),
         EntryLocation::Container {
             kind: container_kind,
-            archive_path,
-            inner_path,
+            ref archive_path,
+            ref inner_path,
         } => {
-            let display = container_display_path(*container_kind, archive_path, inner_path);
+            let display = container_display_path(container_kind, archive_path, inner_path);
             format!("{kind}\n{display}")
         }
     }
@@ -803,8 +797,8 @@ pub fn format_container_listing(
             .ok()
             .flatten()
             .map(|(size, mode)| (format_size(size), mode));
-        let mode_str = size.as_ref().and_then(|(_, mode)| mode.map(format_mode));
-        let size_str = size.as_ref().map(|(size, _)| size.as_str());
+        let mode_str = size.as_ref().and_then(|pair| pair.1.map(format_mode));
+        let size_str = size.as_ref().map(|pair| pair.0.as_str());
 
         let mut line = String::new();
         if let Some(mode) = mode_str {
@@ -836,8 +830,8 @@ fn entry_display_name(entry: &DirEntry) -> String {
 }
 
 fn entry_name_for_metadata(entry: &DirEntry) -> &str {
-    match &entry.location {
-        EntryLocation::Container { inner_path, .. } => inner_path,
+    match entry.location {
+        EntryLocation::Container { ref inner_path, .. } => inner_path,
         _ => &entry.name,
     }
 }
@@ -1104,7 +1098,7 @@ fn read_tar_bz2_directory_with_progress(
         let name = normalize_archive_path(&path);
         if name.is_empty() || !name.starts_with(&prefix) {
             seen += 1;
-            if seen % PROGRESS_INTERVAL == 0 {
+            if seen.is_multiple_of(PROGRESS_INTERVAL) {
                 progress(seen);
             }
             continue;
@@ -1112,7 +1106,7 @@ fn read_tar_bz2_directory_with_progress(
         let rem = &name[prefix.len()..];
         if rem.is_empty() {
             seen += 1;
-            if seen % PROGRESS_INTERVAL == 0 {
+            if seen.is_multiple_of(PROGRESS_INTERVAL) {
                 progress(seen);
             }
             continue;
@@ -1124,7 +1118,7 @@ fn read_tar_bz2_directory_with_progress(
             files.push(rem.to_string());
         }
         seen += 1;
-        if seen % PROGRESS_INTERVAL == 0 {
+        if seen.is_multiple_of(PROGRESS_INTERVAL) {
             progress(seen);
         }
     }
@@ -1379,7 +1373,7 @@ impl ContainerPlugin for TarGzPlugin {
             let name = normalize_archive_path(&path);
             if name == normalized {
                 let size = entry.size();
-                let mode = entry.header().mode().ok().map(|v| v as u32);
+                let mode = entry.header().mode().ok();
                 return Ok(Some((size, mode)));
             }
         }
@@ -1434,7 +1428,7 @@ impl ContainerPlugin for TarBz2Plugin {
             let name = normalize_archive_path(&path);
             if name == normalized {
                 let size = entry.size();
-                let mode = entry.header().mode().ok().map(|v| v as u32);
+                let mode = entry.header().mode().ok();
                 return Ok(Some((size, mode)));
             }
         }
