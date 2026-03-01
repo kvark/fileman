@@ -319,7 +319,7 @@ fn load_themes_from_dir(dir: &std::path::Path) -> Vec<(String, ThemeColors)> {
             candidates.push((name_hint, path));
         }
     }
-    candidates.sort_by(|(a, _), (b, _)| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    candidates.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
     for (name_hint, path) in candidates {
         if let Ok(bytes) = std::fs::read(&path)
             && let Some((name, colors)) = parse_theme_bytes(&name_hint, &bytes)

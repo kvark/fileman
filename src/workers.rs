@@ -1,4 +1,10 @@
-use std::{fs::File, io::Read, path::PathBuf, sync::mpsc, thread};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+};
 
 use crate::core::{
     EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
@@ -253,7 +259,7 @@ pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<Sea
                 };
                 for entry in read_dir.flatten() {
                     tick = tick.wrapping_add(1);
-                    if tick % 256 == 0 {
+                    if tick.is_multiple_of(256) {
                         if let Ok(new_request) = rx.try_recv() {
                             pending = Some(new_request);
                             continue 'worker;
@@ -412,9 +418,9 @@ fn wildcard_match(text: &str, pattern: &str) -> bool {
     p == pat_bytes.len()
 }
 
-fn compute_dir_size(root: &PathBuf) -> u64 {
+fn compute_dir_size(root: &Path) -> u64 {
     let mut total = 0u64;
-    let mut stack = vec![root.clone()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let read_dir = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
@@ -431,10 +437,10 @@ fn compute_dir_size(root: &PathBuf) -> u64 {
             }
             if file_type.is_dir() {
                 stack.push(path);
-            } else if file_type.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    total = total.saturating_add(meta.len());
-                }
+            } else if file_type.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
+                total = total.saturating_add(meta.len());
             }
         }
     }

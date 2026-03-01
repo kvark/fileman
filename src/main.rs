@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     hash::{Hash, Hasher},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
 };
@@ -75,19 +75,11 @@ enum ScrollMode {
 
 impl UiCache {
     fn update_scroll_mode(&mut self, app: &AppState) {
-        let left_selected = AppState::browser(&app.left_panel)
-            .map(|b| b.selected_index)
-            .unwrap_or(0);
-        let right_selected = AppState::browser(&app.right_panel)
-            .map(|b| b.selected_index)
-            .unwrap_or(0);
+        let left_selected = app.left_panel.browser.selected_index;
+        let right_selected = app.right_panel.browser.selected_index;
         let active = app.active_panel.clone();
-        let left_dir = AppState::browser(&app.left_panel)
-            .map(|b| b.dir_token)
-            .unwrap_or(0);
-        let right_dir = AppState::browser(&app.right_panel)
-            .map(|b| b.dir_token)
-            .unwrap_or(0);
+        let left_dir = app.left_panel.browser.dir_token;
+        let right_dir = app.right_panel.browser.dir_token;
         let selection_changed = left_selected != self.last_left_selected
             || right_selected != self.last_right_selected
             || active != self.last_active_panel
@@ -188,10 +180,10 @@ fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<egui::ColorImage> {
 fn exif_orientation(image: &ZuneImage) -> Option<u16> {
     let exif = image.metadata().exif()?;
     for field in exif {
-        if field.tag == Tag::Orientation {
-            if let Value::Short(values) = &field.value {
-                return values.first().copied();
-            }
+        if field.tag == Tag::Orientation
+            && let Value::Short(values) = &field.value
+        {
+            return values.first().copied();
         }
     }
     None
@@ -533,10 +525,12 @@ On Linux in CI or headless environments, Vulkan is often unavailable."
 }
 
 fn panel_path_display(panel: &PanelState) -> String {
-    let Some(browser) = AppState::browser(panel) else {
-        return String::new();
-    };
-    match &browser.browser_mode {
+    let browser = &panel.browser;
+    let BrowserState {
+        browser_mode: ref mode,
+        ..
+    } = *browser;
+    match mode {
         BrowserMode::Fs => browser.current_path.to_string_lossy().into_owned(),
         BrowserMode::Container {
             kind,
@@ -619,9 +613,7 @@ fn pump_async(app: &mut AppState) -> bool {
     let mut changed = false;
     for side in [ActivePanel::Left, ActivePanel::Right] {
         let panel = app.panel_mut(side.clone());
-        let Some(browser) = AppState::browser_mut(panel) else {
-            continue;
-        };
+        let browser = &mut panel.browser;
         if let Some(rx) = browser.entries_rx.take() {
             let mut handled = 0usize;
             while handled < 8 {
@@ -641,17 +633,12 @@ fn pump_async(app: &mut AppState) -> bool {
         }
     }
 
-    match app.preview_rx.try_recv() {
-        Ok((id, content)) => {
-            if let Some(preview) = app.preview_panel_mut() {
-                if id == preview.request_id {
-                    preview.content = Some(content);
-                    changed = true;
-                }
-            }
-        }
-        Err(mpsc::TryRecvError::Empty) => {}
-        Err(mpsc::TryRecvError::Disconnected) => {}
+    if let Ok((id, content)) = app.preview_rx.try_recv()
+        && let Some(preview) = app.preview_panel_mut()
+        && id == preview.request_id
+    {
+        preview.content = Some(content);
+        changed = true;
     }
 
     while let Ok((path, size)) = app.dir_size_rx.try_recv() {
@@ -659,15 +646,13 @@ fn pump_async(app: &mut AppState) -> bool {
         app.dir_sizes.insert(path.clone(), size);
         for side in [ActivePanel::Left, ActivePanel::Right] {
             let panel = app.panel_mut(side.clone());
-            if let Some(browser) = AppState::browser_mut(panel) {
-                for entry in &mut browser.entries {
-                    if entry.is_dir {
-                        if let EntryLocation::Fs(p) = &entry.location {
-                            if *p == path {
-                                entry.size = Some(size);
-                            }
-                        }
-                    }
+            let browser = &mut panel.browser;
+            for entry in &mut browser.entries {
+                if entry.is_dir
+                    && let EntryLocation::Fs(p) = &entry.location
+                    && *p == path
+                {
+                    entry.size = Some(size);
                 }
             }
         }
@@ -675,18 +660,18 @@ fn pump_async(app: &mut AppState) -> bool {
     }
 
     while let Ok(result) = app.edit_rx.try_recv() {
-        if let Some(edit) = app.edit_panel_mut() {
-            if result.id == edit.request_id {
-                edit.loading = false;
-                edit.text = result.text;
-                edit.highlight_hash = hash_text(&edit.text);
-                edit.highlight_wrap_width = 0.0;
-                edit.highlight_key = Some(format!("edit:{}", result.path.to_string_lossy()));
-                edit.highlight_dirty_at = None;
-                edit.dirty = false;
-                edit.confirm_discard = false;
-                changed = true;
-            }
+        if let Some(edit) = app.edit_panel_mut()
+            && result.id == edit.request_id
+        {
+            edit.loading = false;
+            edit.text = result.text;
+            edit.highlight_hash = hash_text(&edit.text);
+            edit.highlight_wrap_width = 0.0;
+            edit.highlight_key = Some(format!("edit:{}", result.path.to_string_lossy()));
+            edit.highlight_dirty_at = None;
+            edit.dirty = false;
+            edit.confirm_discard = false;
+            changed = true;
         }
     }
 
@@ -710,10 +695,12 @@ fn pump_async(app: &mut AppState) -> bool {
                         SearchStatus::Idle => None,
                     };
                     let panel = app.get_active_panel_mut();
-                    let Some(browser) = AppState::browser_mut(panel) else {
-                        continue;
-                    };
-                    let display_name = match &browser.browser_mode {
+                    let browser = &mut panel.browser;
+                    let BrowserState {
+                        browser_mode: ref mode,
+                        ..
+                    } = *browser;
+                    let display_name = match mode {
                         BrowserMode::Search { root, .. } => result
                             .path
                             .strip_prefix(root)
@@ -751,9 +738,8 @@ fn pump_async(app: &mut AppState) -> bool {
                 if id == app.search_request_id {
                     app.search_status = SearchStatus::Running(progress);
                     let panel = app.get_active_panel_mut();
-                    if let Some(browser) = AppState::browser_mut(panel) {
-                        browser.loading_progress = Some((progress.matched, Some(progress.scanned)));
-                    }
+                    panel.browser.loading_progress =
+                        Some((progress.matched, Some(progress.scanned)));
                     changed = true;
                 }
             }
@@ -761,10 +747,9 @@ fn pump_async(app: &mut AppState) -> bool {
                 if id == app.search_request_id {
                     app.search_status = SearchStatus::Done(progress);
                     let panel = app.get_active_panel_mut();
-                    if let Some(browser) = AppState::browser_mut(panel) {
-                        browser.loading = false;
-                        browser.loading_progress = Some((progress.matched, Some(progress.scanned)));
-                    }
+                    panel.browser.loading = false;
+                    panel.browser.loading_progress =
+                        Some((progress.matched, Some(progress.scanned)));
                     changed = true;
                 }
             }
@@ -776,9 +761,7 @@ fn pump_async(app: &mut AppState) -> bool {
                         matched: 0,
                     });
                     let panel = app.get_active_panel_mut();
-                    if let Some(browser) = AppState::browser_mut(panel) {
-                        browser.loading = false;
-                    }
+                    panel.browser.loading = false;
                     changed = true;
                 }
             }
@@ -836,11 +819,9 @@ fn load_fs_directory_async(
         if !snapshot.is_empty() {
             let _ = tx.send(DirBatch::Append(snapshot.clone()));
         }
-        let mut snapshot = snapshot;
         thread::spawn(move || {
             let chunk = 500usize;
-            let mut all: Vec<DirEntry> = Vec::new();
-            all.append(&mut snapshot);
+            let mut all: Vec<DirEntry> = snapshot;
             for entry in rd.flatten() {
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if let Ok(file_type) = entry.file_type() {
@@ -940,9 +921,7 @@ fn load_fs_directory_async(
         .clone()
         .or_else(|| app.fs_last_selected_name.get(&path).cloned());
     let panel_state = app.panel_mut(target_panel);
-    let Some(browser) = AppState::browser_mut(panel_state) else {
-        return;
-    };
+    let browser = &mut panel_state.browser;
     let initial_loading = initial.is_empty() || has_parent_entry;
     browser.current_path = path.clone();
     browser.browser_mode = BrowserMode::Fs;
@@ -1021,18 +1000,19 @@ fn load_container_directory_async(
             let mut seen_root_file = false;
             let mut seen_other_root = false;
 
-            fn emit_name(
-                name: &str,
-                implicit_prefix: Option<&str>,
-                cwd: &str,
+            struct TarEmitContext<'a> {
+                implicit_prefix: Option<&'a str>,
+                cwd: &'a str,
                 kind: ContainerKind,
-                archive_path: &PathBuf,
-                pending: &mut Vec<DirEntry>,
-                seen_dirs: &mut std::collections::HashSet<String>,
-                seen_files: &mut std::collections::HashSet<String>,
-                loaded: &mut usize,
-            ) {
-                let rem = if let Some(prefix) = implicit_prefix {
+                archive_path: &'a Path,
+                pending: &'a mut Vec<DirEntry>,
+                seen_dirs: &'a mut std::collections::HashSet<String>,
+                seen_files: &'a mut std::collections::HashSet<String>,
+                loaded: &'a mut usize,
+            }
+
+            fn emit_name(name: &str, ctx: &mut TarEmitContext<'_>) {
+                let rem = if let Some(prefix) = ctx.implicit_prefix {
                     if !name.starts_with(prefix) {
                         return;
                     }
@@ -1047,44 +1027,44 @@ fn load_container_directory_async(
 
                 if let Some(slash) = rem.find('/') {
                     let dir = rem[..slash].to_string();
-                    if seen_dirs.insert(dir.clone()) {
-                        pending.push(DirEntry {
+                    if ctx.seen_dirs.insert(dir.clone()) {
+                        ctx.pending.push(DirEntry {
                             name: dir.clone(),
                             is_dir: true,
                             location: EntryLocation::Container {
-                                kind,
-                                archive_path: archive_path.clone(),
-                                inner_path: if let Some(prefix) = implicit_prefix {
+                                kind: ctx.kind,
+                                archive_path: ctx.archive_path.to_path_buf(),
+                                inner_path: if let Some(prefix) = ctx.implicit_prefix {
                                     format!("{}{}", prefix, dir)
-                                } else if cwd.is_empty() {
+                                } else if ctx.cwd.is_empty() {
                                     dir
                                 } else {
-                                    format!("{}/{}", cwd.trim_end_matches('/'), dir)
+                                    format!("{}/{}", ctx.cwd.trim_end_matches('/'), dir)
                                 },
                             },
                             size: None,
                         });
-                        *loaded += 1;
+                        *ctx.loaded += 1;
                     }
-                } else if seen_files.insert(rem.to_string()) {
+                } else if ctx.seen_files.insert(rem.to_string()) {
                     let file_name = rem.to_string();
-                    pending.push(DirEntry {
+                    ctx.pending.push(DirEntry {
                         name: file_name.clone(),
                         is_dir: false,
                         location: EntryLocation::Container {
-                            kind,
-                            archive_path: archive_path.clone(),
-                            inner_path: if let Some(prefix) = implicit_prefix {
+                            kind: ctx.kind,
+                            archive_path: ctx.archive_path.to_path_buf(),
+                            inner_path: if let Some(prefix) = ctx.implicit_prefix {
                                 format!("{}{}", prefix, file_name)
-                            } else if cwd.is_empty() {
+                            } else if ctx.cwd.is_empty() {
                                 file_name
                             } else {
-                                format!("{}/{}", cwd.trim_end_matches('/'), file_name)
+                                format!("{}/{}", ctx.cwd.trim_end_matches('/'), file_name)
                             },
                         },
                         size: None,
                     });
-                    *loaded += 1;
+                    *ctx.loaded += 1;
                 }
             }
 
@@ -1141,36 +1121,36 @@ fn load_container_directory_async(
                             .as_ref()
                             .map(|root| format!("{}/", root.trim_end_matches('/')));
                         for buffered_name in buffered.drain(..) {
-                            emit_name(
-                                &buffered_name,
-                                root_ref.as_deref(),
-                                &cwd_clone,
-                                kind_clone,
-                                &archive_clone,
-                                &mut pending,
-                                &mut seen_dirs,
-                                &mut seen_files,
-                                &mut loaded,
-                            );
+                            let mut ctx = TarEmitContext {
+                                implicit_prefix: root_ref.as_deref(),
+                                cwd: &cwd_clone,
+                                kind: kind_clone,
+                                archive_path: archive_clone.as_path(),
+                                pending: &mut pending,
+                                seen_dirs: &mut seen_dirs,
+                                seen_files: &mut seen_files,
+                                loaded: &mut loaded,
+                            };
+                            emit_name(&buffered_name, &mut ctx);
                         }
                     } else {
                         continue;
                     }
                 } else {
-                    emit_name(
-                        &name,
-                        implicit_root
-                            .as_ref()
-                            .map(|root| format!("{}/", root.trim_end_matches('/')))
-                            .as_deref(),
-                        &cwd_clone,
-                        kind_clone,
-                        &archive_clone,
-                        &mut pending,
-                        &mut seen_dirs,
-                        &mut seen_files,
-                        &mut loaded,
-                    );
+                    let root_ref = implicit_root
+                        .as_ref()
+                        .map(|root| format!("{}/", root.trim_end_matches('/')));
+                    let mut ctx = TarEmitContext {
+                        implicit_prefix: root_ref.as_deref(),
+                        cwd: &cwd_clone,
+                        kind: kind_clone,
+                        archive_path: archive_clone.as_path(),
+                        pending: &mut pending,
+                        seen_dirs: &mut seen_dirs,
+                        seen_files: &mut seen_files,
+                        loaded: &mut loaded,
+                    };
+                    emit_name(&name, &mut ctx);
                 }
 
                 if pending.len() >= BATCH || (!sent_first && !pending.is_empty()) {
@@ -1192,17 +1172,17 @@ fn load_container_directory_async(
                     .as_ref()
                     .map(|root| format!("{}/", root.trim_end_matches('/')));
                 for buffered_name in buffered.drain(..) {
-                    emit_name(
-                        &buffered_name,
-                        root_ref.as_deref(),
-                        &cwd_clone,
-                        kind_clone,
-                        &archive_clone,
-                        &mut pending,
-                        &mut seen_dirs,
-                        &mut seen_files,
-                        &mut loaded,
-                    );
+                    let mut ctx = TarEmitContext {
+                        implicit_prefix: root_ref.as_deref(),
+                        cwd: &cwd_clone,
+                        kind: kind_clone,
+                        archive_path: archive_clone.as_path(),
+                        pending: &mut pending,
+                        seen_dirs: &mut seen_dirs,
+                        seen_files: &mut seen_files,
+                        loaded: &mut loaded,
+                    };
+                    emit_name(&buffered_name, &mut ctx);
                 }
             }
 
@@ -1266,9 +1246,7 @@ fn load_container_directory_async(
             .cloned()
     });
     let panel_state = app.panel_mut(target_panel);
-    let Some(browser) = AppState::browser_mut(panel_state) else {
-        return;
-    };
+    let browser = &mut panel_state.browser;
     let initial_loading = true;
 
     browser.current_path = archive_path.clone();
@@ -1294,25 +1272,29 @@ fn open_selected(app: &mut AppState) {
 }
 
 fn should_show_preview(app: &AppState, panel_side: ActivePanel) -> bool {
-    matches!(app.panel(panel_side).mode, PanelMode::Preview(_))
+    let PanelState { mode, .. } = app.panel(panel_side);
+    matches!(mode, PanelMode::Preview(_))
 }
 
 fn should_show_editor(app: &AppState, panel_side: ActivePanel) -> bool {
-    matches!(app.panel(panel_side).mode, PanelMode::Edit(_))
+    let PanelState { mode, .. } = app.panel(panel_side);
+    matches!(mode, PanelMode::Edit(_))
 }
 
 fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: ActivePanel) {
     let (selected_entry, current_path, container_cwd) = {
         let panel = app.panel(source.clone());
-        let Some(browser) = AppState::browser(panel) else {
-            return;
-        };
+        let browser = &panel.browser;
         if browser.entries.is_empty() {
             return;
         }
         let entry = browser.entries[browser.selected_index].clone();
         let current_path = browser.current_path.clone();
-        let container_cwd = match &browser.browser_mode {
+        let BrowserState {
+            browser_mode: ref mode,
+            ..
+        } = *browser;
+        let container_cwd = match mode {
             BrowserMode::Container { cwd, .. } => Some(cwd.clone()),
             _ => None,
         };
@@ -1322,7 +1304,7 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
     app.store_selection_memory_for(source);
     app.push_history(target.clone());
 
-    match &selected_entry.location {
+    match selected_entry.location.clone() {
         EntryLocation::Fs(path) => {
             if selected_entry.is_dir {
                 let prefer_name = if selected_entry.name == ".." {
@@ -1335,11 +1317,11 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
                 load_fs_directory_async(app, path.clone(), target.clone(), prefer_name);
 
                 if selected_entry.name != ".."
-                    && let Some(name) = app.fs_last_selected_name.get(path).cloned()
+                    && let Some(name) = app.fs_last_selected_name.get(&path).cloned()
                 {
                     app.select_entry_by_name(target, &name);
                 }
-            } else if let Some(kind) = container_kind_from_path(path) {
+            } else if let Some(kind) = container_kind_from_path(&path) {
                 load_container_directory_async(
                     app,
                     kind,
@@ -1368,7 +1350,7 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
                 };
                 load_container_directory_async(
                     app,
-                    *kind,
+                    kind,
                     archive_path.clone(),
                     inner_path.clone(),
                     target.clone(),
@@ -1378,7 +1360,7 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
                 if selected_entry.name != ".."
                     && let Some(name) = app
                         .container_last_selected_name
-                        .get(&(archive_path.clone(), inner_path.clone(), *kind))
+                        .get(&(archive_path.clone(), inner_path.clone(), kind))
                         .cloned()
                 {
                     app.select_entry_by_name(target, &name);
@@ -1392,15 +1374,13 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
         app.dir_sizes.insert(path.clone(), size);
         for side in [ActivePanel::Left, ActivePanel::Right] {
             let panel = app.panel_mut(side.clone());
-            if let Some(browser) = AppState::browser_mut(panel) {
-                for entry in &mut browser.entries {
-                    if entry.is_dir {
-                        if let EntryLocation::Fs(p) = &entry.location {
-                            if *p == path {
-                                entry.size = Some(size);
-                            }
-                        }
-                    }
+            let browser = &mut panel.browser;
+            for entry in &mut browser.entries {
+                if entry.is_dir
+                    && let EntryLocation::Fs(p) = &entry.location
+                    && *p == path
+                {
+                    entry.size = Some(size);
                 }
             }
         }
@@ -1480,14 +1460,16 @@ fn apply_panel_snapshot(
         BrowserMode::Search { .. } => {
             let results = app.search_results.clone();
             let panel = app.panel_mut(which);
-            let Some(browser) = AppState::browser_mut(panel) else {
-                return;
-            };
+            let browser = &mut panel.browser;
             browser.browser_mode = snapshot.mode;
             browser.current_path = snapshot.current_path;
             browser.entries.clear();
             browser.entries.extend(results.iter().map(|result| {
-                let display_name = match &browser.browser_mode {
+                let BrowserState {
+                    browser_mode: ref mode,
+                    ..
+                } = *browser;
+                let display_name = match mode {
                     BrowserMode::Search { root, .. } => result
                         .path
                         .strip_prefix(root)
@@ -1562,9 +1544,7 @@ fn start_search(app: &mut AppState) {
     });
     let root = {
         let panel = app.get_active_panel();
-        let Some(browser) = AppState::browser(panel) else {
-            return;
-        };
+        let browser = &panel.browser;
         browser.current_path.clone()
     };
     {
@@ -1618,7 +1598,7 @@ fn handle_keyboard(
         ctx.request_repaint();
         return;
     }
-    if let PanelMode::Edit(edit) = &mut app.panel_mut(app.active_panel.clone()).mode {
+    if let PanelMode::Edit(ref mut edit) = app.panel_mut(app.active_panel.clone()).mode {
         let enter = input.key_pressed(egui::Key::Enter);
         let escape = input.key_pressed(egui::Key::Escape);
         let ctrl_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
@@ -1721,25 +1701,24 @@ fn handle_keyboard(
     if space {
         let target_path = {
             let panel = app.get_active_panel();
-            AppState::browser(panel).and_then(|browser| {
-                browser
-                    .entries
-                    .get(browser.selected_index)
-                    .and_then(|entry| {
-                        if entry.is_dir {
-                            if let EntryLocation::Fs(path) = &entry.location {
-                                return Some(path.clone());
-                            }
-                        }
-                        None
-                    })
-            })
+            let browser = &panel.browser;
+            browser
+                .entries
+                .get(browser.selected_index)
+                .and_then(|entry| {
+                    if entry.is_dir
+                        && let EntryLocation::Fs(path) = &entry.location
+                    {
+                        return Some(path.clone());
+                    }
+                    None
+                })
         };
-        if let Some(path) = target_path {
-            if !app.dir_size_pending.contains(&path) {
-                app.dir_size_pending.insert(path.clone());
-                let _ = app.dir_size_tx.send(path);
-            }
+        if let Some(path) = target_path
+            && !app.dir_size_pending.contains(&path)
+        {
+            app.dir_size_pending.insert(path.clone());
+            let _ = app.dir_size_tx.send(path);
         }
     }
     let ctrl_left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
@@ -1751,16 +1730,12 @@ fn handle_keyboard(
         open_selected_from_to(app, ActivePanel::Left, ActivePanel::Right);
     }
     let alt_left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft));
-    if alt_left {
-        if let Some(snapshot) = app.pop_history_back(app.active_panel.clone()) {
-            apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
-        }
+    if alt_left && let Some(snapshot) = app.pop_history_back(app.active_panel.clone()) {
+        apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
     }
     let alt_right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight));
-    if alt_right {
-        if let Some(snapshot) = app.pop_history_forward(app.active_panel.clone()) {
-            apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
-        }
+    if alt_right && let Some(snapshot) = app.pop_history_forward(app.active_panel.clone()) {
+        apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
     }
     let alt_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F7));
     if alt_f7 {
@@ -1773,36 +1748,39 @@ fn handle_keyboard(
     }
     if input.key_pressed(egui::Key::Enter) {
         if app.search_ui == SearchUiState::Open {
-            if AppState::browser(app.get_active_panel())
-                .is_some_and(|browser| matches!(browser.browser_mode, BrowserMode::Search { .. }))
-            {
+            if matches!(
+                app.get_active_panel().browser.browser_mode,
+                BrowserMode::Search { .. }
+            ) {
                 // Open selected result.
             } else {
                 start_search(app);
             }
         }
-        if AppState::browser(app.get_active_panel())
-            .is_some_and(|browser| matches!(browser.browser_mode, BrowserMode::Search { .. }))
-        {
+        if matches!(
+            app.get_active_panel().browser.browser_mode,
+            BrowserMode::Search { .. }
+        ) {
             app.push_history(app.active_panel.clone());
-            let entry = AppState::browser(app.get_active_panel())
-                .and_then(|browser| browser.entries.get(browser.selected_index).cloned());
-            if let Some(entry) = entry {
-                if let EntryLocation::Fs(path) = entry.location {
-                    if entry.is_dir {
-                        load_fs_directory_async(app, path, app.active_panel.clone(), None);
-                    } else if let Some(parent) = path.parent() {
-                        let name = path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .map(|s| s.to_string());
-                        load_fs_directory_async(
-                            app,
-                            parent.to_path_buf(),
-                            app.active_panel.clone(),
-                            name,
-                        );
-                    }
+            let panel = app.get_active_panel();
+            let browser = &panel.browser;
+            let entry = browser.entries.get(browser.selected_index).cloned();
+            if let Some(entry) = entry
+                && let EntryLocation::Fs(path) = entry.location
+            {
+                if entry.is_dir {
+                    load_fs_directory_async(app, path, app.active_panel.clone(), None);
+                } else if let Some(parent) = path.parent() {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string());
+                    load_fs_directory_async(
+                        app,
+                        parent.to_path_buf(),
+                        app.active_panel.clone(),
+                        name,
+                    );
                 }
             }
             app.search_ui = SearchUiState::Closed;
@@ -1812,7 +1790,7 @@ fn handle_keyboard(
             open_selected(app);
         }
     }
-    if let PanelMode::Preview(preview) = &mut app.panel_mut(app.active_panel.clone()).mode {
+    if let PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel.clone()).mode {
         let line = preview.line_height.max(16.0);
         let page = preview.page_height.max(200.0);
         let mut consumed = false;
@@ -1838,7 +1816,7 @@ fn handle_keyboard(
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::End) {
-            preview.scroll = preview.scroll + page * 10.0;
+            preview.scroll += page * 10.0;
             consumed = true;
         }
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
@@ -1853,49 +1831,43 @@ fn handle_keyboard(
     }
     let ctrl_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F));
     if ctrl_f {
-        if let PanelMode::Preview(preview) = &mut app.panel_mut(app.active_panel.clone()).mode {
+        if let PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel.clone()).mode {
             preview.find_open = true;
             preview.find_focus = true;
         }
         ctx.request_repaint();
     }
-    if input.key_pressed(egui::Key::ArrowDown)
-        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
-    {
+    let PanelState {
+        mode: active_mode, ..
+    } = app.panel(app.active_panel.clone());
+    let active_is_browser = matches!(active_mode, PanelMode::Browser);
+    if input.key_pressed(egui::Key::ArrowDown) && active_is_browser {
         if app.theme_picker_open {
             app.select_next_theme();
-        } else if let Some(browser) = AppState::browser(app.get_active_panel()) {
+        } else {
+            let browser = &app.get_active_panel().browser;
             if browser.selected_index + 1 < browser.entries.len() {
                 app.select_entry(browser.selected_index + 1, window_rows);
             }
         }
     }
-    if input.key_pressed(egui::Key::ArrowUp)
-        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
-    {
+    if input.key_pressed(egui::Key::ArrowUp) && active_is_browser {
         if app.theme_picker_open {
             app.select_prev_theme();
-        } else if let Some(browser) = AppState::browser(app.get_active_panel()) {
+        } else {
+            let browser = &app.get_active_panel().browser;
             if browser.selected_index > 0 {
                 app.select_entry(browser.selected_index - 1, window_rows);
             }
         }
     }
-    if input.key_pressed(egui::Key::PageUp)
-        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
-    {
-        let Some(browser) = AppState::browser(app.get_active_panel()) else {
-            return;
-        };
+    if input.key_pressed(egui::Key::PageUp) && active_is_browser {
+        let browser = &app.get_active_panel().browser;
         let new_index = browser.selected_index.saturating_sub(window_rows);
         app.select_entry(new_index, window_rows);
     }
-    if input.key_pressed(egui::Key::PageDown)
-        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
-    {
-        let Some(browser) = AppState::browser(app.get_active_panel()) else {
-            return;
-        };
+    if input.key_pressed(egui::Key::PageDown) && active_is_browser {
+        let browser = &app.get_active_panel().browser;
         let len = browser.entries.len();
         let mut new_index = browser.selected_index.saturating_add(window_rows);
         if len > 0 && new_index >= len {
@@ -1903,18 +1875,13 @@ fn handle_keyboard(
         }
         app.select_entry(new_index, window_rows);
     }
-    if input.key_pressed(egui::Key::Home)
-        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
-    {
+    if input.key_pressed(egui::Key::Home) && active_is_browser {
         app.select_entry(0, window_rows);
     }
-    if input.key_pressed(egui::Key::End)
-        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
-    {
-        if let Some(browser) = AppState::browser(app.get_active_panel()) {
-            if !browser.entries.is_empty() {
-                app.select_entry(browser.entries.len() - 1, window_rows);
-            }
+    if input.key_pressed(egui::Key::End) && active_is_browser {
+        let browser = &app.get_active_panel().browser;
+        if !browser.entries.is_empty() {
+            app.select_entry(browser.entries.len() - 1, window_rows);
         }
     }
     if input.key_pressed(egui::Key::F3) {
@@ -1954,9 +1921,7 @@ fn handle_keyboard(
 
 fn open_parent(app: &mut AppState, window_rows: usize) {
     let panel = app.get_active_panel();
-    let Some(browser) = AppState::browser(panel) else {
-        return;
-    };
+    let browser = &panel.browser;
     let parent_index = browser.entries.iter().position(|e| e.name == "..");
     let Some(idx) = parent_index else { return };
     if browser.selected_index != idx {
@@ -1967,12 +1932,12 @@ fn open_parent(app: &mut AppState, window_rows: usize) {
 
 fn confirm_pending_op(app: &mut AppState) {
     if let Some(op) = app.take_pending_op() {
-        if let PendingOp::Delete { target } = &op {
-            if let Some(name) = target.file_name().and_then(|n| n.to_str()) {
-                let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
-                app.fs_last_selected_name
-                    .insert(parent.to_path_buf(), name.to_string());
-            }
+        if let PendingOp::Delete { target } = &op
+            && let Some(name) = target.file_name().and_then(|n| n.to_str())
+        {
+            let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+            app.fs_last_selected_name
+                .insert(parent.to_path_buf(), name.to_string());
         }
         if let PendingOp::Rename { src } = &op {
             let name = app.rename_input.clone().unwrap_or_default();
@@ -1985,11 +1950,11 @@ fn confirm_pending_op(app: &mut AppState) {
                 app.clear_pending_op();
                 return;
             }
-            if let Some(current) = src.file_name().and_then(|n| n.to_str()) {
-                if current == name {
-                    app.clear_pending_op();
-                    return;
-                }
+            if let Some(current) = src.file_name().and_then(|n| n.to_str())
+                && current == name
+            {
+                app.clear_pending_op();
+                return;
             }
             app.store_selection_memory_for(app.active_panel.clone());
             app.fs_last_selected_name.insert(
@@ -2012,9 +1977,7 @@ fn confirm_pending_op(app: &mut AppState) {
 fn refresh_active_panel(app: &mut AppState) {
     let which = app.active_panel.clone();
     let panel = app.panel(which.clone());
-    let Some(browser) = AppState::browser(panel) else {
-        return;
-    };
+    let browser = &panel.browser;
     let path = browser.current_path.clone();
     if matches!(browser.browser_mode, BrowserMode::Fs) {
         load_fs_directory_async(app, path, which, None);
@@ -2023,13 +1986,12 @@ fn refresh_active_panel(app: &mut AppState) {
 
 fn refresh_fs_panels(app: &mut AppState) {
     for which in [ActivePanel::Left, ActivePanel::Right] {
-        if let Some(browser) = AppState::browser(app.panel(which.clone())) {
-            if !matches!(browser.browser_mode, BrowserMode::Fs) {
-                continue;
-            }
-            let path = browser.current_path.clone();
-            load_fs_directory_async(app, path, which, None);
+        let browser = &app.panel(which.clone()).browser;
+        if !matches!(browser.browser_mode, BrowserMode::Fs) {
+            continue;
         }
+        let path = browser.current_path.clone();
+        load_fs_directory_async(app, path, which, None);
     }
 }
 
@@ -2187,30 +2149,38 @@ fn draw_discard_modal(ctx: &egui::Context, app: &mut AppState) {
     if let Some(accept) = action {
         let panel = app.panel_mut(side.clone());
         if accept {
-            let return_focus = match &panel.mode {
-                PanelMode::Edit(edit) => edit.return_focus.clone(),
+            let return_focus = match panel.mode {
+                PanelMode::Edit(ref edit) => edit.return_focus.clone(),
                 _ => side.clone(),
             };
             panel.mode = PanelMode::Browser;
             app.active_panel = return_focus;
-        } else {
-            if let PanelMode::Edit(edit) = &mut panel.mode {
-                edit.confirm_discard = false;
-            }
+        } else if let PanelMode::Edit(ref mut edit) = panel.mode {
+            edit.confirm_discard = false;
         }
     }
 }
 
-fn draw_editor(
-    ui: &mut egui::Ui,
-    theme: &Theme,
+struct EditorRender<'a> {
+    theme: &'a Theme,
     is_focused: bool,
-    edit: &mut EditState,
-    highlight_cache: &HashMap<String, egui::text::LayoutJob>,
-    highlight_pending: &mut HashSet<String>,
-    highlight_req_tx: &mpsc::Sender<HighlightRequest>,
+    edit: &'a mut EditState,
+    highlight_cache: &'a HashMap<String, egui::text::LayoutJob>,
+    highlight_pending: &'a mut HashSet<String>,
+    highlight_req_tx: &'a mpsc::Sender<HighlightRequest>,
     min_height: f32,
-) {
+}
+
+fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
+    let EditorRender {
+        theme,
+        is_focused,
+        edit,
+        highlight_cache,
+        highlight_pending,
+        highlight_req_tx,
+        min_height,
+    } = ctx;
     let colors = theme.colors();
     egui::Frame::NONE
         .fill(color32(colors.preview_bg))
@@ -2248,11 +2218,11 @@ fn draw_editor(
             let edit_ext = edit.ext.clone();
             let theme_kind = theme.kind;
             let mut key = edit.highlight_key.clone();
-            if key.is_none() {
-                if let Some(path) = edit.path.as_ref() {
-                    key = Some(format!("edit:{}", path.to_string_lossy()));
-                    edit.highlight_key = key.clone();
-                }
+            if key.is_none()
+                && let Some(path) = edit.path.as_ref()
+            {
+                key = Some(format!("edit:{}", path.to_string_lossy()));
+                edit.highlight_key = key.clone();
             }
             let key_with_hash = key
                 .as_ref()
@@ -2323,19 +2293,17 @@ fn draw_editor(
                 edit.highlight_dirty_at = Some(std::time::Instant::now());
                 edit.dirty = true;
             }
-            if needs_highlight {
-                if let Some(key) = edit.highlight_key.clone() {
-                    let wrap_width = ui.available_width();
-                    if !highlight_pending.contains(&key) {
-                        edit.highlight_wrap_width = wrap_width;
-                        highlight_pending.insert(key.clone());
-                        let _ = highlight_req_tx.send(HighlightRequest {
-                            key,
-                            text: edit.text.clone(),
-                            ext: edit_ext,
-                            theme_kind,
-                        });
-                    }
+            if needs_highlight && let Some(key) = edit.highlight_key.clone() {
+                let wrap_width = ui.available_width();
+                if !highlight_pending.contains(&key) {
+                    edit.highlight_wrap_width = wrap_width;
+                    highlight_pending.insert(key.clone());
+                    let _ = highlight_req_tx.send(HighlightRequest {
+                        key,
+                        text: edit.text.clone(),
+                        ext: edit_ext,
+                        theme_kind,
+                    });
                 }
             }
             if is_focused {
@@ -2394,18 +2362,30 @@ fn pending_op_text(op: &PendingOp) -> (&'static str, String) {
     }
 }
 
-fn draw_preview(
-    ui: &mut egui::Ui,
-    theme: &Theme,
+struct PreviewRender<'a> {
+    theme: &'a Theme,
     is_focused: bool,
-    preview: &mut PreviewState,
-    image_cache: &mut ImageCache,
-    image_req_tx: &mpsc::Sender<ImageRequest>,
-    highlight_cache: &HashMap<String, egui::text::LayoutJob>,
-    highlight_pending: &mut HashSet<String>,
-    highlight_req_tx: &mpsc::Sender<HighlightRequest>,
+    preview: &'a mut PreviewState,
+    image_cache: &'a mut ImageCache,
+    image_req_tx: &'a mpsc::Sender<ImageRequest>,
+    highlight_cache: &'a HashMap<String, egui::text::LayoutJob>,
+    highlight_pending: &'a mut HashSet<String>,
+    highlight_req_tx: &'a mpsc::Sender<HighlightRequest>,
     min_height: f32,
-) {
+}
+
+fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
+    let PreviewRender {
+        theme,
+        is_focused,
+        preview,
+        image_cache,
+        image_req_tx,
+        highlight_cache,
+        highlight_pending,
+        highlight_req_tx,
+        min_height,
+    } = ctx;
     let colors = theme.colors();
     let header_bg = color32(colors.preview_header_bg);
     let header_fg = color32(colors.preview_header_fg);
@@ -2631,9 +2611,7 @@ fn draw_panel(
 
     let (entries_len, selected_index, header_text, selected_label, loading, loading_progress) = {
         let panel = app.panel(panel_side.clone());
-        let Some(browser) = AppState::browser(panel) else {
-            return 0;
-        };
+        let browser = &panel.browser;
         let entries_len = browser.entries.len();
         let selected_index = browser.selected_index;
         let header_text = format!(
@@ -2710,10 +2688,10 @@ fn draw_panel(
                         _ => 0.0,
                     };
                     ui.add_space(4.0);
-                    let loading_label = AppState::browser(app.panel(panel_side.clone()))
-                        .is_some_and(|browser| {
-                            matches!(browser.browser_mode, BrowserMode::Search { .. })
-                        });
+                    let loading_label = matches!(
+                        app.panel(panel_side.clone()).browser.browser_mode,
+                        BrowserMode::Search { .. }
+                    );
                     let prefix = if loading_label {
                         "Searching…"
                     } else {
@@ -2770,11 +2748,7 @@ fn draw_panel(
                         scroll.show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
                             visible_range = row_range.clone();
                             for idx in row_range {
-                                let Some(browser) =
-                                    AppState::browser(app.panel(panel_side_for_closure.clone()))
-                                else {
-                                    continue;
-                                };
+                                let browser = &app.panel(panel_side_for_closure.clone()).browser;
                                 let entry = &browser.entries[idx];
                                 let is_selected = selected_index == idx;
                                 let stripe = idx % 2 == 0;
@@ -2839,12 +2813,12 @@ fn draw_panel(
 
                                 let font_id = egui::TextStyle::Body.resolve(ui.style());
                                 let mut size_text = entry.size.map(format_size).unwrap_or_default();
-                                if size_text.is_empty() && entry.is_dir {
-                                    if let EntryLocation::Fs(path) = &entry.location {
-                                        if app.dir_size_pending.contains(path) {
-                                            size_text = "…".to_string();
-                                        }
-                                    }
+                                if size_text.is_empty()
+                                    && entry.is_dir
+                                    && let EntryLocation::Fs(path) = &entry.location
+                                    && app.dir_size_pending.contains(path)
+                                {
+                                    size_text = "…".to_string();
                                 }
                                 if !size_text.is_empty() {
                                     ui.painter().text(
@@ -2921,9 +2895,7 @@ fn draw_panel(
     }
 
     if let Some(top) = new_top_index {
-        if let Some(browser) = AppState::browser_mut(app.panel_mut(panel_side.clone())) {
-            browser.top_index = top;
-        }
+        app.panel_mut(panel_side.clone()).browser.top_index = top;
     }
 
     if let Some(idx) = clicked_index {
@@ -3341,34 +3313,38 @@ impl ApplicationHandler for App {
                                 let is_focused = runtime.app.active_panel == ActivePanel::Left;
                                 let theme = runtime.app.theme.clone();
                                 let panel = runtime.app.panel_mut(ActivePanel::Left);
-                                if let PanelMode::Edit(edit) = &mut panel.mode {
+                                if let PanelMode::Edit(ref mut edit) = panel.mode {
                                     draw_editor(
                                         ui,
-                                        &theme,
-                                        is_focused,
-                                        edit,
-                                        &runtime.highlight_cache,
-                                        &mut runtime.highlight_pending,
-                                        &runtime.highlight_req_tx,
-                                        rect.height(),
+                                        EditorRender {
+                                            theme: &theme,
+                                            is_focused,
+                                            edit,
+                                            highlight_cache: &runtime.highlight_cache,
+                                            highlight_pending: &mut runtime.highlight_pending,
+                                            highlight_req_tx: &runtime.highlight_req_tx,
+                                            min_height: rect.height(),
+                                        },
                                     );
                                 }
                             } else if should_show_preview(&runtime.app, ActivePanel::Left) {
                                 let is_focused = runtime.app.active_panel == ActivePanel::Left;
                                 let theme = runtime.app.theme.clone();
                                 let panel = runtime.app.panel_mut(ActivePanel::Left);
-                                if let PanelMode::Preview(preview) = &mut panel.mode {
+                                if let PanelMode::Preview(ref mut preview) = panel.mode {
                                     draw_preview(
                                         ui,
-                                        &theme,
-                                        is_focused,
-                                        preview,
-                                        &mut runtime.image_cache,
-                                        &runtime.image_req_tx,
-                                        &runtime.highlight_cache,
-                                        &mut runtime.highlight_pending,
-                                        &runtime.highlight_req_tx,
-                                        rect.height(),
+                                        PreviewRender {
+                                            theme: &theme,
+                                            is_focused,
+                                            preview,
+                                            image_cache: &mut runtime.image_cache,
+                                            image_req_tx: &runtime.image_req_tx,
+                                            highlight_cache: &runtime.highlight_cache,
+                                            highlight_pending: &mut runtime.highlight_pending,
+                                            highlight_req_tx: &runtime.highlight_req_tx,
+                                            min_height: rect.height(),
+                                        },
                                     );
                                 }
                             } else {
@@ -3388,34 +3364,38 @@ impl ApplicationHandler for App {
                                 let is_focused = runtime.app.active_panel == ActivePanel::Right;
                                 let theme = runtime.app.theme.clone();
                                 let panel = runtime.app.panel_mut(ActivePanel::Right);
-                                if let PanelMode::Edit(edit) = &mut panel.mode {
+                                if let PanelMode::Edit(ref mut edit) = panel.mode {
                                     draw_editor(
                                         ui,
-                                        &theme,
-                                        is_focused,
-                                        edit,
-                                        &runtime.highlight_cache,
-                                        &mut runtime.highlight_pending,
-                                        &runtime.highlight_req_tx,
-                                        rect.height(),
+                                        EditorRender {
+                                            theme: &theme,
+                                            is_focused,
+                                            edit,
+                                            highlight_cache: &runtime.highlight_cache,
+                                            highlight_pending: &mut runtime.highlight_pending,
+                                            highlight_req_tx: &runtime.highlight_req_tx,
+                                            min_height: rect.height(),
+                                        },
                                     );
                                 }
                             } else if should_show_preview(&runtime.app, ActivePanel::Right) {
                                 let is_focused = runtime.app.active_panel == ActivePanel::Right;
                                 let theme = runtime.app.theme.clone();
                                 let panel = runtime.app.panel_mut(ActivePanel::Right);
-                                if let PanelMode::Preview(preview) = &mut panel.mode {
+                                if let PanelMode::Preview(ref mut preview) = panel.mode {
                                     draw_preview(
                                         ui,
-                                        &theme,
-                                        is_focused,
-                                        preview,
-                                        &mut runtime.image_cache,
-                                        &runtime.image_req_tx,
-                                        &runtime.highlight_cache,
-                                        &mut runtime.highlight_pending,
-                                        &runtime.highlight_req_tx,
-                                        rect.height(),
+                                        PreviewRender {
+                                            theme: &theme,
+                                            is_focused,
+                                            preview,
+                                            image_cache: &mut runtime.image_cache,
+                                            image_req_tx: &runtime.image_req_tx,
+                                            highlight_cache: &runtime.highlight_cache,
+                                            highlight_pending: &mut runtime.highlight_pending,
+                                            highlight_req_tx: &runtime.highlight_req_tx,
+                                            min_height: rect.height(),
+                                        },
                                     );
                                 }
                             } else {
@@ -3446,10 +3426,10 @@ impl ApplicationHandler for App {
                     if runtime.app.pending_op.is_some() {
                         draw_confirmation(ctx, &mut runtime.app);
                     }
-                    if let Some(edit) = runtime.app.edit_panel_mut() {
-                        if edit.confirm_discard {
-                            draw_discard_modal(ctx, &mut runtime.app);
-                        }
+                    if let Some(edit) = runtime.app.edit_panel_mut()
+                        && edit.confirm_discard
+                    {
+                        draw_discard_modal(ctx, &mut runtime.app);
                     }
                     if runtime.app.io_in_flight > 0 {
                         draw_progress_modal(ctx, &runtime.app);
@@ -3557,30 +3537,30 @@ impl ApplicationHandler for App {
                 runtime.highlight_results.push_back(res);
                 runtime.needs_redraw = true;
             }
-            if let Some(preview) = runtime.app.preview_panel_mut() {
-                if let Some(PreviewContent::Image(path)) = preview.content.as_ref() {
-                    let key = match path {
-                        ImageLocation::Fs(path) => path.to_string_lossy().into_owned(),
-                        ImageLocation::Container {
-                            kind,
-                            archive_path,
-                            inner_path,
-                        } => format!(
-                            "{}::{}:/{}",
-                            archive_path.to_string_lossy(),
-                            match kind {
-                                ContainerKind::Zip => "zip",
-                                ContainerKind::TarGz => "tar.gz",
-                                ContainerKind::TarBz2 => "tar.bz2",
-                            },
-                            inner_path
-                        ),
-                    };
-                    if runtime.image_cache.pending.contains(&key)
-                        || runtime.image_cache.textures.get(&key).is_none()
-                    {
-                        runtime.needs_redraw = true;
-                    }
+            if let Some(preview) = runtime.app.preview_panel_mut()
+                && let Some(PreviewContent::Image(path)) = preview.content.as_ref()
+            {
+                let key = match path {
+                    ImageLocation::Fs(path) => path.to_string_lossy().into_owned(),
+                    ImageLocation::Container {
+                        kind,
+                        archive_path,
+                        inner_path,
+                    } => format!(
+                        "{}::{}:/{}",
+                        archive_path.to_string_lossy(),
+                        match kind {
+                            ContainerKind::Zip => "zip",
+                            ContainerKind::TarGz => "tar.gz",
+                            ContainerKind::TarBz2 => "tar.bz2",
+                        },
+                        inner_path
+                    ),
+                };
+                if runtime.image_cache.pending.contains(&key)
+                    || !runtime.image_cache.textures.contains_key(&key)
+                {
+                    runtime.needs_redraw = true;
                 }
             }
             if pump_async(&mut runtime.app) {
@@ -3803,34 +3783,38 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                     let is_focused = app.active_panel == ActivePanel::Left;
                     let theme = app.theme.clone();
                     let panel = app.panel_mut(ActivePanel::Left);
-                    if let PanelMode::Edit(edit) = &mut panel.mode {
+                    if let PanelMode::Edit(ref mut edit) = panel.mode {
                         draw_editor(
                             ui,
-                            &theme,
-                            is_focused,
-                            edit,
-                            &highlight_cache,
-                            &mut highlight_pending,
-                            &highlight_req_tx,
-                            rect.height(),
+                            EditorRender {
+                                theme: &theme,
+                                is_focused,
+                                edit,
+                                highlight_cache: &highlight_cache,
+                                highlight_pending: &mut highlight_pending,
+                                highlight_req_tx: &highlight_req_tx,
+                                min_height: rect.height(),
+                            },
                         );
                     }
                 } else if should_show_preview(&app, ActivePanel::Left) {
                     let is_focused = app.active_panel == ActivePanel::Left;
                     let theme = app.theme.clone();
                     let panel = app.panel_mut(ActivePanel::Left);
-                    if let PanelMode::Preview(preview) = &mut panel.mode {
+                    if let PanelMode::Preview(ref mut preview) = panel.mode {
                         draw_preview(
                             ui,
-                            &theme,
-                            is_focused,
-                            preview,
-                            &mut image_cache,
-                            &image_req_tx,
-                            &highlight_cache,
-                            &mut highlight_pending,
-                            &highlight_req_tx,
-                            rect.height(),
+                            PreviewRender {
+                                theme: &theme,
+                                is_focused,
+                                preview,
+                                image_cache: &mut image_cache,
+                                image_req_tx: &image_req_tx,
+                                highlight_cache: &highlight_cache,
+                                highlight_pending: &mut highlight_pending,
+                                highlight_req_tx: &highlight_req_tx,
+                                min_height: rect.height(),
+                            },
                         );
                     }
                 } else {
@@ -3850,34 +3834,38 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                     let is_focused = app.active_panel == ActivePanel::Right;
                     let theme = app.theme.clone();
                     let panel = app.panel_mut(ActivePanel::Right);
-                    if let PanelMode::Edit(edit) = &mut panel.mode {
+                    if let PanelMode::Edit(ref mut edit) = panel.mode {
                         draw_editor(
                             ui,
-                            &theme,
-                            is_focused,
-                            edit,
-                            &highlight_cache,
-                            &mut highlight_pending,
-                            &highlight_req_tx,
-                            rect.height(),
+                            EditorRender {
+                                theme: &theme,
+                                is_focused,
+                                edit,
+                                highlight_cache: &highlight_cache,
+                                highlight_pending: &mut highlight_pending,
+                                highlight_req_tx: &highlight_req_tx,
+                                min_height: rect.height(),
+                            },
                         );
                     }
                 } else if should_show_preview(&app, ActivePanel::Right) {
                     let is_focused = app.active_panel == ActivePanel::Right;
                     let theme = app.theme.clone();
                     let panel = app.panel_mut(ActivePanel::Right);
-                    if let PanelMode::Preview(preview) = &mut panel.mode {
+                    if let PanelMode::Preview(ref mut preview) = panel.mode {
                         draw_preview(
                             ui,
-                            &theme,
-                            is_focused,
-                            preview,
-                            &mut image_cache,
-                            &image_req_tx,
-                            &highlight_cache,
-                            &mut highlight_pending,
-                            &highlight_req_tx,
-                            rect.height(),
+                            PreviewRender {
+                                theme: &theme,
+                                is_focused,
+                                preview,
+                                image_cache: &mut image_cache,
+                                image_req_tx: &image_req_tx,
+                                highlight_cache: &highlight_cache,
+                                highlight_pending: &mut highlight_pending,
+                                highlight_req_tx: &highlight_req_tx,
+                                min_height: rect.height(),
+                            },
                         );
                     }
                 } else {
@@ -3904,10 +3892,10 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         if app.pending_op.is_some() {
             draw_confirmation(ctx, &mut app);
         }
-        if let Some(edit) = app.edit_panel_mut() {
-            if edit.confirm_discard {
-                draw_discard_modal(ctx, &mut app);
-            }
+        if let Some(edit) = app.edit_panel_mut()
+            && edit.confirm_discard
+        {
+            draw_discard_modal(ctx, &mut app);
         }
         if app.io_in_flight > 0 {
             draw_progress_modal(ctx, &app);
@@ -3982,7 +3970,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
 }
 
 fn align_to(value: u32, alignment: u32) -> u32 {
-    ((value + alignment - 1) / alignment) * alignment
+    value.div_ceil(alignment) * alignment
 }
 
 fn save_snapshot_png(
