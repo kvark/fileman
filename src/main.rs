@@ -6,6 +6,7 @@ use blade_graphics::{
     TextureSubresources, TextureUsage, TextureViewDesc, ViewDimension,
 };
 use egui_winit::State as EguiWinitState;
+use exif::{Tag, Value};
 use once_cell::sync::Lazy;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -158,16 +159,144 @@ fn blend_color(base: Color, tint: Color, t: f32) -> Color {
 
 fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<egui::ColorImage> {
     let image = ZuneImage::read(bytes, DecoderOptions::default()).ok()?;
+    let orientation = exif_orientation(&image).unwrap_or(1);
     let (width, height) = image.dimensions();
     let colorspace = image.colorspace();
     let mut frames = image.flatten_to_u8();
     let data = frames.pop()?;
     let rgba = convert_to_rgba(&data, width, height, colorspace)?;
+    let (rgba, width, height) = apply_orientation_rgba(rgba, width, height, orientation);
     let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
     Some(egui::ColorImage::from_rgba_unmultiplied(
         [out_w, out_h],
         &out_rgba,
     ))
+}
+
+fn exif_orientation(image: &ZuneImage) -> Option<u16> {
+    let exif = image.metadata().exif()?;
+    for field in exif {
+        if field.tag == Tag::Orientation {
+            if let Value::Short(values) = &field.value {
+                return values.first().copied();
+            }
+        }
+    }
+    None
+}
+
+fn apply_orientation_rgba(
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+    orientation: u16,
+) -> (Vec<u8>, usize, usize) {
+    match orientation {
+        2 => (flip_horizontal(&rgba, width, height), width, height),
+        3 => (rotate_180(&rgba, width, height), width, height),
+        4 => (flip_vertical(&rgba, width, height), width, height),
+        5 => (
+            transpose_flip_horizontal(&rgba, width, height),
+            height,
+            width,
+        ),
+        6 => (rotate_90_cw(&rgba, width, height), height, width),
+        7 => (transpose_flip_vertical(&rgba, width, height), height, width),
+        8 => (rotate_90_ccw(&rgba, width, height), height, width),
+        _ => (rgba, width, height),
+    }
+}
+
+fn flip_horizontal(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * 4;
+            let dst = (y * width + (width - 1 - x)) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    out
+}
+
+fn flip_vertical(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * 4;
+            let dst = ((height - 1 - y) * width + x) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    out
+}
+
+fn rotate_180(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * 4;
+            let dst = ((height - 1 - y) * width + (width - 1 - x)) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    out
+}
+
+fn rotate_90_cw(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * 4;
+            let dst_x = height - 1 - y;
+            let dst_y = x;
+            let dst = (dst_y * height + dst_x) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    out
+}
+
+fn rotate_90_ccw(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * 4;
+            let dst_x = y;
+            let dst_y = width - 1 - x;
+            let dst = (dst_y * height + dst_x) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    out
+}
+
+fn transpose_flip_horizontal(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * 4;
+            let dst_x = height - 1 - y;
+            let dst_y = width - 1 - x;
+            let dst = (dst_y * height + dst_x) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    out
+}
+
+fn transpose_flip_vertical(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let src = (y * width + x) * 4;
+            let dst_x = y;
+            let dst_y = x;
+            let dst = (dst_y * height + dst_x) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    out
 }
 
 fn convert_to_rgba(
@@ -1111,6 +1240,16 @@ fn open_selected(app: &mut AppState) {
     open_selected_from_to(app, active.clone(), active);
 }
 
+fn should_show_preview(app: &AppState, panel_side: ActivePanel) -> bool {
+    if app.preview.is_none() {
+        return false;
+    }
+    match app.active_panel {
+        ActivePanel::Left => panel_side == ActivePanel::Right,
+        ActivePanel::Right => panel_side == ActivePanel::Left,
+    }
+}
+
 fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: ActivePanel) {
     let (selected_entry, current_path, container_cwd) = {
         let panel = app.panel(source.clone());
@@ -1318,7 +1457,18 @@ fn apply_panel_snapshot(
             panel.entries_rx = None;
             panel.selected_index = snapshot
                 .selected_name
-                .and_then(|name| panel.entries.iter().position(|e| e.name == name))
+                .and_then(|name| {
+                    if let Some(path) = name.strip_prefix("fs:") {
+                        return panel.entries.iter().position(|e| {
+                            if let EntryLocation::Fs(p) = &e.location {
+                                p.to_string_lossy() == path
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                    panel.entries.iter().position(|e| e.name == name)
+                })
                 .unwrap_or(0);
             panel.top_index = 0;
             panel.loading = false;
@@ -1428,7 +1578,9 @@ fn handle_keyboard(
         ctx.request_repaint();
     }
     let ctrl_pgup = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
-    if ctrl_pgup || input.key_pressed(egui::Key::Backspace) {
+    let backspace = input.key_pressed(egui::Key::Backspace);
+    let typing_in_ui = ctx.wants_keyboard_input();
+    if (ctrl_pgup || backspace) && !(app.search_ui == SearchUiState::Open && typing_in_ui) {
         open_parent(app, window_rows);
     }
     let ctrl_pgdn = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
@@ -1659,6 +1811,13 @@ fn open_parent(app: &mut AppState, window_rows: usize) {
 
 fn confirm_pending_op(app: &mut AppState) {
     if let Some(op) = app.take_pending_op() {
+        if let PendingOp::Delete { target } = &op {
+            if let Some(name) = target.file_name().and_then(|n| n.to_str()) {
+                let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+                app.fs_last_selected_name
+                    .insert(parent.to_path_buf(), name.to_string());
+            }
+        }
         if let PendingOp::Rename { src } = &op {
             let name = app.rename_input.clone().unwrap_or_default();
             if name.is_empty()
@@ -1993,6 +2152,7 @@ fn draw_preview(
                                 .clamp(0.01, 1.0);
                             let size = egui::Vec2::new(tex.x * scale, tex.y * scale);
                             ui.add(egui::Image::new(sized).fit_to_exact_size(size));
+                            ui.ctx().request_repaint();
                         } else {
                             if image_cache.pending.insert(key.clone()) {
                                 let _ = image_req_tx.send(request);
@@ -2036,6 +2196,7 @@ fn draw_theme_picker(ctx: &egui::Context, app: &mut AppState) {
 }
 
 fn draw_command_bar(ctx: &egui::Context, colors: &ThemeColors) {
+    let modifiers = ctx.input(|i| i.modifiers);
     egui::TopBottomPanel::bottom("command_bar")
         .exact_height(30.0)
         .show(ctx, |ui| {
@@ -2044,12 +2205,19 @@ fn draw_command_bar(ctx: &egui::Context, colors: &ThemeColors) {
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        draw_key_cap(ui, "F3", "View", colors);
-                        draw_key_cap(ui, "F4", "Edit", colors);
-                        draw_key_cap(ui, "F5", "Copy", colors);
-                        draw_key_cap(ui, "F6", "Move", colors);
-                        draw_key_cap(ui, "F7", "Mkdir", colors);
-                        draw_key_cap(ui, "F8", "Delete", colors);
+                        let (f3, f4, f5, f6, f7, f8) = if modifiers.alt {
+                            ("", "", "Pack", "Unpack", "Search", "Command")
+                        } else if modifiers.shift {
+                            ("", "New", "Copy", "Rename", "", "")
+                        } else {
+                            ("View", "Edit", "Copy", "Move", "Mkdir", "Delete")
+                        };
+                        draw_key_cap(ui, "F3", f3, colors);
+                        draw_key_cap(ui, "F4", f4, colors);
+                        draw_key_cap(ui, "F5", f5, colors);
+                        draw_key_cap(ui, "F6", f6, colors);
+                        draw_key_cap(ui, "F7", f7, colors);
+                        draw_key_cap(ui, "F8", f8, colors);
                     });
                 });
         });
@@ -2059,7 +2227,6 @@ fn draw_key_cap(ui: &mut egui::Ui, key: &str, label: &str, colors: &ThemeColors)
     let key_text = egui::RichText::new(key)
         .color(color32(colors.row_fg_selected))
         .strong();
-    let label_text = egui::RichText::new(format!(" {label}")).color(color32(colors.footer_fg));
     egui::Frame::NONE
         .fill(color32(colors.preview_header_bg))
         .corner_radius(egui::CornerRadius::same(4))
@@ -2067,7 +2234,11 @@ fn draw_key_cap(ui: &mut egui::Ui, key: &str, label: &str, colors: &ThemeColors)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(key_text);
-                ui.label(label_text);
+                if !label.is_empty() {
+                    let label_text =
+                        egui::RichText::new(format!(" {label}")).color(color32(colors.footer_fg));
+                    ui.label(label_text);
+                }
             });
         });
     ui.add_space(6.0);
@@ -2405,8 +2576,10 @@ struct Runtime {
     highlight_pending: HashSet<String>,
     highlight_req_tx: mpsc::Sender<HighlightRequest>,
     highlight_res_rx: mpsc::Receiver<HighlightResult>,
+    highlight_results: VecDeque<HighlightResult>,
     image_req_tx: mpsc::Sender<ImageRequest>,
     image_res_rx: mpsc::Receiver<ImageResult>,
+    image_pending: VecDeque<ImageResult>,
     needs_redraw: bool,
 }
 
@@ -2669,8 +2842,10 @@ impl ApplicationHandler for App {
             highlight_pending,
             highlight_req_tx,
             highlight_res_rx,
+            highlight_results: VecDeque::new(),
             image_req_tx,
             image_res_rx,
+            image_pending: VecDeque::new(),
             needs_redraw: true,
         });
     }
@@ -2699,11 +2874,19 @@ impl ApplicationHandler for App {
                 let _ = pump_async(&mut runtime.app);
                 let mut decoded_images = Vec::new();
                 while decoded_images.len() < MAX_IMAGE_UPLOADS_PER_FRAME {
+                    if let Some(img) = runtime.image_pending.pop_front() {
+                        decoded_images.push(img);
+                        continue;
+                    }
                     match runtime.image_res_rx.try_recv() {
                         Ok(img) => decoded_images.push(img),
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => break,
                     }
+                }
+                while let Some(res) = runtime.highlight_results.pop_front() {
+                    runtime.highlight_cache.insert(res.key.clone(), res.job);
+                    runtime.highlight_pending.remove(&res.key);
                 }
                 while let Ok(res) = runtime.highlight_res_rx.try_recv() {
                     runtime.highlight_cache.insert(res.key.clone(), res.job);
@@ -2738,6 +2921,7 @@ impl ApplicationHandler for App {
                                 runtime.image_cache.textures.remove(&old);
                             }
                         }
+                        runtime.needs_redraw = true;
                     }
 
                     draw_command_bar(ctx, &runtime.app.theme.colors());
@@ -2756,9 +2940,7 @@ impl ApplicationHandler for App {
                         );
 
                         ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                            if runtime.app.preview.is_some()
-                                && runtime.app.active_panel == ActivePanel::Right
-                            {
+                            if should_show_preview(&runtime.app, ActivePanel::Left) {
                                 draw_preview(
                                     ui,
                                     &mut runtime.app,
@@ -2782,9 +2964,7 @@ impl ApplicationHandler for App {
                             }
                         });
                         ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                            if runtime.app.preview.is_some()
-                                && runtime.app.active_panel == ActivePanel::Left
-                            {
+                            if should_show_preview(&runtime.app, ActivePanel::Right) {
                                 draw_preview(
                                     ui,
                                     &mut runtime.app,
@@ -2920,6 +3100,38 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Wait);
         if let Some(runtime) = self.runtime.as_mut() {
+            while let Ok(img) = runtime.image_res_rx.try_recv() {
+                runtime.image_pending.push_back(img);
+                runtime.needs_redraw = true;
+            }
+            while let Ok(res) = runtime.highlight_res_rx.try_recv() {
+                runtime.highlight_results.push_back(res);
+                runtime.needs_redraw = true;
+            }
+            if let Some(PreviewContent::Image(path)) = runtime.app.preview.as_ref() {
+                let key = match path {
+                    ImageLocation::Fs(path) => path.to_string_lossy().into_owned(),
+                    ImageLocation::Container {
+                        kind,
+                        archive_path,
+                        inner_path,
+                    } => format!(
+                        "{}::{}:/{}",
+                        archive_path.to_string_lossy(),
+                        match kind {
+                            ContainerKind::Zip => "zip",
+                            ContainerKind::TarGz => "tar.gz",
+                            ContainerKind::TarBz2 => "tar.bz2",
+                        },
+                        inner_path
+                    ),
+                };
+                if runtime.image_cache.pending.contains(&key)
+                    || runtime.image_cache.textures.get(&key).is_none()
+                {
+                    runtime.needs_redraw = true;
+                }
+            }
             if pump_async(&mut runtime.app) {
                 runtime.needs_redraw = true;
             }
@@ -3137,7 +3349,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             );
 
             ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                if app.preview.is_some() && app.active_panel == ActivePanel::Right {
+                if should_show_preview(&app, ActivePanel::Left) {
                     draw_preview(
                         ui,
                         &mut app,
@@ -3161,7 +3373,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                 }
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                if app.preview.is_some() && app.active_panel == ActivePanel::Left {
+                if should_show_preview(&app, ActivePanel::Right) {
                     draw_preview(
                         ui,
                         &mut app,
