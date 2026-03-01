@@ -847,6 +847,7 @@ dependencies = [
  "egui-winit",
  "env_logger",
  "flate2",
+ "kamadak-exif",
  "log",
  "memchr",
  "once_cell",

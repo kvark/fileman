@@ -34,6 +34,44 @@ pub struct PanelSnapshot {
     pub selected_name: Option<String>,
 }
 
+fn history_key(snapshot: &PanelSnapshot) -> String {
+    match &snapshot.mode {
+        PanelMode::Fs => format!("fs:{}", snapshot.current_path.to_string_lossy()),
+        PanelMode::Container {
+            kind,
+            archive_path,
+            cwd,
+        } => format!(
+            "container:{}:{}:{}",
+            match kind {
+                ContainerKind::Zip => "zip",
+                ContainerKind::TarGz => "tar.gz",
+                ContainerKind::TarBz2 => "tar.bz2",
+            },
+            archive_path.to_string_lossy(),
+            cwd
+        ),
+        PanelMode::Search {
+            root,
+            query,
+            mode,
+            case,
+        } => format!(
+            "search:{}:{}:{}:{}",
+            root.to_string_lossy(),
+            query,
+            match mode {
+                SearchMode::Name => "name",
+                SearchMode::Content => "content",
+            },
+            match case {
+                SearchCase::Sensitive => "s",
+                SearchCase::Insensitive => "i",
+            }
+        ),
+    }
+}
+
 pub struct AppState {
     pub left_panel: PanelState,
     pub right_panel: PanelState,
@@ -213,10 +251,14 @@ impl AppState {
     pub fn push_history(&mut self, which: ActivePanel) {
         let snapshot = {
             let panel = self.panel(which.clone());
-            let selected = panel
-                .entries
-                .get(panel.selected_index)
-                .map(|e| e.name.clone());
+            let selected = panel.entries.get(panel.selected_index).map(|e| {
+                if matches!(panel.mode, PanelMode::Search { .. }) {
+                    if let EntryLocation::Fs(path) = &e.location {
+                        return format!("fs:{}", path.to_string_lossy());
+                    }
+                }
+                e.name.clone()
+            });
             PanelSnapshot {
                 mode: panel.mode.clone(),
                 current_path: panel.current_path.clone(),
@@ -224,6 +266,11 @@ impl AppState {
             }
         };
         let panel = self.panel_mut(which);
+        if let Some(last) = panel.history_back.last() {
+            if history_key(last) == history_key(&snapshot) {
+                return;
+            }
+        }
         panel.history_back.push(snapshot);
         panel.history_forward.clear();
     }
@@ -231,10 +278,14 @@ impl AppState {
     pub fn pop_history_back(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
         let current = {
             let panel = self.panel(which.clone());
-            let selected = panel
-                .entries
-                .get(panel.selected_index)
-                .map(|e| e.name.clone());
+            let selected = panel.entries.get(panel.selected_index).map(|e| {
+                if matches!(panel.mode, PanelMode::Search { .. }) {
+                    if let EntryLocation::Fs(path) = &e.location {
+                        return format!("fs:{}", path.to_string_lossy());
+                    }
+                }
+                e.name.clone()
+            });
             PanelSnapshot {
                 mode: panel.mode.clone(),
                 current_path: panel.current_path.clone(),
@@ -252,10 +303,14 @@ impl AppState {
     pub fn pop_history_forward(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
         let current = {
             let panel = self.panel(which.clone());
-            let selected = panel
-                .entries
-                .get(panel.selected_index)
-                .map(|e| e.name.clone());
+            let selected = panel.entries.get(panel.selected_index).map(|e| {
+                if matches!(panel.mode, PanelMode::Search { .. }) {
+                    if let EntryLocation::Fs(path) = &e.location {
+                        return format!("fs:{}", path.to_string_lossy());
+                    }
+                }
+                e.name.clone()
+            });
             PanelSnapshot {
                 mode: panel.mode.clone(),
                 current_path: panel.current_path.clone(),
