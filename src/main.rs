@@ -41,12 +41,13 @@ use fileman::core::{
     EntryLocation, ImageLocation, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
     SearchMode, SearchProgress, SearchRequest, container_display_path, container_kind_from_path,
     format_size, is_media_name, is_text_name, read_container_directory_with_progress,
-    read_fs_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{
     start_dir_size_worker, start_io_worker, start_preview_worker, start_search_worker,
 };
+mod replay;
+use replay::{ReplayKey, load_replay_case};
 
 const ROW_HEIGHT: f32 = 24.0;
 const SIZE_COL_WIDTH: f32 = 84.0;
@@ -162,7 +163,8 @@ fn blend_color(base: Color, tint: Color, t: f32) -> Color {
 }
 
 fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<egui::ColorImage> {
-    let image = ZuneImage::read(bytes, DecoderOptions::default()).ok()?;
+    let options = DecoderOptions::new_fast();
+    let image = ZuneImage::read(bytes, options).ok()?;
     let orientation = exif_orientation(&image).unwrap_or(1);
     let (width, height) = image.dimensions();
     let colorspace = image.colorspace();
@@ -3580,93 +3582,177 @@ impl ApplicationHandler for App {
     }
 }
 
-fn parse_snapshot_arg() -> Result<Option<PathBuf>> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--snapshot" {
-            return args
-                .next()
-                .map(|value| Ok(Some(PathBuf::from(value))))
-                .unwrap_or_else(|| Err(anyhow::anyhow!("--snapshot requires a path")));
-        }
-    }
-    Ok(None)
+#[derive(Default)]
+struct CliArgs {
+    snapshot: Option<PathBuf>,
+    replay: Option<PathBuf>,
 }
 
-fn run_snapshot(path: &PathBuf) -> Result<()> {
-    let context = unsafe {
-        Context::init(ContextDesc::default())
-            .map_err(|err| anyhow::anyhow!("Failed to init GPU context: {err:?}"))?
-    };
+fn parse_cli_args() -> Result<CliArgs> {
+    let mut args = std::env::args().skip(1);
+    let mut parsed = CliArgs::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--snapshot" => {
+                parsed.snapshot = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| anyhow::anyhow!("--snapshot requires a path"))?,
+                );
+            }
+            "--replay" => {
+                parsed.replay = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| anyhow::anyhow!("--replay requires a path"))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(parsed)
+}
 
-    let size = Extent {
-        width: SNAPSHOT_WIDTH,
-        height: SNAPSHOT_HEIGHT,
-        depth: 1,
+fn parse_modifiers(raw: &[String]) -> egui::Modifiers {
+    let mut mods = egui::Modifiers::NONE;
+    for item in raw {
+        match item.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => mods |= egui::Modifiers::CTRL,
+            "alt" => mods |= egui::Modifiers::ALT,
+            "shift" => mods |= egui::Modifiers::SHIFT,
+            _ => {}
+        }
+    }
+    mods
+}
+
+fn parse_key_name(name: &str) -> Option<egui::Key> {
+    match name.to_ascii_lowercase().as_str() {
+        "enter" => Some(egui::Key::Enter),
+        "tab" => Some(egui::Key::Tab),
+        "escape" | "esc" => Some(egui::Key::Escape),
+        "backspace" => Some(egui::Key::Backspace),
+        "up" => Some(egui::Key::ArrowUp),
+        "down" => Some(egui::Key::ArrowDown),
+        "left" => Some(egui::Key::ArrowLeft),
+        "right" => Some(egui::Key::ArrowRight),
+        "pageup" | "pgup" => Some(egui::Key::PageUp),
+        "pagedown" | "pgdn" => Some(egui::Key::PageDown),
+        "home" => Some(egui::Key::Home),
+        "end" => Some(egui::Key::End),
+        "space" => Some(egui::Key::Space),
+        "f1" => Some(egui::Key::F1),
+        "f2" => Some(egui::Key::F2),
+        "f3" => Some(egui::Key::F3),
+        "f4" => Some(egui::Key::F4),
+        "f5" => Some(egui::Key::F5),
+        "f6" => Some(egui::Key::F6),
+        "f7" => Some(egui::Key::F7),
+        "f8" => Some(egui::Key::F8),
+        "f9" => Some(egui::Key::F9),
+        "f10" => Some(egui::Key::F10),
+        "f11" => Some(egui::Key::F11),
+        "f12" => Some(egui::Key::F12),
+        _ => None,
+    }
+}
+
+fn apply_replay_key(
+    egui_ctx: &egui::Context,
+    app: &mut AppState,
+    ui_cache: &mut UiCache,
+    key: &ReplayKey,
+) {
+    let modifiers = key
+        .modifiers
+        .as_ref()
+        .map(|mods| parse_modifiers(mods))
+        .unwrap_or(egui::Modifiers::NONE);
+
+    let mut events = Vec::new();
+    let key_name = key.key.as_str();
+    if let Some(rest) = key_name.strip_prefix("text:") {
+        events.push(egui::Event::Text(rest.to_string()));
+    } else if key_name.len() == 1 && modifiers == egui::Modifiers::NONE {
+        events.push(egui::Event::Text(key_name.to_string()));
+    } else if let Some(egui_key) = parse_key_name(key_name) {
+        events.push(egui::Event::Key {
+            key: egui_key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+            physical_key: None,
+        });
+        events.push(egui::Event::Key {
+            key: egui_key,
+            pressed: false,
+            repeat: false,
+            modifiers,
+            physical_key: None,
+        });
+    }
+
+    let raw_input = egui::RawInput {
+        events,
+        ..Default::default()
     };
-    let format = TextureFormat::Rgba8Unorm;
-    let surface_info = SurfaceInfo {
-        format,
-        alpha: AlphaMode::PreMultiplied,
-    };
-    let mut painter = GuiPainter::new(surface_info, &context);
-    let mut command_encoder = context.create_command_encoder(CommandEncoderDesc {
-        name: "snapshot",
-        buffer_count: 1,
+    let _ = egui_ctx.run(raw_input, |ctx| {
+        let input = ctx.input(|i| i.clone());
+        handle_keyboard(ctx, &input, app, ui_cache);
     });
+}
 
-    let texture = context.create_texture(TextureDesc {
-        name: "snapshot_target",
-        format,
-        size,
-        array_layer_count: 1,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: blade_graphics::TextureDimension::D2,
-        usage: TextureUsage::TARGET | TextureUsage::COPY,
-        external: None,
-    });
-    let view = context.create_texture_view(
-        texture,
-        TextureViewDesc {
-            name: "snapshot_view",
-            format,
-            dimension: ViewDimension::D2,
-            subresources: &TextureSubresources::default(),
-        },
-    );
+fn drain_async(app: &mut AppState, max_iters: usize) {
+    for _ in 0..max_iters {
+        let changed = pump_async(app);
+        let pending = app.io_in_flight > 0
+            || app.left_panel.browser.loading
+            || app.right_panel.browser.loading
+            || app.left_panel.browser.entries_rx.is_some()
+            || app.right_panel.browser.entries_rx.is_some();
+        if !changed && !pending {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+}
 
-    let cur_dir = std::env::current_dir()?;
-    let entries = read_fs_directory(cur_dir.as_path()).unwrap_or_default();
-
-    let (preview_tx, _preview_req_rx) = mpsc::channel::<PreviewRequest>();
-    let (_preview_res_tx, preview_rx) = mpsc::channel::<(u64, PreviewContent)>();
-    let (io_tx, _io_rx_unused) = mpsc::channel::<fileman::core::IOTask>();
-    let (_io_res_tx, io_rx) = mpsc::channel::<fileman::core::IOResult>();
-    let (io_cancel_tx, _io_cancel_rx) = mpsc::channel::<()>();
-    let (dir_size_tx, _dir_size_req_rx) = mpsc::channel::<PathBuf>();
-    let (_dir_size_res_tx, dir_size_rx) = mpsc::channel::<(PathBuf, u64)>();
-    let (edit_tx, _edit_req_rx) = mpsc::channel::<EditLoadRequest>();
-    let (_edit_res_tx, edit_res_rx) = mpsc::channel::<EditLoadResult>();
-    let (search_tx, _search_req_rx) = mpsc::channel::<SearchRequest>();
-    let (_search_res_tx, search_rx) = mpsc::channel::<SearchEvent>();
-    let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
-    let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
-    let mut image_cache = ImageCache {
-        textures: HashMap::new(),
-        pending: HashSet::new(),
-        order: VecDeque::new(),
+fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
+    let root = match root {
+        Some(root) => root,
+        None => std::env::current_dir().expect("current_dir"),
     };
-    let highlight_cache = HashMap::new();
-    let mut highlight_pending = HashSet::new();
+    let (io_tx, io_rx, io_cancel_tx) = start_io_worker();
+    let (preview_tx, preview_rx) = start_preview_worker();
+    let (dir_size_tx, dir_size_rx) = start_dir_size_worker();
+    let (search_tx, search_rx) = start_search_worker();
+    let (edit_tx, edit_rx) = mpsc::channel::<EditLoadRequest>();
+    let (edit_res_tx, edit_res_rx) = mpsc::channel::<EditLoadResult>();
+
+    thread::spawn(move || {
+        while let Ok(req) = edit_rx.recv() {
+            let text = match std::fs::read(&req.path) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => "Refusing to edit binary file.".to_string(),
+                },
+                Err(e) => format!("Failed to read file: {e}"),
+            };
+            let _ = edit_res_tx.send(EditLoadResult {
+                id: req.id,
+                path: req.path,
+                text,
+            });
+        }
+    });
 
     let mut app = AppState {
         left_panel: PanelState {
             browser: BrowserState {
                 browser_mode: BrowserMode::Fs,
-                current_path: cur_dir.clone(),
+                current_path: root.clone(),
                 selected_index: 0,
-                entries: entries.clone(),
+                entries: Vec::new(),
                 entries_rx: None,
                 prefer_select_name: None,
                 top_index: 0,
@@ -3681,9 +3767,9 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         right_panel: PanelState {
             browser: BrowserState {
                 browser_mode: BrowserMode::Fs,
-                current_path: cur_dir.clone(),
+                current_path: root.clone(),
                 selected_index: 0,
-                entries,
+                entries: Vec::new(),
                 entries_rx: None,
                 prefer_select_name: None,
                 top_index: 0,
@@ -3733,6 +3819,115 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));
+    Ok(app)
+}
+
+fn run_replay(case_path: &PathBuf, snapshot: Option<PathBuf>) -> Result<()> {
+    let case = load_replay_case(case_path)?;
+    let mut app = init_headless_app(Some(case.root.clone()))?;
+    let left_root = case.left.clone().unwrap_or_else(|| case.root.clone());
+    let right_root = case.right.clone().unwrap_or_else(|| case.root.clone());
+    load_fs_directory_async(&mut app, left_root, ActivePanel::Left, None);
+    load_fs_directory_async(&mut app, right_root, ActivePanel::Right, None);
+
+    let mut ui_cache = UiCache {
+        left_rows: 20,
+        right_rows: 20,
+        scroll_mode: ScrollMode::Default,
+        last_left_selected: 0,
+        last_right_selected: 0,
+        last_active_panel: ActivePanel::Left,
+        last_left_dir_token: 0,
+        last_right_dir_token: 0,
+    };
+    let egui_ctx = egui::Context::default();
+
+    for key in case.keys {
+        apply_replay_key(&egui_ctx, &mut app, &mut ui_cache, &key);
+        drain_async(&mut app, 50);
+    }
+
+    if let Some(path) = snapshot {
+        render_snapshot(&mut app, &mut ui_cache, &path)?;
+    }
+    Ok(())
+}
+
+fn render_snapshot(app: &mut AppState, ui_cache: &mut UiCache, path: &PathBuf) -> Result<()> {
+    let context = unsafe {
+        Context::init(ContextDesc::default())
+            .map_err(|err| anyhow::anyhow!("Failed to init GPU context: {err:?}"))?
+    };
+
+    let size = Extent {
+        width: SNAPSHOT_WIDTH,
+        height: SNAPSHOT_HEIGHT,
+        depth: 1,
+    };
+    let format = TextureFormat::Rgba8Unorm;
+    let surface_info = SurfaceInfo {
+        format,
+        alpha: AlphaMode::PreMultiplied,
+    };
+    let mut painter = GuiPainter::new(surface_info, &context);
+    let mut command_encoder = context.create_command_encoder(CommandEncoderDesc {
+        name: "snapshot",
+        buffer_count: 1,
+    });
+
+    let texture = context.create_texture(TextureDesc {
+        name: "snapshot_target",
+        format,
+        size,
+        array_layer_count: 1,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: blade_graphics::TextureDimension::D2,
+        usage: TextureUsage::TARGET | TextureUsage::COPY,
+        external: None,
+    });
+    let view = context.create_texture_view(
+        texture,
+        TextureViewDesc {
+            name: "snapshot_view",
+            format,
+            dimension: ViewDimension::D2,
+            subresources: &TextureSubresources::default(),
+        },
+    );
+
+    let (preview_tx, _preview_req_rx) = mpsc::channel::<PreviewRequest>();
+    let (_preview_res_tx, preview_rx) = mpsc::channel::<(u64, PreviewContent)>();
+    let (io_tx, _io_rx_unused) = mpsc::channel::<fileman::core::IOTask>();
+    let (_io_res_tx, io_rx) = mpsc::channel::<fileman::core::IOResult>();
+    let (io_cancel_tx, _io_cancel_rx) = mpsc::channel::<()>();
+    let (dir_size_tx, _dir_size_req_rx) = mpsc::channel::<PathBuf>();
+    let (_dir_size_res_tx, dir_size_rx) = mpsc::channel::<(PathBuf, u64)>();
+    let (edit_tx, _edit_req_rx) = mpsc::channel::<EditLoadRequest>();
+    let (_edit_res_tx, edit_res_rx) = mpsc::channel::<EditLoadResult>();
+    let (search_tx, _search_req_rx) = mpsc::channel::<SearchRequest>();
+    let (_search_res_tx, search_rx) = mpsc::channel::<SearchEvent>();
+    let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
+    let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
+    let mut image_cache = ImageCache {
+        textures: HashMap::new(),
+        pending: HashSet::new(),
+        order: VecDeque::new(),
+    };
+    let highlight_cache = HashMap::new();
+    let mut highlight_pending = HashSet::new();
+
+    app.preview_tx = preview_tx;
+    app.preview_rx = preview_rx;
+    app.io_tx = io_tx;
+    app.io_rx = io_rx;
+    app.io_cancel_tx = io_cancel_tx;
+    app.dir_size_tx = dir_size_tx;
+    app.dir_size_rx = dir_size_rx;
+    app.edit_tx = edit_tx;
+    app.edit_rx = edit_res_rx;
+    app.search_tx = search_tx;
+    app.search_rx = search_rx;
 
     let egui_ctx = egui::Context::default();
     let raw_input = egui::RawInput {
@@ -3757,16 +3952,6 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     let output = egui_ctx.run(raw_input, |ctx| {
         apply_theme(ctx, &app.theme.colors());
         draw_command_bar(ctx, &app.theme.colors());
-        let _ui_cache = UiCache {
-            left_rows: 10,
-            right_rows: 10,
-            scroll_mode: ScrollMode::Default,
-            last_left_selected: 0,
-            last_right_selected: 0,
-            last_active_panel: ActivePanel::Left,
-            last_left_dir_token: 0,
-            last_right_dir_token: 0,
-        };
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
             let spacing_x = ui.spacing().item_spacing.x;
@@ -3779,7 +3964,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             );
 
             ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                if should_show_editor(&app, ActivePanel::Left) {
+                if should_show_editor(app, ActivePanel::Left) {
                     let is_focused = app.active_panel == ActivePanel::Left;
                     let theme = app.theme.clone();
                     let panel = app.panel_mut(ActivePanel::Left);
@@ -3797,7 +3982,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                             },
                         );
                     }
-                } else if should_show_preview(&app, ActivePanel::Left) {
+                } else if should_show_preview(app, ActivePanel::Left) {
                     let is_focused = app.active_panel == ActivePanel::Left;
                     let theme = app.theme.clone();
                     let panel = app.panel_mut(ActivePanel::Left);
@@ -3820,17 +4005,17 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                 } else {
                     draw_panel(
                         ui,
-                        &mut app,
+                        app,
                         ActivePanel::Left,
                         &mut image_cache,
                         &image_req_tx,
-                        ScrollMode::Default,
+                        ui_cache.scroll_mode,
                         rect.height(),
                     );
                 }
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                if should_show_editor(&app, ActivePanel::Right) {
+                if should_show_editor(app, ActivePanel::Right) {
                     let is_focused = app.active_panel == ActivePanel::Right;
                     let theme = app.theme.clone();
                     let panel = app.panel_mut(ActivePanel::Right);
@@ -3848,7 +4033,7 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                             },
                         );
                     }
-                } else if should_show_preview(&app, ActivePanel::Right) {
+                } else if should_show_preview(app, ActivePanel::Right) {
                     let is_focused = app.active_panel == ActivePanel::Right;
                     let theme = app.theme.clone();
                     let panel = app.panel_mut(ActivePanel::Right);
@@ -3871,11 +4056,11 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                 } else {
                     draw_panel(
                         ui,
-                        &mut app,
+                        app,
                         ActivePanel::Right,
                         &mut image_cache,
                         &image_req_tx,
-                        ScrollMode::Default,
+                        ui_cache.scroll_mode,
                         rect.height(),
                     );
                 }
@@ -3890,15 +4075,15 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             );
         });
         if app.pending_op.is_some() {
-            draw_confirmation(ctx, &mut app);
+            draw_confirmation(ctx, app);
         }
         if let Some(edit) = app.edit_panel_mut()
             && edit.confirm_discard
         {
-            draw_discard_modal(ctx, &mut app);
+            draw_discard_modal(ctx, app);
         }
         if app.io_in_flight > 0 {
-            draw_progress_modal(ctx, &app);
+            draw_progress_modal(ctx, app);
         }
     });
 
@@ -3969,6 +4154,25 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn run_snapshot(path: &PathBuf) -> Result<()> {
+    let mut app = init_headless_app(None)?;
+    let mut ui_cache = UiCache {
+        left_rows: 10,
+        right_rows: 10,
+        scroll_mode: ScrollMode::Default,
+        last_left_selected: 0,
+        last_right_selected: 0,
+        last_active_panel: ActivePanel::Left,
+        last_left_dir_token: 0,
+        last_right_dir_token: 0,
+    };
+    let cur_dir = std::env::current_dir()?;
+    load_fs_directory_async(&mut app, cur_dir.clone(), ActivePanel::Left, None);
+    load_fs_directory_async(&mut app, cur_dir, ActivePanel::Right, None);
+    drain_async(&mut app, 50);
+    render_snapshot(&mut app, &mut ui_cache, path)
+}
+
 fn align_to(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
@@ -4002,7 +4206,11 @@ fn main() -> Result<()> {
         .filter_module("egui_winit", log::LevelFilter::Warn)
         .init();
 
-    if let Some(snapshot_path) = parse_snapshot_arg()? {
+    let args = parse_cli_args()?;
+    if let Some(replay_path) = args.replay.as_ref() {
+        return run_replay(replay_path, args.snapshot);
+    }
+    if let Some(snapshot_path) = args.snapshot {
         return run_snapshot(&snapshot_path);
     }
 
