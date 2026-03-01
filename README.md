@@ -8,6 +8,18 @@ Fileman is a fast, responsive two-panel file manager built with egui via blade-e
 - Optional previews for text and images.
 - External themes in `themes/` (JSON, YAML, or TOML).
 
+## Features (Current)
+- Two-panel file browser with independent navigation and history (Alt+Left/Right).
+- Async directory listing with streaming batches.
+- Search (Alt+F7) with results as a virtual folder.
+- Preview mode (F3) for text and images, including archives.
+- Inline editor (F4) with syntax highlighting for text files.
+- Copy/Move/Delete operations with confirmation dialogs (F5/F6/F8).
+- Rename (Shift+F6) and directory size calculation (Space).
+- Archive navigation for zip, tar.gz, tar.bz2 (copy out supported).
+- Snapshot rendering via `--snapshot` for CI.
+- Replay runner for tests via `--replay` (RON format).
+
 ## Screenshot
 ![Fileman screenshot](etc/snapshots/linux.png)
 
@@ -32,4 +44,5 @@ RUSTFLAGS="--cfg gles" cargo run
 
 ## Repository Layout
 - `src/main.rs` contains the egui app entry point.
+- `src/replay.rs` contains test replay case parsing.
 - `themes/` stores theme files.
