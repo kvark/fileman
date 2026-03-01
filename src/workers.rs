@@ -104,6 +104,11 @@ pub fn start_io_worker() -> (
                         eprintln!("Rename error: {e}");
                     }
                 }
+                IOTask::WriteFile { path, contents } => {
+                    if let Err(e) = std::fs::write(&path, contents) {
+                        eprintln!("Write error: {e}");
+                    }
+                }
             }
             let _ = result_tx.send(IOResult::Completed);
         }
