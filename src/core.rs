@@ -139,7 +139,7 @@ pub enum ActivePanel {
 }
 
 #[derive(Clone)]
-pub enum PanelMode {
+pub enum BrowserMode {
     Fs,
     Container {
         kind: ContainerKind,
@@ -213,10 +213,25 @@ pub enum IOTask {
         src: path::PathBuf,
         new_name: String,
     },
+    WriteFile {
+        path: path::PathBuf,
+        contents: Vec<u8>,
+    },
 }
 
 pub enum IOResult {
     Completed,
+}
+
+pub struct EditLoadRequest {
+    pub id: u64,
+    pub path: path::PathBuf,
+}
+
+pub struct EditLoadResult {
+    pub id: u64,
+    pub path: path::PathBuf,
+    pub text: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

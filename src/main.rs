@@ -32,12 +32,16 @@ use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
 use zune_image::codecs::ImageFormat;
 use zune_image::image::Image as ZuneImage;
 
-use fileman::app_state::{AppState, PanelState, PendingOp, SearchStatus, SearchUiState};
+use fileman::app_state::{
+    AppState, BrowserState, EditState, PanelMode, PanelState, PendingOp, PreviewState,
+    SearchStatus, SearchUiState,
+};
 use fileman::core::{
-    ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, ImageLocation, PanelMode,
-    PreviewContent, PreviewRequest, SearchCase, SearchEvent, SearchMode, SearchProgress,
-    SearchRequest, container_display_path, container_kind_from_path, format_size, is_media_name,
-    is_text_name, read_container_directory_with_progress, read_fs_directory,
+    ActivePanel, BrowserMode, ContainerKind, DirBatch, DirEntry, EditLoadRequest, EditLoadResult,
+    EntryLocation, ImageLocation, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
+    SearchMode, SearchProgress, SearchRequest, container_display_path, container_kind_from_path,
+    format_size, is_media_name, is_text_name, read_container_directory_with_progress,
+    read_fs_directory,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{
@@ -71,11 +75,19 @@ enum ScrollMode {
 
 impl UiCache {
     fn update_scroll_mode(&mut self, app: &AppState) {
-        let left_selected = app.left_panel.selected_index;
-        let right_selected = app.right_panel.selected_index;
+        let left_selected = AppState::browser(&app.left_panel)
+            .map(|b| b.selected_index)
+            .unwrap_or(0);
+        let right_selected = AppState::browser(&app.right_panel)
+            .map(|b| b.selected_index)
+            .unwrap_or(0);
         let active = app.active_panel.clone();
-        let left_dir = app.left_panel.dir_token;
-        let right_dir = app.right_panel.dir_token;
+        let left_dir = AppState::browser(&app.left_panel)
+            .map(|b| b.dir_token)
+            .unwrap_or(0);
+        let right_dir = AppState::browser(&app.right_panel)
+            .map(|b| b.dir_token)
+            .unwrap_or(0);
         let selection_changed = left_selected != self.last_left_selected
             || right_selected != self.last_right_selected
             || active != self.last_active_panel
@@ -521,14 +533,17 @@ On Linux in CI or headless environments, Vulkan is often unavailable."
 }
 
 fn panel_path_display(panel: &PanelState) -> String {
-    match &panel.mode {
-        PanelMode::Fs => panel.current_path.to_string_lossy().into_owned(),
-        PanelMode::Container {
+    let Some(browser) = AppState::browser(panel) else {
+        return String::new();
+    };
+    match &browser.browser_mode {
+        BrowserMode::Fs => browser.current_path.to_string_lossy().into_owned(),
+        BrowserMode::Container {
             kind,
             archive_path,
             cwd,
         } => container_display_path(*kind, archive_path, cwd),
-        PanelMode::Search {
+        BrowserMode::Search {
             root,
             query,
             mode,
@@ -550,53 +565,53 @@ fn panel_path_display(panel: &PanelState) -> String {
     }
 }
 
-fn apply_dir_batch(panel: &mut PanelState, batch: DirBatch) {
-    let prior_selection = panel
+fn apply_dir_batch(browser: &mut BrowserState, batch: DirBatch) {
+    let prior_selection = browser
         .entries
-        .get(panel.selected_index)
+        .get(browser.selected_index)
         .map(|e| e.name.clone());
 
     match batch {
         DirBatch::Loading => {
-            panel.loading = true;
-            panel.loading_progress = None;
+            browser.loading = true;
+            browser.loading_progress = None;
             return;
         }
         DirBatch::Error(message) => {
-            panel.entries = vec![DirEntry {
+            browser.entries = vec![DirEntry {
                 name: message,
                 is_dir: false,
-                location: EntryLocation::Fs(panel.current_path.clone()),
+                location: EntryLocation::Fs(browser.current_path.clone()),
                 size: None,
             }];
-            panel.selected_index = 0;
-            panel.top_index = 0;
-            panel.loading = false;
-            panel.loading_progress = None;
+            browser.selected_index = 0;
+            browser.top_index = 0;
+            browser.loading = false;
+            browser.loading_progress = None;
             return;
         }
         DirBatch::Progress { loaded, total } => {
-            panel.loading_progress = Some((loaded, total));
-            panel.loading = total.map(|t| loaded < t).unwrap_or(true);
+            browser.loading_progress = Some((loaded, total));
+            browser.loading = total.map(|t| loaded < t).unwrap_or(true);
             return;
         }
         DirBatch::Append(mut new_entries) => {
-            panel.entries.append(&mut new_entries);
-            panel.loading = false;
+            browser.entries.append(&mut new_entries);
+            browser.loading = false;
         }
         DirBatch::Replace(new_entries) => {
-            panel.entries = new_entries;
-            panel.selected_index = 0;
-            panel.top_index = 0;
-            panel.loading = false;
+            browser.entries = new_entries;
+            browser.selected_index = 0;
+            browser.top_index = 0;
+            browser.loading = false;
         }
     }
 
-    let restore_name = panel.prefer_select_name.take().or(prior_selection);
+    let restore_name = browser.prefer_select_name.take().or(prior_selection);
     if let Some(pref) = restore_name
-        && let Some(idx) = panel.entries.iter().position(|e| e.name == pref)
+        && let Some(idx) = browser.entries.iter().position(|e| e.name == pref)
     {
-        panel.selected_index = idx;
+        browser.selected_index = idx;
     }
 }
 
@@ -604,17 +619,20 @@ fn pump_async(app: &mut AppState) -> bool {
     let mut changed = false;
     for side in [ActivePanel::Left, ActivePanel::Right] {
         let panel = app.panel_mut(side.clone());
-        if let Some(rx) = panel.entries_rx.take() {
+        let Some(browser) = AppState::browser_mut(panel) else {
+            continue;
+        };
+        if let Some(rx) = browser.entries_rx.take() {
             let mut handled = 0usize;
             while handled < 8 {
                 match rx.try_recv() {
                     Ok(batch) => {
-                        apply_dir_batch(panel, batch);
+                        apply_dir_batch(browser, batch);
                         handled += 1;
                         changed = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        panel.entries_rx = Some(rx);
+                        browser.entries_rx = Some(rx);
                         break;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => break,
@@ -625,9 +643,11 @@ fn pump_async(app: &mut AppState) -> bool {
 
     match app.preview_rx.try_recv() {
         Ok((id, content)) => {
-            if id == app.preview_request_id {
-                app.preview = Some(content);
-                changed = true;
+            if let Some(preview) = app.preview_panel_mut() {
+                if id == preview.request_id {
+                    preview.content = Some(content);
+                    changed = true;
+                }
             }
         }
         Err(mpsc::TryRecvError::Empty) => {}
@@ -639,17 +659,35 @@ fn pump_async(app: &mut AppState) -> bool {
         app.dir_sizes.insert(path.clone(), size);
         for side in [ActivePanel::Left, ActivePanel::Right] {
             let panel = app.panel_mut(side.clone());
-            for entry in &mut panel.entries {
-                if entry.is_dir {
-                    if let EntryLocation::Fs(p) = &entry.location {
-                        if *p == path {
-                            entry.size = Some(size);
+            if let Some(browser) = AppState::browser_mut(panel) {
+                for entry in &mut browser.entries {
+                    if entry.is_dir {
+                        if let EntryLocation::Fs(p) = &entry.location {
+                            if *p == path {
+                                entry.size = Some(size);
+                            }
                         }
                     }
                 }
             }
         }
         changed = true;
+    }
+
+    while let Ok(result) = app.edit_rx.try_recv() {
+        if let Some(edit) = app.edit_panel_mut() {
+            if result.id == edit.request_id {
+                edit.loading = false;
+                edit.text = result.text;
+                edit.highlight_hash = hash_text(&edit.text);
+                edit.highlight_wrap_width = 0.0;
+                edit.highlight_key = Some(format!("edit:{}", result.path.to_string_lossy()));
+                edit.highlight_dirty_at = None;
+                edit.dirty = false;
+                edit.confirm_discard = false;
+                changed = true;
+            }
+        }
     }
 
     while let Ok(event) = app.search_rx.try_recv() {
@@ -672,8 +710,11 @@ fn pump_async(app: &mut AppState) -> bool {
                         SearchStatus::Idle => None,
                     };
                     let panel = app.get_active_panel_mut();
-                    let display_name = match &panel.mode {
-                        PanelMode::Search { root, .. } => result
+                    let Some(browser) = AppState::browser_mut(panel) else {
+                        continue;
+                    };
+                    let display_name = match &browser.browser_mode {
+                        BrowserMode::Search { root, .. } => result
                             .path
                             .strip_prefix(root)
                             .ok()
@@ -694,14 +735,14 @@ fn pump_async(app: &mut AppState) -> bool {
                             .unwrap_or("<unknown>")
                             .to_string(),
                     };
-                    panel.entries.push(DirEntry {
+                    browser.entries.push(DirEntry {
                         name: display_name,
                         is_dir: result.is_dir,
                         location: EntryLocation::Fs(result.path),
                         size: result.size,
                     });
                     if let Some(progress) = progress_for_panel {
-                        panel.loading_progress = Some(progress);
+                        browser.loading_progress = Some(progress);
                     }
                     changed = true;
                 }
@@ -710,7 +751,9 @@ fn pump_async(app: &mut AppState) -> bool {
                 if id == app.search_request_id {
                     app.search_status = SearchStatus::Running(progress);
                     let panel = app.get_active_panel_mut();
-                    panel.loading_progress = Some((progress.matched, Some(progress.scanned)));
+                    if let Some(browser) = AppState::browser_mut(panel) {
+                        browser.loading_progress = Some((progress.matched, Some(progress.scanned)));
+                    }
                     changed = true;
                 }
             }
@@ -718,8 +761,10 @@ fn pump_async(app: &mut AppState) -> bool {
                 if id == app.search_request_id {
                     app.search_status = SearchStatus::Done(progress);
                     let panel = app.get_active_panel_mut();
-                    panel.loading = false;
-                    panel.loading_progress = Some((progress.matched, Some(progress.scanned)));
+                    if let Some(browser) = AppState::browser_mut(panel) {
+                        browser.loading = false;
+                        browser.loading_progress = Some((progress.matched, Some(progress.scanned)));
+                    }
                     changed = true;
                 }
             }
@@ -731,7 +776,9 @@ fn pump_async(app: &mut AppState) -> bool {
                         matched: 0,
                     });
                     let panel = app.get_active_panel_mut();
-                    panel.loading = false;
+                    if let Some(browser) = AppState::browser_mut(panel) {
+                        browser.loading = false;
+                    }
                     changed = true;
                 }
             }
@@ -893,17 +940,20 @@ fn load_fs_directory_async(
         .clone()
         .or_else(|| app.fs_last_selected_name.get(&path).cloned());
     let panel_state = app.panel_mut(target_panel);
+    let Some(browser) = AppState::browser_mut(panel_state) else {
+        return;
+    };
     let initial_loading = initial.is_empty() || has_parent_entry;
-    panel_state.current_path = path.clone();
-    panel_state.mode = PanelMode::Fs;
-    panel_state.entries = initial;
-    panel_state.selected_index = 0;
-    panel_state.top_index = 0;
-    panel_state.dir_token = panel_state.dir_token.wrapping_add(1);
-    panel_state.entries_rx = Some(rx);
-    panel_state.prefer_select_name = remembered;
-    panel_state.loading = initial_loading;
-    panel_state.loading_progress = None;
+    browser.current_path = path.clone();
+    browser.browser_mode = BrowserMode::Fs;
+    browser.entries = initial;
+    browser.selected_index = 0;
+    browser.top_index = 0;
+    browser.dir_token = browser.dir_token.wrapping_add(1);
+    browser.entries_rx = Some(rx);
+    browser.prefer_select_name = remembered;
+    browser.loading = initial_loading;
+    browser.loading_progress = None;
 }
 
 fn load_container_directory_async(
@@ -1216,22 +1266,25 @@ fn load_container_directory_async(
             .cloned()
     });
     let panel_state = app.panel_mut(target_panel);
+    let Some(browser) = AppState::browser_mut(panel_state) else {
+        return;
+    };
     let initial_loading = true;
 
-    panel_state.current_path = archive_path.clone();
-    panel_state.mode = PanelMode::Container {
+    browser.current_path = archive_path.clone();
+    browser.browser_mode = BrowserMode::Container {
         kind,
         archive_path: archive_path.clone(),
         cwd: cwd.clone(),
     };
-    panel_state.entries = initial;
-    panel_state.selected_index = 0;
-    panel_state.top_index = 0;
-    panel_state.dir_token = panel_state.dir_token.wrapping_add(1);
-    panel_state.entries_rx = Some(rx);
-    panel_state.prefer_select_name = remembered;
-    panel_state.loading = initial_loading;
-    panel_state.loading_progress = None;
+    browser.entries = initial;
+    browser.selected_index = 0;
+    browser.top_index = 0;
+    browser.dir_token = browser.dir_token.wrapping_add(1);
+    browser.entries_rx = Some(rx);
+    browser.prefer_select_name = remembered;
+    browser.loading = initial_loading;
+    browser.loading_progress = None;
 }
 
 fn open_selected(app: &mut AppState) {
@@ -1241,25 +1294,26 @@ fn open_selected(app: &mut AppState) {
 }
 
 fn should_show_preview(app: &AppState, panel_side: ActivePanel) -> bool {
-    if app.preview.is_none() {
-        return false;
-    }
-    match app.active_panel {
-        ActivePanel::Left => panel_side == ActivePanel::Right,
-        ActivePanel::Right => panel_side == ActivePanel::Left,
-    }
+    matches!(app.panel(panel_side).mode, PanelMode::Preview(_))
+}
+
+fn should_show_editor(app: &AppState, panel_side: ActivePanel) -> bool {
+    matches!(app.panel(panel_side).mode, PanelMode::Edit(_))
 }
 
 fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: ActivePanel) {
     let (selected_entry, current_path, container_cwd) = {
         let panel = app.panel(source.clone());
-        if panel.entries.is_empty() {
+        let Some(browser) = AppState::browser(panel) else {
+            return;
+        };
+        if browser.entries.is_empty() {
             return;
         }
-        let entry = panel.entries[panel.selected_index].clone();
-        let current_path = panel.current_path.clone();
-        let container_cwd = match &panel.mode {
-            PanelMode::Container { cwd, .. } => Some(cwd.clone()),
+        let entry = browser.entries[browser.selected_index].clone();
+        let current_path = browser.current_path.clone();
+        let container_cwd = match &browser.browser_mode {
+            BrowserMode::Container { cwd, .. } => Some(cwd.clone()),
             _ => None,
         };
         (entry, current_path, container_cwd)
@@ -1338,11 +1392,13 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
         app.dir_sizes.insert(path.clone(), size);
         for side in [ActivePanel::Left, ActivePanel::Right] {
             let panel = app.panel_mut(side.clone());
-            for entry in &mut panel.entries {
-                if entry.is_dir {
-                    if let EntryLocation::Fs(p) = &entry.location {
-                        if *p == path {
-                            entry.size = Some(size);
+            if let Some(browser) = AppState::browser_mut(panel) {
+                for entry in &mut browser.entries {
+                    if entry.is_dir {
+                        if let EntryLocation::Fs(p) = &entry.location {
+                            if *p == path {
+                                entry.size = Some(size);
+                            }
                         }
                     }
                 }
@@ -1373,25 +1429,28 @@ fn open_search(app: &mut AppState, mode: SearchMode) {
 }
 
 fn preview_find_next(app: &mut AppState) {
-    let Some(PreviewContent::Text(text)) = app.preview.as_ref() else {
+    let Some(preview) = app.preview_panel_mut() else {
         return;
     };
-    let query = app.preview_find_query.trim();
+    let Some(PreviewContent::Text(text)) = preview.content.as_ref() else {
+        return;
+    };
+    let query = preview.find_query.trim();
     if query.is_empty() {
         return;
     }
     let lower_text = text.to_ascii_lowercase();
     let lower_query = query.to_ascii_lowercase();
-    let start = app.preview_find_index.min(lower_text.len());
+    let start = preview.find_index.min(lower_text.len());
     let mut found = lower_text[start..].find(&lower_query).map(|i| i + start);
     if found.is_none() && start > 0 {
         found = lower_text.find(&lower_query);
     }
     if let Some(idx) = found {
-        app.preview_find_index = idx + lower_query.len();
+        preview.find_index = idx + lower_query.len();
         let line = text[..idx].bytes().filter(|b| *b == b'\n').count();
-        let line_height = app.preview_line_height.max(14.0);
-        app.preview_scroll = line as f32 * line_height;
+        let line_height = preview.line_height.max(14.0);
+        preview.scroll = line as f32 * line_height;
     }
 }
 
@@ -1401,10 +1460,10 @@ fn apply_panel_snapshot(
     snapshot: fileman::app_state::PanelSnapshot,
 ) {
     match snapshot.mode {
-        PanelMode::Fs => {
+        BrowserMode::Fs => {
             load_fs_directory_async(app, snapshot.current_path, which, snapshot.selected_name);
         }
-        PanelMode::Container {
+        BrowserMode::Container {
             kind,
             archive_path,
             cwd,
@@ -1418,15 +1477,18 @@ fn apply_panel_snapshot(
                 snapshot.selected_name,
             );
         }
-        PanelMode::Search { .. } => {
+        BrowserMode::Search { .. } => {
             let results = app.search_results.clone();
             let panel = app.panel_mut(which);
-            panel.mode = snapshot.mode;
-            panel.current_path = snapshot.current_path;
-            panel.entries.clear();
-            panel.entries.extend(results.iter().map(|result| {
-                let display_name = match &panel.mode {
-                    PanelMode::Search { root, .. } => result
+            let Some(browser) = AppState::browser_mut(panel) else {
+                return;
+            };
+            browser.browser_mode = snapshot.mode;
+            browser.current_path = snapshot.current_path;
+            browser.entries.clear();
+            browser.entries.extend(results.iter().map(|result| {
+                let display_name = match &browser.browser_mode {
+                    BrowserMode::Search { root, .. } => result
                         .path
                         .strip_prefix(root)
                         .ok()
@@ -1454,12 +1516,12 @@ fn apply_panel_snapshot(
                     size: result.size,
                 }
             }));
-            panel.entries_rx = None;
-            panel.selected_index = snapshot
+            browser.entries_rx = None;
+            browser.selected_index = snapshot
                 .selected_name
                 .and_then(|name| {
                     if let Some(path) = name.strip_prefix("fs:") {
-                        return panel.entries.iter().position(|e| {
+                        return browser.entries.iter().position(|e| {
                             if let EntryLocation::Fs(p) = &e.location {
                                 p.to_string_lossy() == path
                             } else {
@@ -1467,13 +1529,13 @@ fn apply_panel_snapshot(
                             }
                         });
                     }
-                    panel.entries.iter().position(|e| e.name == name)
+                    browser.entries.iter().position(|e| e.name == name)
                 })
                 .unwrap_or(0);
-            panel.top_index = 0;
-            panel.loading = false;
-            panel.loading_progress = None;
-            panel.dir_token = panel.dir_token.wrapping_add(1);
+            browser.top_index = 0;
+            browser.loading = false;
+            browser.loading_progress = None;
+            browser.dir_token = browser.dir_token.wrapping_add(1);
         }
     }
 }
@@ -1498,24 +1560,32 @@ fn start_search(app: &mut AppState) {
         scanned: 0,
         matched: 0,
     });
-    let root = app.get_active_panel().current_path.clone();
+    let root = {
+        let panel = app.get_active_panel();
+        let Some(browser) = AppState::browser(panel) else {
+            return;
+        };
+        browser.current_path.clone()
+    };
     {
         app.push_history(app.active_panel.clone());
         let panel = app.get_active_panel_mut();
-        panel.current_path = root.clone();
-        panel.mode = PanelMode::Search {
+        let browser = &mut panel.browser;
+        browser.current_path = root.clone();
+        browser.browser_mode = BrowserMode::Search {
             root: root.clone(),
             query: needle.clone(),
             mode: search_mode,
             case: search_case,
         };
-        panel.entries.clear();
-        panel.entries_rx = None;
-        panel.selected_index = 0;
-        panel.top_index = 0;
-        panel.loading = true;
-        panel.loading_progress = Some((0, None));
-        panel.dir_token = panel.dir_token.wrapping_add(1);
+        browser.entries.clear();
+        browser.entries_rx = None;
+        browser.selected_index = 0;
+        browser.top_index = 0;
+        browser.loading = true;
+        browser.loading_progress = Some((0, None));
+        browser.dir_token = browser.dir_token.wrapping_add(1);
+        panel.mode = PanelMode::Browser;
     }
     let _ = app.search_tx.send(SearchRequest {
         id,
@@ -1532,6 +1602,7 @@ fn handle_keyboard(
     app: &mut AppState,
     cache: &mut UiCache,
 ) {
+    let io_tx = app.io_tx.clone();
     if app.io_in_flight > 0 && input.key_pressed(egui::Key::Escape) {
         app.request_io_cancel();
         ctx.request_repaint();
@@ -1545,6 +1616,71 @@ fn handle_keyboard(
             app.clear_pending_op();
         }
         ctx.request_repaint();
+        return;
+    }
+    if let PanelMode::Edit(edit) = &mut app.panel_mut(app.active_panel.clone()).mode {
+        let enter = input.key_pressed(egui::Key::Enter);
+        let escape = input.key_pressed(egui::Key::Escape);
+        let ctrl_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
+        let mut refresh_after = false;
+        let mut save_payload: Option<(PathBuf, Vec<u8>)> = None;
+        let mut close_editor = false;
+        if edit.confirm_discard {
+            if enter {
+                close_editor = true;
+            } else if escape {
+                edit.confirm_discard = false;
+            }
+            ctx.request_repaint();
+            if close_editor {
+                let return_focus = edit.return_focus.clone();
+                let panel = app.panel_mut(app.active_panel.clone());
+                panel.mode = PanelMode::Browser;
+                app.active_panel = return_focus;
+            }
+            return;
+        }
+        if !input.events.is_empty() {
+            ctx.request_repaint();
+        }
+        if ctrl_s {
+            if let Some(path) = edit.path.clone() {
+                save_payload = Some((path, edit.text.as_bytes().to_vec()));
+                edit.dirty = false;
+                edit.confirm_discard = false;
+                refresh_after = true;
+                close_editor = true;
+            }
+            ctx.request_repaint();
+            if let Some((path, contents)) = save_payload {
+                let _ = io_tx.send(fileman::core::IOTask::WriteFile { path, contents });
+            }
+            if close_editor {
+                let return_focus = edit.return_focus.clone();
+                let panel = app.panel_mut(app.active_panel.clone());
+                panel.mode = PanelMode::Browser;
+                app.active_panel = return_focus;
+            }
+            if refresh_after {
+                refresh_active_panel(app);
+            }
+            return;
+        }
+        if escape {
+            if edit.dirty {
+                edit.confirm_discard = true;
+            } else {
+                close_editor = true;
+            }
+            ctx.request_repaint();
+            if close_editor {
+                let return_focus = edit.return_focus.clone();
+                let panel = app.panel_mut(app.active_panel.clone());
+                panel.mode = PanelMode::Browser;
+                app.active_panel = return_focus;
+            }
+            return;
+        }
         return;
     }
     if app.search_ui == SearchUiState::Open {
@@ -1564,17 +1700,7 @@ fn handle_keyboard(
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
     let ctrl_tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
     if tab_pressed || ctrl_tab_pressed {
-        if app.preview.is_some() {
-            app.preview_focus = !app.preview_focus;
-            if app.preview_focus {
-                app.preview_find_open = false;
-            }
-        } else {
-            app.switch_panel();
-            if app.preview.is_some() {
-                app.update_preview_for_current_selection();
-            }
-        }
+        app.switch_panel();
         ctx.request_repaint();
     }
     let ctrl_pgup = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
@@ -1595,13 +1721,18 @@ fn handle_keyboard(
     if space {
         let target_path = {
             let panel = app.get_active_panel();
-            panel.entries.get(panel.selected_index).and_then(|entry| {
-                if entry.is_dir {
-                    if let EntryLocation::Fs(path) = &entry.location {
-                        return Some(path.clone());
-                    }
-                }
-                None
+            AppState::browser(panel).and_then(|browser| {
+                browser
+                    .entries
+                    .get(browser.selected_index)
+                    .and_then(|entry| {
+                        if entry.is_dir {
+                            if let EntryLocation::Fs(path) = &entry.location {
+                                return Some(path.clone());
+                            }
+                        }
+                        None
+                    })
             })
         };
         if let Some(path) = target_path {
@@ -1642,19 +1773,20 @@ fn handle_keyboard(
     }
     if input.key_pressed(egui::Key::Enter) {
         if app.search_ui == SearchUiState::Open {
-            if matches!(app.get_active_panel().mode, PanelMode::Search { .. }) {
+            if AppState::browser(app.get_active_panel())
+                .is_some_and(|browser| matches!(browser.browser_mode, BrowserMode::Search { .. }))
+            {
                 // Open selected result.
             } else {
                 start_search(app);
             }
         }
-        if matches!(app.get_active_panel().mode, PanelMode::Search { .. }) {
+        if AppState::browser(app.get_active_panel())
+            .is_some_and(|browser| matches!(browser.browser_mode, BrowserMode::Search { .. }))
+        {
             app.push_history(app.active_panel.clone());
-            let entry = app
-                .get_active_panel()
-                .entries
-                .get(app.get_active_panel().selected_index)
-                .cloned();
+            let entry = AppState::browser(app.get_active_panel())
+                .and_then(|browser| browser.entries.get(browser.selected_index).cloned());
             if let Some(entry) = entry {
                 if let EntryLocation::Fs(path) = entry.location {
                     if entry.is_dir {
@@ -1680,37 +1812,37 @@ fn handle_keyboard(
             open_selected(app);
         }
     }
-    if app.preview_focus {
-        let line = app.preview_line_height.max(16.0);
-        let page = app.preview_page_height.max(200.0);
+    if let PanelMode::Preview(preview) = &mut app.panel_mut(app.active_panel.clone()).mode {
+        let line = preview.line_height.max(16.0);
+        let page = preview.page_height.max(200.0);
         let mut consumed = false;
-        let can_scroll = app.preview_can_scroll;
+        let can_scroll = preview.can_scroll;
         if can_scroll && input.key_pressed(egui::Key::ArrowDown) {
-            app.preview_scroll += line;
+            preview.scroll += line;
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::ArrowUp) {
-            app.preview_scroll = (app.preview_scroll - line).max(0.0);
+            preview.scroll = (preview.scroll - line).max(0.0);
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::PageDown) {
-            app.preview_scroll += page;
+            preview.scroll += page;
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::PageUp) {
-            app.preview_scroll = (app.preview_scroll - page).max(0.0);
+            preview.scroll = (preview.scroll - page).max(0.0);
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::Home) {
-            app.preview_scroll = 0.0;
+            preview.scroll = 0.0;
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::End) {
-            app.preview_scroll = app.preview_scroll + page * 10.0;
+            preview.scroll = preview.scroll + page * 10.0;
             consumed = true;
         }
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        if enter && app.preview_find_open {
+        if enter && preview.find_open {
             preview_find_next(app);
             consumed = true;
         }
@@ -1720,52 +1852,69 @@ fn handle_keyboard(
         }
     }
     let ctrl_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F));
-    if ctrl_f && app.preview_focus {
-        app.preview_find_open = true;
-        app.preview_find_focus = true;
+    if ctrl_f {
+        if let PanelMode::Preview(preview) = &mut app.panel_mut(app.active_panel.clone()).mode {
+            preview.find_open = true;
+            preview.find_focus = true;
+        }
         ctx.request_repaint();
     }
-    if input.key_pressed(egui::Key::ArrowDown) && !app.preview_focus {
+    if input.key_pressed(egui::Key::ArrowDown)
+        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
+    {
         if app.theme_picker_open {
             app.select_next_theme();
-        } else {
-            let panel = app.get_active_panel();
-            if panel.selected_index + 1 < panel.entries.len() {
-                app.select_entry(panel.selected_index + 1, window_rows);
+        } else if let Some(browser) = AppState::browser(app.get_active_panel()) {
+            if browser.selected_index + 1 < browser.entries.len() {
+                app.select_entry(browser.selected_index + 1, window_rows);
             }
         }
     }
-    if input.key_pressed(egui::Key::ArrowUp) && !app.preview_focus {
+    if input.key_pressed(egui::Key::ArrowUp)
+        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
+    {
         if app.theme_picker_open {
             app.select_prev_theme();
-        } else {
-            let panel = app.get_active_panel();
-            if panel.selected_index > 0 {
-                app.select_entry(panel.selected_index - 1, window_rows);
+        } else if let Some(browser) = AppState::browser(app.get_active_panel()) {
+            if browser.selected_index > 0 {
+                app.select_entry(browser.selected_index - 1, window_rows);
             }
         }
     }
-    if input.key_pressed(egui::Key::PageUp) && !app.preview_focus {
-        let panel = app.get_active_panel();
-        let new_index = panel.selected_index.saturating_sub(window_rows);
+    if input.key_pressed(egui::Key::PageUp)
+        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
+    {
+        let Some(browser) = AppState::browser(app.get_active_panel()) else {
+            return;
+        };
+        let new_index = browser.selected_index.saturating_sub(window_rows);
         app.select_entry(new_index, window_rows);
     }
-    if input.key_pressed(egui::Key::PageDown) && !app.preview_focus {
-        let panel = app.get_active_panel();
-        let len = panel.entries.len();
-        let mut new_index = panel.selected_index.saturating_add(window_rows);
+    if input.key_pressed(egui::Key::PageDown)
+        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
+    {
+        let Some(browser) = AppState::browser(app.get_active_panel()) else {
+            return;
+        };
+        let len = browser.entries.len();
+        let mut new_index = browser.selected_index.saturating_add(window_rows);
         if len > 0 && new_index >= len {
             new_index = len - 1;
         }
         app.select_entry(new_index, window_rows);
     }
-    if input.key_pressed(egui::Key::Home) && !app.preview_focus {
+    if input.key_pressed(egui::Key::Home)
+        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
+    {
         app.select_entry(0, window_rows);
     }
-    if input.key_pressed(egui::Key::End) && !app.preview_focus {
-        let panel = app.get_active_panel();
-        if !panel.entries.is_empty() {
-            app.select_entry(panel.entries.len() - 1, window_rows);
+    if input.key_pressed(egui::Key::End)
+        && matches!(app.panel(app.active_panel.clone()).mode, PanelMode::Browser)
+    {
+        if let Some(browser) = AppState::browser(app.get_active_panel()) {
+            if !browser.entries.is_empty() {
+                app.select_entry(browser.entries.len() - 1, window_rows);
+            }
         }
     }
     if input.key_pressed(egui::Key::F3) {
@@ -1784,6 +1933,10 @@ fn handle_keyboard(
     if input.key_pressed(egui::Key::F6) {
         app.prepare_move_selected();
     }
+    if input.key_pressed(egui::Key::F4) {
+        app.prepare_edit_selected();
+        ctx.request_repaint();
+    }
     let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
     if shift_f6 {
         app.prepare_rename_selected();
@@ -1801,9 +1954,12 @@ fn handle_keyboard(
 
 fn open_parent(app: &mut AppState, window_rows: usize) {
     let panel = app.get_active_panel();
-    let parent_index = panel.entries.iter().position(|e| e.name == "..");
+    let Some(browser) = AppState::browser(panel) else {
+        return;
+    };
+    let parent_index = browser.entries.iter().position(|e| e.name == "..");
     let Some(idx) = parent_index else { return };
-    if panel.selected_index != idx {
+    if browser.selected_index != idx {
         app.select_entry(idx, window_rows);
     }
     open_selected(app);
@@ -1855,16 +2011,23 @@ fn confirm_pending_op(app: &mut AppState) {
 
 fn refresh_active_panel(app: &mut AppState) {
     let which = app.active_panel.clone();
-    let path = app.panel(which.clone()).current_path.clone();
-    if matches!(app.panel(which.clone()).mode, PanelMode::Fs) {
+    let panel = app.panel(which.clone());
+    let Some(browser) = AppState::browser(panel) else {
+        return;
+    };
+    let path = browser.current_path.clone();
+    if matches!(browser.browser_mode, BrowserMode::Fs) {
         load_fs_directory_async(app, path, which, None);
     }
 }
 
 fn refresh_fs_panels(app: &mut AppState) {
     for which in [ActivePanel::Left, ActivePanel::Right] {
-        if matches!(app.panel(which.clone()).mode, PanelMode::Fs) {
-            let path = app.panel(which.clone()).current_path.clone();
+        if let Some(browser) = AppState::browser(app.panel(which.clone())) {
+            if !matches!(browser.browser_mode, BrowserMode::Fs) {
+                continue;
+            }
+            let path = browser.current_path.clone();
             load_fs_directory_async(app, path, which, None);
         }
     }
@@ -1981,6 +2144,214 @@ fn draw_progress_modal(ctx: &egui::Context, app: &AppState) {
             ui.colored_label(color32(colors.row_fg_inactive), "Esc: cancel");
         });
 }
+
+fn draw_discard_modal(ctx: &egui::Context, app: &mut AppState) {
+    let colors = app.theme.colors();
+    let Some(side) = app.edit_panel_side() else {
+        return;
+    };
+    let screen = ctx.available_rect();
+    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "discard_overlay".into());
+    ctx.layer_painter(overlay_layer).rect_filled(
+        screen,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_black_alpha(120),
+    );
+
+    let mut action: Option<bool> = None;
+    egui::Window::new("Discard changes?")
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size(egui::Vec2::new(360.0, 140.0))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(4.0);
+                ui.colored_label(color32(colors.row_fg_active), "Discard unsaved edits?");
+                ui.add_space(14.0);
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let yes = egui::Button::new("Discard").min_size(egui::Vec2::new(120.0, 0.0));
+                    let no =
+                        egui::Button::new("Keep Editing").min_size(egui::Vec2::new(140.0, 0.0));
+                    if ui.add(yes).clicked() {
+                        action = Some(true);
+                    }
+                    if ui.add(no).clicked() {
+                        action = Some(false);
+                    }
+                });
+                ui.add_space(6.0);
+            });
+        });
+    if let Some(accept) = action {
+        let panel = app.panel_mut(side.clone());
+        if accept {
+            let return_focus = match &panel.mode {
+                PanelMode::Edit(edit) => edit.return_focus.clone(),
+                _ => side.clone(),
+            };
+            panel.mode = PanelMode::Browser;
+            app.active_panel = return_focus;
+        } else {
+            if let PanelMode::Edit(edit) = &mut panel.mode {
+                edit.confirm_discard = false;
+            }
+        }
+    }
+}
+
+fn draw_editor(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    is_focused: bool,
+    edit: &mut EditState,
+    highlight_cache: &HashMap<String, egui::text::LayoutJob>,
+    highlight_pending: &mut HashSet<String>,
+    highlight_req_tx: &mpsc::Sender<HighlightRequest>,
+    min_height: f32,
+) {
+    let colors = theme.colors();
+    egui::Frame::NONE
+        .fill(color32(colors.preview_bg))
+        .stroke(egui::Stroke::new(
+            1.0,
+            color32(if is_focused {
+                colors.panel_border_active
+            } else {
+                colors.panel_border_inactive
+            }),
+        ))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::Vec2::new(ui.available_width(), min_height));
+            egui::Frame::NONE
+                .fill(color32(colors.preview_header_bg))
+                .show(ui, |ui| {
+                    let title = edit
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Edit".to_string());
+                    ui.colored_label(color32(colors.preview_header_fg), format!("Edit — {title}"));
+                });
+            ui.add_space(4.0);
+            if edit.loading {
+                ui.colored_label(color32(colors.row_fg_inactive), "Loading…");
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(60));
+                if is_focused {
+                    ui.ctx().request_repaint();
+                }
+                return;
+            }
+            let mut text = std::mem::take(&mut edit.text);
+            let edit_ext = edit.ext.clone();
+            let theme_kind = theme.kind;
+            let mut key = edit.highlight_key.clone();
+            if key.is_none() {
+                if let Some(path) = edit.path.as_ref() {
+                    key = Some(format!("edit:{}", path.to_string_lossy()));
+                    edit.highlight_key = key.clone();
+                }
+            }
+            let key_with_hash = key
+                .as_ref()
+                .map(|base| format!("{base}:{}", edit.highlight_hash));
+            if let Some(key) = key_with_hash.as_ref() {
+                let cached = highlight_cache.contains_key(key);
+                let ready = edit
+                    .highlight_dirty_at
+                    .map(|t| t.elapsed().as_millis() > 250)
+                    .unwrap_or(true);
+                if !cached && !highlight_pending.contains(key) && !text.is_empty() && ready {
+                    edit.highlight_wrap_width = ui.available_width();
+                    highlight_pending.insert(key.clone());
+                    edit.highlight_dirty_at = None;
+                    let _ = highlight_req_tx.send(HighlightRequest {
+                        key: key.clone(),
+                        text: text.clone(),
+                        ext: edit_ext.clone(),
+                        theme_kind,
+                    });
+                }
+            }
+            let mut needs_highlight = false;
+            let mut layouter = |ui: &egui::Ui, string: &dyn egui::TextBuffer, wrap_width: f32| {
+                if let Some(key) = key_with_hash.as_ref() {
+                    let _wrap_changed = (edit.highlight_wrap_width - wrap_width).abs() > 0.5;
+                    if let Some(cached) = highlight_cache.get(key) {
+                        let mut job = cached.clone();
+                        job.wrap.max_width = wrap_width;
+                        return ui.fonts_mut(|f| f.layout_job(job));
+                    }
+                    needs_highlight = true;
+                }
+                ui.fonts_mut(|f| {
+                    f.layout_job(egui::text::LayoutJob::simple(
+                        string.as_str().to_string(),
+                        egui::TextStyle::Monospace.resolve(ui.style()),
+                        egui::Color32::LIGHT_GRAY,
+                        wrap_width,
+                    ))
+                })
+            };
+            let footer_height = ui.text_style_height(&egui::TextStyle::Body).max(1.0) + 8.0;
+            let editor_height = (ui.available_height() - footer_height).max(0.0);
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+            let desired_rows = (editor_height / row_height).floor().max(1.0) as usize;
+            let mut edit_response = None;
+            egui::ScrollArea::vertical()
+                .id_salt("editor_scroll")
+                .auto_shrink([false, false])
+                .max_height(editor_height)
+                .show(ui, |ui| {
+                    let output = egui::TextEdit::multiline(&mut text)
+                        .font(egui::TextStyle::Monospace)
+                        .layouter(&mut layouter)
+                        .code_editor()
+                        .id_source("editor_text")
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(desired_rows)
+                        .show(ui);
+                    edit_response = Some(output.response);
+                });
+            let response = edit_response.unwrap_or_else(|| ui.label(" "));
+            edit.text = text;
+            if response.changed() {
+                edit.highlight_hash = hash_text(&edit.text);
+                edit.highlight_wrap_width = 0.0;
+                edit.highlight_dirty_at = Some(std::time::Instant::now());
+                edit.dirty = true;
+            }
+            if needs_highlight {
+                if let Some(key) = edit.highlight_key.clone() {
+                    let wrap_width = ui.available_width();
+                    if !highlight_pending.contains(&key) {
+                        edit.highlight_wrap_width = wrap_width;
+                        highlight_pending.insert(key.clone());
+                        let _ = highlight_req_tx.send(HighlightRequest {
+                            key,
+                            text: edit.text.clone(),
+                            ext: edit_ext,
+                            theme_kind,
+                        });
+                    }
+                }
+            }
+            if is_focused {
+                response.request_focus();
+                ui.memory_mut(|mem| mem.request_focus(response.id));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    color32(colors.row_fg_inactive),
+                    "Ctrl+S: save  •  Esc: close",
+                );
+            });
+        });
+}
 fn pending_op_text(op: &PendingOp) -> (&'static str, String) {
     match op {
         PendingOp::Copy { src, dst_dir, .. } => (
@@ -2025,7 +2396,9 @@ fn pending_op_text(op: &PendingOp) -> (&'static str, String) {
 
 fn draw_preview(
     ui: &mut egui::Ui,
-    app: &mut AppState,
+    theme: &Theme,
+    is_focused: bool,
+    preview: &mut PreviewState,
     image_cache: &mut ImageCache,
     image_req_tx: &mpsc::Sender<ImageRequest>,
     highlight_cache: &HashMap<String, egui::text::LayoutJob>,
@@ -2033,7 +2406,7 @@ fn draw_preview(
     highlight_req_tx: &mpsc::Sender<HighlightRequest>,
     min_height: f32,
 ) {
-    let colors = app.theme.colors();
+    let colors = theme.colors();
     let header_bg = color32(colors.preview_header_bg);
     let header_fg = color32(colors.preview_header_fg);
     let text_color = color32(colors.preview_text);
@@ -2042,16 +2415,16 @@ fn draw_preview(
         .fill(color32(colors.preview_bg))
         .stroke(egui::Stroke::new(
             1.0,
-            color32(if app.preview_focus {
+            color32(if is_focused {
                 colors.panel_border_active
             } else {
                 colors.panel_border_inactive
             }),
         ))
         .show(ui, |ui| {
-            ui.set_min_height(min_height);
+            ui.set_min_size(egui::Vec2::new(ui.available_width(), min_height));
             egui::Frame::NONE.fill(header_bg).show(ui, |ui| {
-                if app.preview_focus {
+                if is_focused {
                     ui.colored_label(header_fg, "● Preview (Tab to return)");
                 } else {
                     ui.colored_label(header_fg, "Preview (Tab to focus)");
@@ -2061,25 +2434,22 @@ fn draw_preview(
 
             let page_height = ui.available_height();
             let output = egui::ScrollArea::both()
-                .vertical_scroll_offset(app.preview_scroll)
-                .show(ui, |ui| match app.preview.as_ref() {
+                .vertical_scroll_offset(preview.scroll)
+                .show(ui, |ui| match preview.content.as_ref() {
                     Some(PreviewContent::Text(text)) => {
-                        if app.preview_find_open {
+                        if preview.find_open {
                             ui.horizontal(|ui| {
                                 ui.colored_label(text_color, "Find:");
-                                let response = ui.text_edit_singleline(&mut app.preview_find_query);
-                                if app.preview_find_focus {
+                                let response = ui.text_edit_singleline(&mut preview.find_query);
+                                if preview.find_focus {
                                     response.request_focus();
-                                    app.preview_find_focus = false;
+                                    preview.find_focus = false;
                                 }
                             });
                             ui.add_space(4.0);
                         }
-                        let ext = app.preview_ext.clone();
-                        let base_key = app
-                            .preview_key
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string());
+                        let ext = preview.ext.clone();
+                        let base_key = preview.key.clone().unwrap_or_else(|| "unknown".to_string());
                         let key = format!("{base_key}:{:x}", hash_text(text));
                         if let Some(job) = highlight_cache.get(&key) {
                             ui.add(egui::Label::new(job.clone()).selectable(true));
@@ -2096,7 +2466,7 @@ fn draw_preview(
                                     key: key.clone(),
                                     text: text.clone(),
                                     ext,
-                                    theme_kind: app.theme.kind,
+                                    theme_kind: theme.kind,
                                 });
                             }
                             ui.colored_label(text_color, text);
@@ -2166,10 +2536,10 @@ fn draw_preview(
                         ui.colored_label(text_color, "No preview");
                     }
                 });
-            app.preview_scroll = output.state.offset.y;
-            app.preview_page_height = page_height;
-            app.preview_line_height = ui.text_style_height(&egui::TextStyle::Body);
-            app.preview_can_scroll = output.content_size.y > output.inner_rect.height();
+            preview.scroll = output.state.offset.y;
+            preview.page_height = page_height;
+            preview.line_height = ui.text_style_height(&egui::TextStyle::Body);
+            preview.can_scroll = output.content_size.y > output.inner_rect.height();
         });
 }
 
@@ -2257,12 +2627,15 @@ fn draw_panel(
     ui.set_min_size(available);
     let panel_height = available.y.max(0.0).max(min_height);
     let colors = app.theme.colors();
-    let is_active = app.active_panel == panel_side && !app.preview_focus;
+    let is_active = app.active_panel == panel_side;
 
     let (entries_len, selected_index, header_text, selected_label, loading, loading_progress) = {
         let panel = app.panel(panel_side.clone());
-        let entries_len = panel.entries.len();
-        let selected_index = panel.selected_index;
+        let Some(browser) = AppState::browser(panel) else {
+            return 0;
+        };
+        let entries_len = browser.entries.len();
+        let selected_index = browser.selected_index;
         let header_text = format!(
             "{}    {}/{}",
             panel_path_display(panel),
@@ -2273,7 +2646,7 @@ fn draw_panel(
             },
             entries_len
         );
-        let selected_label = panel
+        let selected_label = browser
             .entries
             .get(selected_index)
             .map(|e| e.name.clone())
@@ -2283,8 +2656,8 @@ fn draw_panel(
             selected_index,
             header_text,
             selected_label,
-            panel.loading,
-            panel.loading_progress,
+            browser.loading,
+            browser.loading_progress,
         )
     };
 
@@ -2337,8 +2710,10 @@ fn draw_panel(
                         _ => 0.0,
                     };
                     ui.add_space(4.0);
-                    let loading_label =
-                        matches!(app.panel(panel_side.clone()).mode, PanelMode::Search { .. });
+                    let loading_label = AppState::browser(app.panel(panel_side.clone()))
+                        .is_some_and(|browser| {
+                            matches!(browser.browser_mode, BrowserMode::Search { .. })
+                        });
                     let prefix = if loading_label {
                         "Searching…"
                     } else {
@@ -2395,7 +2770,12 @@ fn draw_panel(
                         scroll.show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
                             visible_range = row_range.clone();
                             for idx in row_range {
-                                let entry = &app.panel(panel_side_for_closure.clone()).entries[idx];
+                                let Some(browser) =
+                                    AppState::browser(app.panel(panel_side_for_closure.clone()))
+                                else {
+                                    continue;
+                                };
+                                let entry = &browser.entries[idx];
                                 let is_selected = selected_index == idx;
                                 let stripe = idx % 2 == 0;
                                 let bg = if is_selected {
@@ -2537,12 +2917,13 @@ fn draw_panel(
         });
 
     if panel_response.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
-        app.preview_focus = false;
         app.active_panel = panel_side.clone();
     }
 
     if let Some(top) = new_top_index {
-        app.panel_mut(panel_side.clone()).top_index = top;
+        if let Some(browser) = AppState::browser_mut(app.panel_mut(panel_side.clone())) {
+            browser.top_index = top;
+        }
     }
 
     if let Some(idx) = clicked_index {
@@ -2685,6 +3066,8 @@ impl ApplicationHandler for App {
         let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResult>();
         let (highlight_req_tx, highlight_req_rx) = mpsc::channel::<HighlightRequest>();
         let (highlight_res_tx, highlight_res_rx) = mpsc::channel::<HighlightResult>();
+        let (edit_tx, edit_rx) = mpsc::channel::<EditLoadRequest>();
+        let (edit_res_tx, edit_res_rx) = mpsc::channel::<EditLoadResult>();
 
         thread::spawn(move || {
             while let Ok(req) = image_req_rx.recv() {
@@ -2724,48 +3107,59 @@ impl ApplicationHandler for App {
             }
         });
 
+        thread::spawn(move || {
+            while let Ok(req) = edit_rx.recv() {
+                let text = match std::fs::read(&req.path) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(_) => "Refusing to edit binary file.".to_string(),
+                    },
+                    Err(e) => format!("Failed to read file: {e}"),
+                };
+                let _ = edit_res_tx.send(EditLoadResult {
+                    id: req.id,
+                    path: req.path,
+                    text,
+                });
+            }
+        });
+
         let mut app = AppState {
             left_panel: PanelState {
-                current_path: cur_dir.clone(),
-                mode: PanelMode::Fs,
-                selected_index: 0,
-                entries: Vec::new(),
-                entries_rx: None,
-                prefer_select_name: None,
-                top_index: 0,
-                loading: false,
-                loading_progress: None,
-                dir_token: 0,
-                history_back: Vec::new(),
-                history_forward: Vec::new(),
+                browser: BrowserState {
+                    browser_mode: BrowserMode::Fs,
+                    current_path: cur_dir.clone(),
+                    selected_index: 0,
+                    entries: Vec::new(),
+                    entries_rx: None,
+                    prefer_select_name: None,
+                    top_index: 0,
+                    loading: false,
+                    loading_progress: None,
+                    dir_token: 0,
+                    history_back: Vec::new(),
+                    history_forward: Vec::new(),
+                },
+                mode: PanelMode::Browser,
             },
             right_panel: PanelState {
-                current_path: cur_dir.clone(),
-                mode: PanelMode::Fs,
-                selected_index: 0,
-                entries: Vec::new(),
-                entries_rx: None,
-                prefer_select_name: None,
-                top_index: 0,
-                loading: false,
-                loading_progress: None,
-                dir_token: 0,
-                history_back: Vec::new(),
-                history_forward: Vec::new(),
+                browser: BrowserState {
+                    browser_mode: BrowserMode::Fs,
+                    current_path: cur_dir.clone(),
+                    selected_index: 0,
+                    entries: Vec::new(),
+                    entries_rx: None,
+                    prefer_select_name: None,
+                    top_index: 0,
+                    loading: false,
+                    loading_progress: None,
+                    dir_token: 0,
+                    history_back: Vec::new(),
+                    history_forward: Vec::new(),
+                },
+                mode: PanelMode::Browser,
             },
             active_panel: ActivePanel::Left,
-            preview: None,
-            preview_key: None,
-            preview_ext: None,
-            preview_focus: false,
-            preview_scroll: 0.0,
-            preview_line_height: 16.0,
-            preview_page_height: 240.0,
-            preview_can_scroll: false,
-            preview_find_open: false,
-            preview_find_query: String::new(),
-            preview_find_index: 0,
-            preview_find_focus: false,
             preview_tx: preview_tx.clone(),
             preview_rx,
             preview_request_id: 0,
@@ -2786,6 +3180,9 @@ impl ApplicationHandler for App {
             pending_op: None,
             rename_input: None,
             rename_focus: false,
+            edit_request_id: 0,
+            edit_tx,
+            edit_rx: edit_res_rx,
             search_query: String::new(),
             search_focus: false,
             search_case: SearchCase::Insensitive,
@@ -2940,17 +3337,40 @@ impl ApplicationHandler for App {
                         );
 
                         ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                            if should_show_preview(&runtime.app, ActivePanel::Left) {
-                                draw_preview(
-                                    ui,
-                                    &mut runtime.app,
-                                    &mut runtime.image_cache,
-                                    &runtime.image_req_tx,
-                                    &runtime.highlight_cache,
-                                    &mut runtime.highlight_pending,
-                                    &runtime.highlight_req_tx,
-                                    rect.height(),
-                                );
+                            if should_show_editor(&runtime.app, ActivePanel::Left) {
+                                let is_focused = runtime.app.active_panel == ActivePanel::Left;
+                                let theme = runtime.app.theme.clone();
+                                let panel = runtime.app.panel_mut(ActivePanel::Left);
+                                if let PanelMode::Edit(edit) = &mut panel.mode {
+                                    draw_editor(
+                                        ui,
+                                        &theme,
+                                        is_focused,
+                                        edit,
+                                        &runtime.highlight_cache,
+                                        &mut runtime.highlight_pending,
+                                        &runtime.highlight_req_tx,
+                                        rect.height(),
+                                    );
+                                }
+                            } else if should_show_preview(&runtime.app, ActivePanel::Left) {
+                                let is_focused = runtime.app.active_panel == ActivePanel::Left;
+                                let theme = runtime.app.theme.clone();
+                                let panel = runtime.app.panel_mut(ActivePanel::Left);
+                                if let PanelMode::Preview(preview) = &mut panel.mode {
+                                    draw_preview(
+                                        ui,
+                                        &theme,
+                                        is_focused,
+                                        preview,
+                                        &mut runtime.image_cache,
+                                        &runtime.image_req_tx,
+                                        &runtime.highlight_cache,
+                                        &mut runtime.highlight_pending,
+                                        &runtime.highlight_req_tx,
+                                        rect.height(),
+                                    );
+                                }
                             } else {
                                 runtime.ui_cache.left_rows = draw_panel(
                                     ui,
@@ -2964,17 +3384,40 @@ impl ApplicationHandler for App {
                             }
                         });
                         ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                            if should_show_preview(&runtime.app, ActivePanel::Right) {
-                                draw_preview(
-                                    ui,
-                                    &mut runtime.app,
-                                    &mut runtime.image_cache,
-                                    &runtime.image_req_tx,
-                                    &runtime.highlight_cache,
-                                    &mut runtime.highlight_pending,
-                                    &runtime.highlight_req_tx,
-                                    rect.height(),
-                                );
+                            if should_show_editor(&runtime.app, ActivePanel::Right) {
+                                let is_focused = runtime.app.active_panel == ActivePanel::Right;
+                                let theme = runtime.app.theme.clone();
+                                let panel = runtime.app.panel_mut(ActivePanel::Right);
+                                if let PanelMode::Edit(edit) = &mut panel.mode {
+                                    draw_editor(
+                                        ui,
+                                        &theme,
+                                        is_focused,
+                                        edit,
+                                        &runtime.highlight_cache,
+                                        &mut runtime.highlight_pending,
+                                        &runtime.highlight_req_tx,
+                                        rect.height(),
+                                    );
+                                }
+                            } else if should_show_preview(&runtime.app, ActivePanel::Right) {
+                                let is_focused = runtime.app.active_panel == ActivePanel::Right;
+                                let theme = runtime.app.theme.clone();
+                                let panel = runtime.app.panel_mut(ActivePanel::Right);
+                                if let PanelMode::Preview(preview) = &mut panel.mode {
+                                    draw_preview(
+                                        ui,
+                                        &theme,
+                                        is_focused,
+                                        preview,
+                                        &mut runtime.image_cache,
+                                        &runtime.image_req_tx,
+                                        &runtime.highlight_cache,
+                                        &mut runtime.highlight_pending,
+                                        &runtime.highlight_req_tx,
+                                        rect.height(),
+                                    );
+                                }
                             } else {
                                 runtime.ui_cache.right_rows = draw_panel(
                                     ui,
@@ -3002,6 +3445,11 @@ impl ApplicationHandler for App {
                     }
                     if runtime.app.pending_op.is_some() {
                         draw_confirmation(ctx, &mut runtime.app);
+                    }
+                    if let Some(edit) = runtime.app.edit_panel_mut() {
+                        if edit.confirm_discard {
+                            draw_discard_modal(ctx, &mut runtime.app);
+                        }
                     }
                     if runtime.app.io_in_flight > 0 {
                         draw_progress_modal(ctx, &runtime.app);
@@ -3072,6 +3520,7 @@ impl ApplicationHandler for App {
                     runtime.needs_redraw = true;
                 }
                 if event_response.consumed {
+                    runtime.window.request_redraw();
                     return;
                 }
 
@@ -3108,28 +3557,30 @@ impl ApplicationHandler for App {
                 runtime.highlight_results.push_back(res);
                 runtime.needs_redraw = true;
             }
-            if let Some(PreviewContent::Image(path)) = runtime.app.preview.as_ref() {
-                let key = match path {
-                    ImageLocation::Fs(path) => path.to_string_lossy().into_owned(),
-                    ImageLocation::Container {
-                        kind,
-                        archive_path,
-                        inner_path,
-                    } => format!(
-                        "{}::{}:/{}",
-                        archive_path.to_string_lossy(),
-                        match kind {
-                            ContainerKind::Zip => "zip",
-                            ContainerKind::TarGz => "tar.gz",
-                            ContainerKind::TarBz2 => "tar.bz2",
-                        },
-                        inner_path
-                    ),
-                };
-                if runtime.image_cache.pending.contains(&key)
-                    || runtime.image_cache.textures.get(&key).is_none()
-                {
-                    runtime.needs_redraw = true;
+            if let Some(preview) = runtime.app.preview_panel_mut() {
+                if let Some(PreviewContent::Image(path)) = preview.content.as_ref() {
+                    let key = match path {
+                        ImageLocation::Fs(path) => path.to_string_lossy().into_owned(),
+                        ImageLocation::Container {
+                            kind,
+                            archive_path,
+                            inner_path,
+                        } => format!(
+                            "{}::{}:/{}",
+                            archive_path.to_string_lossy(),
+                            match kind {
+                                ContainerKind::Zip => "zip",
+                                ContainerKind::TarGz => "tar.gz",
+                                ContainerKind::TarBz2 => "tar.bz2",
+                            },
+                            inner_path
+                        ),
+                    };
+                    if runtime.image_cache.pending.contains(&key)
+                        || runtime.image_cache.textures.get(&key).is_none()
+                    {
+                        runtime.needs_redraw = true;
+                    }
                 }
             }
             if pump_async(&mut runtime.app) {
@@ -3215,6 +3666,8 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     let (io_cancel_tx, _io_cancel_rx) = mpsc::channel::<()>();
     let (dir_size_tx, _dir_size_req_rx) = mpsc::channel::<PathBuf>();
     let (_dir_size_res_tx, dir_size_rx) = mpsc::channel::<(PathBuf, u64)>();
+    let (edit_tx, _edit_req_rx) = mpsc::channel::<EditLoadRequest>();
+    let (_edit_res_tx, edit_res_rx) = mpsc::channel::<EditLoadResult>();
     let (search_tx, _search_req_rx) = mpsc::channel::<SearchRequest>();
     let (_search_res_tx, search_rx) = mpsc::channel::<SearchEvent>();
     let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
@@ -3229,46 +3682,40 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
 
     let mut app = AppState {
         left_panel: PanelState {
-            current_path: cur_dir.clone(),
-            mode: PanelMode::Fs,
-            selected_index: 0,
-            entries: entries.clone(),
-            entries_rx: None,
-            prefer_select_name: None,
-            top_index: 0,
-            loading: false,
-            loading_progress: None,
-            dir_token: 0,
-            history_back: Vec::new(),
-            history_forward: Vec::new(),
+            browser: BrowserState {
+                browser_mode: BrowserMode::Fs,
+                current_path: cur_dir.clone(),
+                selected_index: 0,
+                entries: entries.clone(),
+                entries_rx: None,
+                prefer_select_name: None,
+                top_index: 0,
+                loading: false,
+                loading_progress: None,
+                dir_token: 0,
+                history_back: Vec::new(),
+                history_forward: Vec::new(),
+            },
+            mode: PanelMode::Browser,
         },
         right_panel: PanelState {
-            current_path: cur_dir.clone(),
-            mode: PanelMode::Fs,
-            selected_index: 0,
-            entries,
-            entries_rx: None,
-            prefer_select_name: None,
-            top_index: 0,
-            loading: false,
-            loading_progress: None,
-            dir_token: 0,
-            history_back: Vec::new(),
-            history_forward: Vec::new(),
+            browser: BrowserState {
+                browser_mode: BrowserMode::Fs,
+                current_path: cur_dir.clone(),
+                selected_index: 0,
+                entries,
+                entries_rx: None,
+                prefer_select_name: None,
+                top_index: 0,
+                loading: false,
+                loading_progress: None,
+                dir_token: 0,
+                history_back: Vec::new(),
+                history_forward: Vec::new(),
+            },
+            mode: PanelMode::Browser,
         },
         active_panel: ActivePanel::Left,
-        preview: None,
-        preview_key: None,
-        preview_ext: None,
-        preview_focus: false,
-        preview_scroll: 0.0,
-        preview_line_height: 16.0,
-        preview_page_height: 240.0,
-        preview_can_scroll: false,
-        preview_find_open: false,
-        preview_find_query: String::new(),
-        preview_find_index: 0,
-        preview_find_focus: false,
         preview_tx,
         preview_rx,
         preview_request_id: 0,
@@ -3289,6 +3736,9 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         pending_op: None,
         rename_input: None,
         rename_focus: false,
+        edit_request_id: 0,
+        edit_tx,
+        edit_rx: edit_res_rx,
         search_query: String::new(),
         search_focus: false,
         search_case: SearchCase::Insensitive,
@@ -3349,17 +3799,40 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
             );
 
             ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                if should_show_preview(&app, ActivePanel::Left) {
-                    draw_preview(
-                        ui,
-                        &mut app,
-                        &mut image_cache,
-                        &image_req_tx,
-                        &highlight_cache,
-                        &mut highlight_pending,
-                        &highlight_req_tx,
-                        rect.height(),
-                    );
+                if should_show_editor(&app, ActivePanel::Left) {
+                    let is_focused = app.active_panel == ActivePanel::Left;
+                    let theme = app.theme.clone();
+                    let panel = app.panel_mut(ActivePanel::Left);
+                    if let PanelMode::Edit(edit) = &mut panel.mode {
+                        draw_editor(
+                            ui,
+                            &theme,
+                            is_focused,
+                            edit,
+                            &highlight_cache,
+                            &mut highlight_pending,
+                            &highlight_req_tx,
+                            rect.height(),
+                        );
+                    }
+                } else if should_show_preview(&app, ActivePanel::Left) {
+                    let is_focused = app.active_panel == ActivePanel::Left;
+                    let theme = app.theme.clone();
+                    let panel = app.panel_mut(ActivePanel::Left);
+                    if let PanelMode::Preview(preview) = &mut panel.mode {
+                        draw_preview(
+                            ui,
+                            &theme,
+                            is_focused,
+                            preview,
+                            &mut image_cache,
+                            &image_req_tx,
+                            &highlight_cache,
+                            &mut highlight_pending,
+                            &highlight_req_tx,
+                            rect.height(),
+                        );
+                    }
                 } else {
                     draw_panel(
                         ui,
@@ -3373,17 +3846,40 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
                 }
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                if should_show_preview(&app, ActivePanel::Right) {
-                    draw_preview(
-                        ui,
-                        &mut app,
-                        &mut image_cache,
-                        &image_req_tx,
-                        &highlight_cache,
-                        &mut highlight_pending,
-                        &highlight_req_tx,
-                        rect.height(),
-                    );
+                if should_show_editor(&app, ActivePanel::Right) {
+                    let is_focused = app.active_panel == ActivePanel::Right;
+                    let theme = app.theme.clone();
+                    let panel = app.panel_mut(ActivePanel::Right);
+                    if let PanelMode::Edit(edit) = &mut panel.mode {
+                        draw_editor(
+                            ui,
+                            &theme,
+                            is_focused,
+                            edit,
+                            &highlight_cache,
+                            &mut highlight_pending,
+                            &highlight_req_tx,
+                            rect.height(),
+                        );
+                    }
+                } else if should_show_preview(&app, ActivePanel::Right) {
+                    let is_focused = app.active_panel == ActivePanel::Right;
+                    let theme = app.theme.clone();
+                    let panel = app.panel_mut(ActivePanel::Right);
+                    if let PanelMode::Preview(preview) = &mut panel.mode {
+                        draw_preview(
+                            ui,
+                            &theme,
+                            is_focused,
+                            preview,
+                            &mut image_cache,
+                            &image_req_tx,
+                            &highlight_cache,
+                            &mut highlight_pending,
+                            &highlight_req_tx,
+                            rect.height(),
+                        );
+                    }
                 } else {
                     draw_panel(
                         ui,
@@ -3407,6 +3903,11 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
         });
         if app.pending_op.is_some() {
             draw_confirmation(ctx, &mut app);
+        }
+        if let Some(edit) = app.edit_panel_mut() {
+            if edit.confirm_discard {
+                draw_discard_modal(ctx, &mut app);
+            }
         }
         if app.io_in_flight > 0 {
             draw_progress_modal(ctx, &app);
@@ -3508,7 +4009,10 @@ fn save_snapshot_png(
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .filter_module("egui", log::LevelFilter::Warn)
+        .filter_module("egui_winit", log::LevelFilter::Warn)
+        .init();
 
     if let Some(snapshot_path) = parse_snapshot_arg()? {
         return run_snapshot(&snapshot_path);

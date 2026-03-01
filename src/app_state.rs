@@ -2,19 +2,31 @@ use std::{
     collections::{HashMap, HashSet},
     path,
     sync::mpsc,
+    time::Instant,
 };
 
 use crate::core::{
-    ActivePanel, ContainerKind, DirBatch, DirEntry, EntryLocation, IOResult, IOTask, ImageLocation,
-    PanelMode, PreviewContent, PreviewRequest, SearchCase, SearchMode, SearchResult,
-    container_display_path, container_kind_from_path, format_preview_info, is_image_name,
-    is_image_path, is_text_name, is_text_path,
+    ActivePanel, BrowserMode, ContainerKind, DirBatch, DirEntry, EditLoadRequest, EditLoadResult,
+    EntryLocation, IOResult, IOTask, ImageLocation, PreviewContent, PreviewRequest, SearchCase,
+    SearchMode, SearchResult, container_display_path, container_kind_from_path,
+    format_preview_info, is_image_name, is_image_path, is_text_name, is_text_path,
 };
 use crate::theme::Theme;
 
 pub struct PanelState {
-    pub current_path: path::PathBuf, // For Fs mode: real fs path. For Container: archive path.
+    pub browser: BrowserState,
     pub mode: PanelMode,
+}
+
+pub enum PanelMode {
+    Browser,
+    Preview(PreviewState),
+    Edit(EditState),
+}
+
+pub struct BrowserState {
+    pub browser_mode: BrowserMode,
+    pub current_path: path::PathBuf, // For Fs mode: real fs path. For Container: archive path.
     pub selected_index: usize,
     pub entries: Vec<DirEntry>,
     pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
@@ -27,17 +39,47 @@ pub struct PanelState {
     pub history_forward: Vec<PanelSnapshot>,
 }
 
+pub struct PreviewState {
+    pub content: Option<PreviewContent>,
+    pub key: Option<String>,
+    pub ext: Option<String>,
+    pub scroll: f32,
+    pub line_height: f32,
+    pub page_height: f32,
+    pub can_scroll: bool,
+    pub find_open: bool,
+    pub find_query: String,
+    pub find_index: usize,
+    pub find_focus: bool,
+    pub request_id: u64,
+}
+
+pub struct EditState {
+    pub path: Option<path::PathBuf>,
+    pub text: String,
+    pub ext: Option<String>,
+    pub loading: bool,
+    pub dirty: bool,
+    pub confirm_discard: bool,
+    pub return_focus: ActivePanel,
+    pub highlight_key: Option<String>,
+    pub highlight_hash: u64,
+    pub highlight_wrap_width: f32,
+    pub highlight_dirty_at: Option<Instant>,
+    pub request_id: u64,
+}
+
 #[derive(Clone)]
 pub struct PanelSnapshot {
-    pub mode: PanelMode,
+    pub mode: BrowserMode,
     pub current_path: path::PathBuf,
     pub selected_name: Option<String>,
 }
 
 fn history_key(snapshot: &PanelSnapshot) -> String {
     match &snapshot.mode {
-        PanelMode::Fs => format!("fs:{}", snapshot.current_path.to_string_lossy()),
-        PanelMode::Container {
+        BrowserMode::Fs => format!("fs:{}", snapshot.current_path.to_string_lossy()),
+        BrowserMode::Container {
             kind,
             archive_path,
             cwd,
@@ -51,7 +93,7 @@ fn history_key(snapshot: &PanelSnapshot) -> String {
             archive_path.to_string_lossy(),
             cwd
         ),
-        PanelMode::Search {
+        BrowserMode::Search {
             root,
             query,
             mode,
@@ -76,18 +118,6 @@ pub struct AppState {
     pub left_panel: PanelState,
     pub right_panel: PanelState,
     pub active_panel: ActivePanel,
-    pub preview: Option<PreviewContent>,
-    pub preview_key: Option<String>,
-    pub preview_ext: Option<String>,
-    pub preview_focus: bool,
-    pub preview_scroll: f32,
-    pub preview_line_height: f32,
-    pub preview_page_height: f32,
-    pub preview_can_scroll: bool,
-    pub preview_find_open: bool,
-    pub preview_find_query: String,
-    pub preview_find_index: usize,
-    pub preview_find_focus: bool,
     pub preview_tx: mpsc::Sender<PreviewRequest>,
     pub preview_rx: mpsc::Receiver<(u64, PreviewContent)>,
     pub preview_request_id: u64,
@@ -108,6 +138,9 @@ pub struct AppState {
     pub pending_op: Option<PendingOp>,
     pub rename_input: Option<String>,
     pub rename_focus: bool,
+    pub edit_tx: mpsc::Sender<EditLoadRequest>,
+    pub edit_rx: mpsc::Receiver<EditLoadResult>,
+    pub edit_request_id: u64,
     pub search_query: String,
     pub search_focus: bool,
     pub search_case: SearchCase,
@@ -182,16 +215,63 @@ impl AppState {
         self.panel_mut(self.active_panel.clone())
     }
 
+    pub fn browser_mut(panel: &mut PanelState) -> Option<&mut BrowserState> {
+        Some(&mut panel.browser)
+    }
+
+    pub fn browser(panel: &PanelState) -> Option<&BrowserState> {
+        Some(&panel.browser)
+    }
+
+    pub fn preview_panel_side(&self) -> Option<ActivePanel> {
+        if matches!(self.left_panel.mode, PanelMode::Preview(_)) {
+            return Some(ActivePanel::Left);
+        }
+        if matches!(self.right_panel.mode, PanelMode::Preview(_)) {
+            return Some(ActivePanel::Right);
+        }
+        None
+    }
+
+    pub fn preview_panel_mut(&mut self) -> Option<&mut PreviewState> {
+        let side = self.preview_panel_side()?;
+        match &mut self.panel_mut(side).mode {
+            PanelMode::Preview(preview) => Some(preview),
+            _ => None,
+        }
+    }
+
+    pub fn edit_panel_side(&self) -> Option<ActivePanel> {
+        if matches!(self.left_panel.mode, PanelMode::Edit(_)) {
+            return Some(ActivePanel::Left);
+        }
+        if matches!(self.right_panel.mode, PanelMode::Edit(_)) {
+            return Some(ActivePanel::Right);
+        }
+        None
+    }
+
+    pub fn edit_panel_mut(&mut self) -> Option<&mut EditState> {
+        let side = self.edit_panel_side()?;
+        match &mut self.panel_mut(side).mode {
+            PanelMode::Edit(edit) => Some(edit),
+            _ => None,
+        }
+    }
+
     pub fn select_entry(&mut self, index: usize, window_rows: usize) {
         let panel = self.get_active_panel_mut();
-        if index < panel.entries.len() {
-            panel.selected_index = index;
-            if panel.selected_index < panel.top_index {
-                panel.top_index = panel.selected_index;
-            } else if panel.selected_index >= panel.top_index + window_rows {
-                panel.top_index = panel.selected_index + 1 - window_rows;
+        let Some(browser) = Self::browser_mut(panel) else {
+            return;
+        };
+        if index < browser.entries.len() {
+            browser.selected_index = index;
+            if browser.selected_index < browser.top_index {
+                browser.top_index = browser.selected_index;
+            } else if browser.selected_index >= browser.top_index + window_rows {
+                browser.top_index = browser.selected_index + 1 - window_rows;
             }
-            if self.preview.is_some() {
+            if self.preview_panel_side().is_some() {
                 self.update_preview_for_current_selection();
             }
         } else {
@@ -213,13 +293,20 @@ impl AppState {
     pub fn store_selection_memory_for(&mut self, which: ActivePanel) {
         let (fs_key, container_key, selected_name_opt) = {
             let panel = self.panel(which);
-            if panel.entries.is_empty() {
+            let Some(browser) = Self::browser(panel) else {
+                return;
+            };
+            if browser.entries.is_empty() {
                 return;
             }
-            let selected_name = panel.entries[panel.selected_index].name.clone();
-            match &panel.mode {
-                PanelMode::Fs => (Some(panel.current_path.clone()), None, Some(selected_name)),
-                PanelMode::Container {
+            let selected_name = browser.entries[browser.selected_index].name.clone();
+            match &browser.browser_mode {
+                BrowserMode::Fs => (
+                    Some(browser.current_path.clone()),
+                    None,
+                    Some(selected_name),
+                ),
+                BrowserMode::Container {
                     archive_path,
                     cwd,
                     kind,
@@ -228,7 +315,7 @@ impl AppState {
                     Some((archive_path.clone(), cwd.clone(), *kind)),
                     Some(selected_name),
                 ),
-                PanelMode::Search { .. } => (None, None, None),
+                BrowserMode::Search { .. } => (None, None, None),
             }
         };
         if let Some(selected_name) = selected_name_opt {
@@ -243,16 +330,22 @@ impl AppState {
 
     pub fn select_entry_by_name(&mut self, which: ActivePanel, name: &str) {
         let panel = self.panel_mut(which);
-        if let Some(idx) = panel.entries.iter().position(|e| e.name == name) {
-            panel.selected_index = idx;
+        let Some(browser) = Self::browser_mut(panel) else {
+            return;
+        };
+        if let Some(idx) = browser.entries.iter().position(|e| e.name == name) {
+            browser.selected_index = idx;
         }
     }
 
     pub fn push_history(&mut self, which: ActivePanel) {
         let snapshot = {
             let panel = self.panel(which.clone());
-            let selected = panel.entries.get(panel.selected_index).map(|e| {
-                if matches!(panel.mode, PanelMode::Search { .. }) {
+            let Some(browser) = Self::browser(panel) else {
+                return;
+            };
+            let selected = browser.entries.get(browser.selected_index).map(|e| {
+                if matches!(browser.browser_mode, BrowserMode::Search { .. }) {
                     if let EntryLocation::Fs(path) = &e.location {
                         return format!("fs:{}", path.to_string_lossy());
                     }
@@ -260,26 +353,32 @@ impl AppState {
                 e.name.clone()
             });
             PanelSnapshot {
-                mode: panel.mode.clone(),
-                current_path: panel.current_path.clone(),
+                mode: browser.browser_mode.clone(),
+                current_path: browser.current_path.clone(),
                 selected_name: selected,
             }
         };
         let panel = self.panel_mut(which);
-        if let Some(last) = panel.history_back.last() {
+        let Some(browser) = Self::browser_mut(panel) else {
+            return;
+        };
+        if let Some(last) = browser.history_back.last() {
             if history_key(last) == history_key(&snapshot) {
                 return;
             }
         }
-        panel.history_back.push(snapshot);
-        panel.history_forward.clear();
+        browser.history_back.push(snapshot);
+        browser.history_forward.clear();
     }
 
     pub fn pop_history_back(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
         let current = {
             let panel = self.panel(which.clone());
-            let selected = panel.entries.get(panel.selected_index).map(|e| {
-                if matches!(panel.mode, PanelMode::Search { .. }) {
+            let Some(browser) = Self::browser(panel) else {
+                return None;
+            };
+            let selected = browser.entries.get(browser.selected_index).map(|e| {
+                if matches!(browser.browser_mode, BrowserMode::Search { .. }) {
                     if let EntryLocation::Fs(path) = &e.location {
                         return format!("fs:{}", path.to_string_lossy());
                     }
@@ -287,15 +386,18 @@ impl AppState {
                 e.name.clone()
             });
             PanelSnapshot {
-                mode: panel.mode.clone(),
-                current_path: panel.current_path.clone(),
+                mode: browser.browser_mode.clone(),
+                current_path: browser.current_path.clone(),
                 selected_name: selected,
             }
         };
         let panel = self.panel_mut(which);
-        let prev = panel.history_back.pop();
+        let Some(browser) = Self::browser_mut(panel) else {
+            return None;
+        };
+        let prev = browser.history_back.pop();
         if prev.is_some() {
-            panel.history_forward.push(current);
+            browser.history_forward.push(current);
         }
         prev
     }
@@ -303,8 +405,11 @@ impl AppState {
     pub fn pop_history_forward(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
         let current = {
             let panel = self.panel(which.clone());
-            let selected = panel.entries.get(panel.selected_index).map(|e| {
-                if matches!(panel.mode, PanelMode::Search { .. }) {
+            let Some(browser) = Self::browser(panel) else {
+                return None;
+            };
+            let selected = browser.entries.get(browser.selected_index).map(|e| {
+                if matches!(browser.browser_mode, BrowserMode::Search { .. }) {
                     if let EntryLocation::Fs(path) = &e.location {
                         return format!("fs:{}", path.to_string_lossy());
                     }
@@ -312,15 +417,18 @@ impl AppState {
                 e.name.clone()
             });
             PanelSnapshot {
-                mode: panel.mode.clone(),
-                current_path: panel.current_path.clone(),
+                mode: browser.browser_mode.clone(),
+                current_path: browser.current_path.clone(),
                 selected_name: selected,
             }
         };
         let panel = self.panel_mut(which);
-        let next = panel.history_forward.pop();
+        let Some(browser) = Self::browser_mut(panel) else {
+            return None;
+        };
+        let next = browser.history_forward.pop();
         if next.is_some() {
-            panel.history_back.push(current);
+            browser.history_back.push(current);
         }
         next
     }
@@ -328,10 +436,13 @@ impl AppState {
     pub fn prepare_rename_selected(&mut self) {
         let (path, name) = {
             let panel = self.get_active_panel();
-            if panel.entries.is_empty() {
+            let Some(browser) = Self::browser(panel) else {
+                return;
+            };
+            if browser.entries.is_empty() {
                 return;
             }
-            let entry = &panel.entries[panel.selected_index];
+            let entry = &browser.entries[browser.selected_index];
             if entry.name == ".." || entry.is_dir && !matches!(entry.location, EntryLocation::Fs(_))
             {
                 return;
@@ -353,14 +464,96 @@ impl AppState {
         }
     }
 
+    pub fn prepare_edit_selected(&mut self) {
+        let (path, ext) = {
+            let panel = self.get_active_panel();
+            let Some(browser) = Self::browser(panel) else {
+                return;
+            };
+            if browser.entries.is_empty() {
+                return;
+            }
+            let entry = &browser.entries[browser.selected_index];
+            if entry.is_dir || entry.name == ".." {
+                return;
+            }
+            match &entry.location {
+                EntryLocation::Fs(path) => {
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string());
+                    (path.clone(), ext)
+                }
+                _ => return,
+            }
+        };
+        let target_panel = if let Some(side) = self.preview_panel_side() {
+            side
+        } else {
+            match self.active_panel {
+                ActivePanel::Left => ActivePanel::Right,
+                ActivePanel::Right => ActivePanel::Left,
+            }
+        };
+        let return_focus = self.active_panel.clone();
+        let target_panel_clone = target_panel.clone();
+        let request_id = self.edit_request_id.wrapping_add(1);
+        self.edit_request_id = request_id;
+        let path_to_send = {
+            let panel = self.panel_mut(target_panel);
+            let edit = EditState {
+                path: Some(path),
+                text: String::new(),
+                ext,
+                loading: true,
+                dirty: false,
+                confirm_discard: false,
+                return_focus,
+                highlight_key: None,
+                highlight_hash: 0,
+                highlight_wrap_width: 0.0,
+                highlight_dirty_at: None,
+                request_id,
+            };
+            panel.mode = PanelMode::Edit(edit);
+            match &panel.mode {
+                PanelMode::Edit(edit) => edit.path.clone(),
+                _ => None,
+            }
+        };
+        if let Some(path) = path_to_send {
+            if self
+                .edit_tx
+                .send(EditLoadRequest {
+                    id: request_id,
+                    path,
+                })
+                .is_err()
+            {
+                if let Some(edit) = self.edit_panel_mut() {
+                    edit.loading = false;
+                    edit.text = "Failed to load file.".to_string();
+                }
+            }
+        } else if let Some(edit) = self.edit_panel_mut() {
+            edit.loading = false;
+        }
+        self.active_panel = target_panel_clone;
+    }
+
     pub fn update_preview_for_current_selection(&mut self) {
         let (is_dir, location, key, ext) = {
             let panel = self.get_active_panel();
-            if panel.entries.is_empty() {
+            let Some(browser) = Self::browser(panel) else {
+                self.clear_preview();
+                return;
+            };
+            if browser.entries.is_empty() {
                 self.clear_preview();
                 return;
             }
-            let entry = &panel.entries[panel.selected_index];
+            let entry = &browser.entries[browser.selected_index];
             let ext = std::path::Path::new(&entry.name)
                 .extension()
                 .and_then(|ext| ext.to_str())
@@ -375,18 +568,46 @@ impl AppState {
             };
             (entry.is_dir, entry.location.clone(), key, ext)
         };
-        self.preview_key = Some(key);
-        self.preview_ext = ext;
-        self.preview_scroll = 0.0;
-        self.preview_find_index = 0;
-        self.preview_find_open = false;
-        self.preview_find_focus = false;
-        self.preview_request_id = self.preview_request_id.wrapping_add(1);
-        let request_id = self.preview_request_id;
+        let target_panel = match self.active_panel {
+            ActivePanel::Left => ActivePanel::Right,
+            ActivePanel::Right => ActivePanel::Left,
+        };
+        let mut request_id = self.preview_request_id.wrapping_add(1);
+        self.preview_request_id = request_id;
+        let mut list_request: Option<(ContainerKind, path::PathBuf, u64)> = None;
+        if let EntryLocation::Fs(path) = &location {
+            if let Some(kind) = container_kind_from_path(path) {
+                let list_id = self.preview_request_id.wrapping_add(1);
+                self.preview_request_id = list_id;
+                list_request = Some((kind, path.clone(), list_id));
+            }
+        }
+        let _target_panel_clone = target_panel.clone();
+        {
+            let panel = self.panel_mut(target_panel);
+            let preview = PreviewState {
+                content: None,
+                key: Some(key),
+                ext,
+                scroll: 0.0,
+                line_height: 16.0,
+                page_height: 240.0,
+                can_scroll: false,
+                find_open: false,
+                find_query: String::new(),
+                find_index: 0,
+                find_focus: false,
+                request_id,
+            };
+            panel.mode = PanelMode::Preview(preview);
+        }
+        let Some(preview) = self.preview_panel_mut() else {
+            return;
+        };
         const MAX_BYTES_TEXT: usize = 64 * 1024;
         const MAX_BYTES_BINARY: usize = 4 * 1024;
         if is_dir {
-            self.preview = Some(PreviewContent::Text(format_preview_info(
+            preview.content = Some(PreviewContent::Text(format_preview_info(
                 "Directory",
                 &location,
             )));
@@ -395,32 +616,32 @@ impl AppState {
         match location {
             EntryLocation::Fs(path) => {
                 if is_image_path(&path) {
-                    self.preview = Some(PreviewContent::Image(ImageLocation::Fs(
+                    preview.content = Some(PreviewContent::Image(ImageLocation::Fs(
                         std::sync::Arc::from(path),
                     )));
                     return;
                 }
-                if let Some(kind) = container_kind_from_path(&path) {
-                    self.preview_request_id = self.preview_request_id.wrapping_add(1);
-                    let request_id = self.preview_request_id;
-                    self.preview = Some(PreviewContent::Text(format_preview_info(
+                if let Some((kind, archive_path, list_id)) = list_request {
+                    request_id = list_id;
+                    preview.request_id = request_id;
+                    preview.content = Some(PreviewContent::Text(format_preview_info(
                         "Archive",
                         &EntryLocation::Container {
                             kind,
-                            archive_path: path.clone(),
+                            archive_path: archive_path.clone(),
                             inner_path: String::new(),
                         },
                     )));
                     let _ = self.preview_tx.send(PreviewRequest::ListContainer {
                         id: request_id,
                         kind,
-                        archive_path: path,
+                        archive_path,
                         max_entries: 200,
                     });
                     return;
                 }
-                if self.preview.is_none() {
-                    self.preview = Some(PreviewContent::Text(format_preview_info(
+                if preview.content.is_none() {
+                    preview.content = Some(PreviewContent::Text(format_preview_info(
                         "File",
                         &EntryLocation::Fs(path.clone()),
                     )));
@@ -442,15 +663,15 @@ impl AppState {
                 inner_path,
             } => {
                 if is_image_name(&inner_path) {
-                    self.preview = Some(PreviewContent::Image(ImageLocation::Container {
+                    preview.content = Some(PreviewContent::Image(ImageLocation::Container {
                         kind,
                         archive_path: archive_path.clone(),
                         inner_path: inner_path.clone(),
                     }));
                     return;
                 }
-                if self.preview.is_none() {
-                    self.preview = Some(PreviewContent::Text(format_preview_info(
+                if preview.content.is_none() {
+                    preview.content = Some(PreviewContent::Text(format_preview_info(
                         "File",
                         &EntryLocation::Container {
                             kind,
@@ -478,7 +699,7 @@ impl AppState {
     }
 
     pub fn toggle_preview(&mut self) {
-        if self.preview.is_some() {
+        if self.preview_panel_side().is_some() {
             self.clear_preview();
             return;
         }
@@ -616,10 +837,11 @@ impl AppState {
     fn build_copy_op(&self) -> Option<PendingOp> {
         let (src, kind) = {
             let p = self.get_active_panel();
-            if p.entries.is_empty() {
+            let browser = Self::browser(p)?;
+            if browser.entries.is_empty() {
                 return None;
             }
-            let entry = &p.entries[p.selected_index];
+            let entry = &browser.entries[browser.selected_index];
             let kind = if entry.is_dir {
                 CopyKind::Directory
             } else {
@@ -633,12 +855,13 @@ impl AppState {
                 ActivePanel::Left => &self.right_panel,
                 ActivePanel::Right => &self.left_panel,
             };
-            match &other_panel.mode {
-                PanelMode::Fs => other_panel.current_path.clone(),
-                PanelMode::Container { .. } => {
+            let browser = Self::browser(other_panel)?;
+            match &browser.browser_mode {
+                BrowserMode::Fs => browser.current_path.clone(),
+                BrowserMode::Container { .. } => {
                     return None;
                 }
-                PanelMode::Search { .. } => {
+                BrowserMode::Search { .. } => {
                     return None;
                 }
             }
@@ -650,10 +873,11 @@ impl AppState {
     fn build_move_op(&self) -> Option<PendingOp> {
         let src = {
             let p = self.get_active_panel();
-            if p.entries.is_empty() {
+            let browser = Self::browser(p)?;
+            if browser.entries.is_empty() {
                 return None;
             }
-            match &p.entries[p.selected_index].location {
+            match &browser.entries[browser.selected_index].location {
                 EntryLocation::Fs(path) => path.clone(),
                 EntryLocation::Container { .. } => {
                     return None;
@@ -666,12 +890,13 @@ impl AppState {
                 ActivePanel::Left => &self.right_panel,
                 ActivePanel::Right => &self.left_panel,
             };
-            match &other_panel.mode {
-                PanelMode::Fs => other_panel.current_path.clone(),
-                PanelMode::Container { .. } => {
+            let browser = Self::browser(other_panel)?;
+            match &browser.browser_mode {
+                BrowserMode::Fs => browser.current_path.clone(),
+                BrowserMode::Container { .. } => {
                     return None;
                 }
-                PanelMode::Search { .. } => {
+                BrowserMode::Search { .. } => {
                     return None;
                 }
             }
@@ -683,10 +908,11 @@ impl AppState {
     fn build_delete_op(&self) -> Option<PendingOp> {
         let target = {
             let p = self.get_active_panel();
-            if p.entries.is_empty() {
+            let browser = Self::browser(p)?;
+            if browser.entries.is_empty() {
                 return None;
             }
-            let entry = &p.entries[p.selected_index];
+            let entry = &browser.entries[browser.selected_index];
             if entry.name == ".." {
                 return None;
             }
@@ -754,15 +980,13 @@ impl AppState {
     }
 
     pub fn clear_preview(&mut self) {
-        self.preview = None;
-        self.preview_key = None;
-        self.preview_ext = None;
-        self.preview_focus = false;
-        self.preview_scroll = 0.0;
-        self.preview_find_index = 0;
-        self.preview_find_open = false;
-        self.preview_find_focus = false;
-        self.preview_can_scroll = false;
-        self.preview_request_id = self.preview_request_id.wrapping_add(1);
+        let request_id = self.preview_request_id.wrapping_add(1);
+        self.preview_request_id = request_id;
+        let side = self.preview_panel_side();
+        let Some(side) = side else {
+            return;
+        };
+        let panel = self.panel_mut(side);
+        panel.mode = PanelMode::Browser;
     }
 }
