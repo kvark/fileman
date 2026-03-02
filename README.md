@@ -21,7 +21,7 @@ Fileman is a fast, responsive two-panel file manager built with egui via blade-e
 - Replay runner for tests via `--replay` (RON format).
 
 ## Screenshot
-![Fileman screenshot](etc/snapshots/linux.png)
+![Fileman screenshot](etc/snapshots/tests/preview.png)
 
 ## Build and Run
 ```bash
@@ -37,7 +37,7 @@ cargo run -- --replay tests/cases/preview.ron --snapshot /tmp/replay.png
 ```
 To run all replay cases:
 ```bash
-cargo run --bin replay_runner
+scripts/replay_runner.sh
 ```
 
 ### GPU Backend Notes

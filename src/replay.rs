@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use serde::Deserialize;
+use serde::de::{DeserializeOwned, Deserializer};
 
 #[derive(Deserialize)]
 pub struct ReplayCase {
@@ -9,30 +10,36 @@ pub struct ReplayCase {
     pub left: Option<PathBuf>,
     pub right: Option<PathBuf>,
     pub keys: Vec<ReplayKey>,
-    pub asserts: Option<ReplayAsserts>,
+    #[serde(default)]
+    pub asserts: ReplayAsserts,
 }
 
 #[derive(Deserialize)]
 pub struct ReplayKey {
     pub key: String,
-    pub modifiers: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_option")]
+    pub modifiers: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct ReplayAsserts {
     pub fs: Option<FsAssert>,
-    pub files: Option<Vec<FileAssert>>,
-    pub snapshots: Option<Vec<SnapshotAssert>>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_option")]
+    pub files: Vec<FileAssert>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_option")]
+    pub snapshots: Vec<SnapshotAssert>,
 }
 
 #[derive(Deserialize)]
 pub struct FsAssert {
-    pub mode: Option<FsCheckMode>,
+    #[serde(default)]
+    pub mode: FsCheckMode,
     pub entries: Vec<FsEntry>,
 }
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Deserialize, Clone, Copy, Default)]
 pub enum FsCheckMode {
+    #[default]
     Exact,
     Contains,
 }
@@ -60,11 +67,39 @@ pub struct FileAssert {
 pub struct SnapshotAssert {
     pub path: PathBuf,
     pub expected: PathBuf,
-    pub max_channel_diff: Option<u8>,
-    pub max_pixel_fraction: Option<f32>,
+    #[serde(default = "default_max_channel_diff")]
+    pub max_channel_diff: u8,
+    #[serde(default = "default_max_pixel_fraction")]
+    pub max_pixel_fraction: f32,
 }
 
 pub fn load_replay_case(path: &PathBuf) -> Result<ReplayCase> {
     let text = std::fs::read_to_string(path)?;
     ron::from_str(&text).map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+fn default_max_channel_diff() -> u8 {
+    4
+}
+
+fn default_max_pixel_fraction() -> f32 {
+    0.001
+}
+
+fn deserialize_vec_or_option<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeVec<T> {
+        Vec(Vec<T>),
+        Option(Option<Vec<T>>),
+    }
+
+    match MaybeVec::deserialize(deserializer)? {
+        MaybeVec::Vec(items) => Ok(items),
+        MaybeVec::Option(items) => Ok(items.unwrap_or_default()),
+    }
 }

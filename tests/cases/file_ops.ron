@@ -1,28 +1,30 @@
 (
   root: "tests/data/basic",
-  right: "tests/data/basic/out",
+  right: Some("tests/data/basic/out"),
   keys: [
-    (key: "Down"),
-    (key: "Down"),
-    (key: "Down"),
+    (key: "Wait"),
+    (key: "select:source.txt"),
     (key: "F5"),
     (key: "Enter"),
     (key: "Tab"),
-    (key: "Down"),
+    (key: "Wait"),
+    (key: "select:source.txt"),
     (key: "F6", modifiers: ["Shift"]),
+    (key: "A", modifiers: ["Ctrl"]),
+    (key: "Backspace"),
     (key: "text: source_copy.txt"),
     (key: "Enter"),
     (key: "F8"),
     (key: "Enter"),
   ],
   asserts: (
-    fs: (
+    fs: Some((
       mode: Exact,
       entries: [
         (path: "out", kind: Dir),
         (path: "source.txt", kind: File),
         (path: "binary.bin", kind: File),
       ],
-    ),
+    )),
   ),
 )

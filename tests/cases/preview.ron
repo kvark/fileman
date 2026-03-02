@@ -1,9 +1,8 @@
 (
   root: "tests/data/basic",
   keys: [
-    (key: "Down"),
-    (key: "Down"),
-    (key: "Down"),
+    (key: "Wait"),
+    (key: "select:source.txt"),
     (key: "F3"),
     (key: "Tab"),
     (key: "PageDown"),

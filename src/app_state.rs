@@ -260,6 +260,15 @@ impl AppState {
         None
     }
 
+    pub fn edit_panel(&self) -> Option<&EditState> {
+        let side = self.edit_panel_side()?;
+        let panel = self.panel(side);
+        match panel.mode {
+            PanelMode::Edit(ref edit) => Some(edit),
+            _ => None,
+        }
+    }
+
     pub fn edit_panel_mut(&mut self) -> Option<&mut EditState> {
         let side = self.edit_panel_side()?;
         let panel = self.panel_mut(side);

@@ -1,10 +1,10 @@
 (
   root: "tests/data/basic",
   keys: [
-    (key: "Down"),
-    (key: "Down"),
-    (key: "Down"),
+    (key: "Wait"),
+    (key: "select:source.txt"),
     (key: "F4"),
+    (key: "Wait"),
     (key: "Down"),
     (key: "Down"),
     (key: "Down"),
