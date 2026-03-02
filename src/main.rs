@@ -3879,7 +3879,7 @@ fn wait_for_idle(
     for _ in 0..max_iters {
         let changed = pump_async(app);
         headless.run_frame(app, ui_cache, Vec::new());
-        if !changed && !is_app_pending(app) {
+        if !changed && !is_app_pending(app) && headless.highlight_pending.is_empty() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
@@ -4039,6 +4039,7 @@ fn run_replay(case_path: &PathBuf, snapshot: Option<PathBuf>) -> Result<()> {
         apply_replay_key(&mut headless, &mut app, &mut ui_cache, &key);
         drain_async(&mut app, 50);
     }
+    wait_for_idle(&mut headless, &mut app, &mut ui_cache, 600);
 
     if let Some(path) = snapshot {
         render_snapshot(&mut app, &mut ui_cache, &path)?;
@@ -4060,12 +4061,20 @@ struct HeadlessUi {
     highlight_pending: HashSet<String>,
     image_req_tx: mpsc::Sender<ImageRequest>,
     highlight_req_tx: mpsc::Sender<HighlightRequest>,
+    highlight_res_rx: mpsc::Receiver<HighlightResult>,
 }
 
 impl HeadlessUi {
     fn new() -> Self {
         let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
-        let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
+        let (highlight_req_tx, highlight_req_rx) = mpsc::channel::<HighlightRequest>();
+        let (highlight_res_tx, highlight_res_rx) = mpsc::channel::<HighlightResult>();
+        thread::spawn(move || {
+            while let Ok(req) = highlight_req_rx.recv() {
+                let job = highlight_text_job(&req.text, req.ext.as_deref(), req.theme_kind);
+                let _ = highlight_res_tx.send(HighlightResult { key: req.key, job });
+            }
+        });
         Self {
             egui_ctx: egui::Context::default(),
             image_cache: ImageCache::default(),
@@ -4073,6 +4082,7 @@ impl HeadlessUi {
             highlight_pending: HashSet::new(),
             image_req_tx,
             highlight_req_tx,
+            highlight_res_rx,
         }
     }
 
@@ -4111,6 +4121,10 @@ impl HeadlessUi {
                 highlight_req_tx: &self.highlight_req_tx,
             });
         });
+        while let Ok(res) = self.highlight_res_rx.try_recv() {
+            self.highlight_cache.insert(res.key.clone(), res.job);
+            self.highlight_pending.remove(&res.key);
+        }
     }
 }
 
@@ -4484,7 +4498,7 @@ fn render_snapshot(app: &mut AppState, ui_cache: &mut UiCache, path: &PathBuf) -
         pending: HashSet::new(),
         order: VecDeque::new(),
     };
-    let highlight_cache = HashMap::new();
+    let highlight_cache = build_snapshot_highlights(app);
     let mut highlight_pending = HashSet::new();
 
     app.preview_tx = preview_tx;
@@ -4599,6 +4613,30 @@ fn render_snapshot(app: &mut AppState, ui_cache: &mut UiCache, path: &PathBuf) -
     Ok(())
 }
 
+fn build_snapshot_highlights(app: &AppState) -> HashMap<String, egui::text::LayoutJob> {
+    let mut cache = HashMap::new();
+    let theme_kind = app.theme.kind;
+
+    if let Some(edit) = app.edit_panel()
+        && let Some(path) = edit.path.as_ref()
+    {
+        let base_key = format!("edit:{}", path.to_string_lossy());
+        let key = format!("{base_key}:{}", edit.highlight_hash);
+        let job = highlight_text_job(&edit.text, edit.ext.as_deref(), theme_kind);
+        cache.insert(key, job);
+    }
+
+    if let Some(preview) = app.preview_panel()
+        && let Some(PreviewContent::Text(text)) = preview.content.as_ref()
+    {
+        let base_key = preview.key.clone().unwrap_or_else(|| "unknown".to_string());
+        let key = format!("{base_key}:{:x}", hash_text(text));
+        let job = highlight_text_job(text, preview.ext.as_deref(), theme_kind);
+        cache.insert(key, job);
+    }
+
+    cache
+}
 fn run_snapshot(path: &PathBuf) -> Result<()> {
     let mut app = init_headless_app(None)?;
     let mut ui_cache = UiCache {

@@ -242,6 +242,15 @@ impl AppState {
         }
     }
 
+    pub fn preview_panel(&self) -> Option<&PreviewState> {
+        let side = self.preview_panel_side()?;
+        let panel = self.panel(side);
+        match panel.mode {
+            PanelMode::Preview(ref preview) => Some(preview),
+            _ => None,
+        }
+    }
+
     pub fn edit_panel_side(&self) -> Option<ActivePanel> {
         let PanelState {
             mode: ref left_mode,
