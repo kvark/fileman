@@ -19,7 +19,7 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
-  snapshot:
+  replay:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,15 +42,13 @@ jobs:
             exit 1
           fi
           echo "VK_ICD_FILENAMES=$icd" >> $GITHUB_ENV
-      - name: Build snapshot
-        run: cargo run --bin fileman -- --snapshot /tmp/screen.png
-      - name: Compare snapshot
-        run: |
-          test -f etc/snapshots/linux.png
-          cargo run --bin snapshot_compare -- /tmp/screen.png etc/snapshots/linux.png --max-channel-diff 200 --max-pixel-fraction 0.003
-      - name: Upload snapshot artifact on failure
+      - name: Run replay cases
+        run: cargo run --bin replay_runner
+      - name: Upload replay artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: snapshot-failure
-          path: /tmp/screen.png
+          name: replay-artifacts
+          path: |
+            target/test-artifacts
+            etc/snapshots

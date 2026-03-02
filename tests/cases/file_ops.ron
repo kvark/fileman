@@ -1,0 +1,28 @@
+(
+  root: "tests/data/basic",
+  right: "tests/data/basic/out",
+  keys: [
+    (key: "Down"),
+    (key: "Down"),
+    (key: "Down"),
+    (key: "F5"),
+    (key: "Enter"),
+    (key: "Tab"),
+    (key: "Down"),
+    (key: "F6", modifiers: ["Shift"]),
+    (key: "text: source_copy.txt"),
+    (key: "Enter"),
+    (key: "F8"),
+    (key: "Enter"),
+  ],
+  asserts: (
+    fs: (
+      mode: Exact,
+      entries: [
+        (path: "out", kind: Dir),
+        (path: "source.txt", kind: File),
+        (path: "binary.bin", kind: File),
+      ],
+    ),
+  ),
+)

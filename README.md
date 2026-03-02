@@ -30,6 +30,16 @@ cargo run
 RUST_LOG=info cargo run
 ```
 
+### Test Replays
+Replay cases live in `tests/cases/` and use the RON format. To run a case and emit a snapshot:
+```bash
+cargo run -- --replay tests/cases/preview.ron --snapshot /tmp/replay.png
+```
+To run all replay cases:
+```bash
+cargo run --bin replay_runner
+```
+
 ### GPU Backend Notes
 If you see `NoSupportedDeviceFound`, blade-graphics couldn't find a supported GPU backend.
 On Linux, this usually means Vulkan drivers aren't available. You can either install Vulkan
