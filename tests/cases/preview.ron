@@ -1,0 +1,21 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Down"),
+    (key: "Down"),
+    (key: "Down"),
+    (key: "F3"),
+    (key: "Tab"),
+    (key: "PageDown"),
+  ],
+  asserts: (
+    snapshots: [
+      (
+        path: "target/test-artifacts/preview.png",
+        expected: "etc/snapshots/tests/preview.png",
+        max_channel_diff: 200,
+        max_pixel_fraction: 0.003,
+      ),
+    ],
+  ),
+)

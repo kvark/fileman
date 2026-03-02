@@ -1,0 +1,23 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Down"),
+    (key: "Down"),
+    (key: "Down"),
+    (key: "F4"),
+    (key: "Down"),
+    (key: "Down"),
+    (key: "Down"),
+    (key: "text: EDITED"),
+  ],
+  asserts: (
+    snapshots: [
+      (
+        path: "target/test-artifacts/edit.png",
+        expected: "etc/snapshots/tests/edit.png",
+        max_channel_diff: 200,
+        max_pixel_fraction: 0.003,
+      ),
+    ],
+  ),
+)

@@ -46,7 +46,9 @@ use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{
     start_dir_size_worker, start_io_worker, start_preview_worker, start_search_worker,
 };
+use replay::{FileAssert, FsAssert, FsCheckMode, FsEntryKind, ReplayAsserts, SnapshotAssert};
 mod replay;
+use fileman::snapshot::compare_snapshots;
 use replay::{ReplayKey, load_replay_case};
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -130,6 +132,7 @@ struct HighlightResult {
     job: egui::text::LayoutJob,
 }
 
+#[derive(Default)]
 struct ImageCache {
     textures: HashMap<String, egui::TextureHandle>,
     pending: HashSet<String>,
@@ -3658,7 +3661,7 @@ fn parse_key_name(name: &str) -> Option<egui::Key> {
 }
 
 fn apply_replay_key(
-    egui_ctx: &egui::Context,
+    headless: &mut HeadlessUi,
     app: &mut AppState,
     ui_cache: &mut UiCache,
     key: &ReplayKey,
@@ -3691,15 +3694,7 @@ fn apply_replay_key(
             physical_key: None,
         });
     }
-
-    let raw_input = egui::RawInput {
-        events,
-        ..Default::default()
-    };
-    let _ = egui_ctx.run(raw_input, |ctx| {
-        let input = ctx.input(|i| i.clone());
-        handle_keyboard(ctx, &input, app, ui_cache);
-    });
+    headless.run_frame(app, ui_cache, events);
 }
 
 fn drain_async(app: &mut AppState, max_iters: usize) {
@@ -3824,9 +3819,21 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
 
 fn run_replay(case_path: &PathBuf, snapshot: Option<PathBuf>) -> Result<()> {
     let case = load_replay_case(case_path)?;
-    let mut app = init_headless_app(Some(case.root.clone()))?;
-    let left_root = case.left.clone().unwrap_or_else(|| case.root.clone());
-    let right_root = case.right.clone().unwrap_or_else(|| case.root.clone());
+    let base_dir = case_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let root = resolve_case_path(base_dir, &case.root);
+    let mut app = init_headless_app(Some(root.clone()))?;
+    let left_root = case
+        .left
+        .as_ref()
+        .map(|p| resolve_case_path(base_dir, p))
+        .unwrap_or_else(|| root.clone());
+    let right_root = case
+        .right
+        .as_ref()
+        .map(|p| resolve_case_path(base_dir, p))
+        .unwrap_or_else(|| root.clone());
     load_fs_directory_async(&mut app, left_root, ActivePanel::Left, None);
     load_fs_directory_async(&mut app, right_root, ActivePanel::Right, None);
 
@@ -3840,15 +3847,377 @@ fn run_replay(case_path: &PathBuf, snapshot: Option<PathBuf>) -> Result<()> {
         last_left_dir_token: 0,
         last_right_dir_token: 0,
     };
-    let egui_ctx = egui::Context::default();
+    let mut headless = HeadlessUi::new();
 
     for key in case.keys {
-        apply_replay_key(&egui_ctx, &mut app, &mut ui_cache, &key);
+        apply_replay_key(&mut headless, &mut app, &mut ui_cache, &key);
         drain_async(&mut app, 50);
     }
 
     if let Some(path) = snapshot {
         render_snapshot(&mut app, &mut ui_cache, &path)?;
+    }
+    if let Some(asserts) = case.asserts.as_ref() {
+        run_replay_asserts(base_dir, root.as_path(), &mut app, &mut ui_cache, asserts)?;
+    }
+    Ok(())
+}
+
+struct HeadlessUi {
+    egui_ctx: egui::Context,
+    image_cache: ImageCache,
+    highlight_cache: HashMap<String, egui::text::LayoutJob>,
+    highlight_pending: HashSet<String>,
+    image_req_tx: mpsc::Sender<ImageRequest>,
+    highlight_req_tx: mpsc::Sender<HighlightRequest>,
+}
+
+impl HeadlessUi {
+    fn new() -> Self {
+        let (image_req_tx, _image_req_rx) = mpsc::channel::<ImageRequest>();
+        let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
+        Self {
+            egui_ctx: egui::Context::default(),
+            image_cache: ImageCache::default(),
+            highlight_cache: HashMap::new(),
+            highlight_pending: HashSet::new(),
+            image_req_tx,
+            highlight_req_tx,
+        }
+    }
+
+    fn run_frame(&mut self, app: &mut AppState, ui_cache: &mut UiCache, events: Vec<egui::Event>) {
+        let raw_input = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(SNAPSHOT_WIDTH as f32, SNAPSHOT_HEIGHT as f32),
+            )),
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    native_pixels_per_point: Some(1.0),
+                    inner_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(SNAPSHOT_WIDTH as f32, SNAPSHOT_HEIGHT as f32),
+                    )),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let _ = self.egui_ctx.run(raw_input, |ctx| {
+            let input = ctx.input(|i| i.clone());
+            handle_keyboard(ctx, &input, app, ui_cache);
+            draw_root_ui(UiRender {
+                ctx,
+                app,
+                ui_cache,
+                image_cache: &mut self.image_cache,
+                image_req_tx: &self.image_req_tx,
+                highlight_cache: &self.highlight_cache,
+                highlight_pending: &mut self.highlight_pending,
+                highlight_req_tx: &self.highlight_req_tx,
+            });
+        });
+    }
+}
+
+struct UiRender<'a> {
+    ctx: &'a egui::Context,
+    app: &'a mut AppState,
+    ui_cache: &'a mut UiCache,
+    image_cache: &'a mut ImageCache,
+    image_req_tx: &'a mpsc::Sender<ImageRequest>,
+    highlight_cache: &'a HashMap<String, egui::text::LayoutJob>,
+    highlight_pending: &'a mut HashSet<String>,
+    highlight_req_tx: &'a mpsc::Sender<HighlightRequest>,
+}
+
+fn draw_root_ui(render: UiRender<'_>) {
+    let UiRender {
+        ctx,
+        app,
+        ui_cache,
+        image_cache,
+        image_req_tx,
+        highlight_cache,
+        highlight_pending,
+        highlight_req_tx,
+    } = render;
+    apply_theme(ctx, &app.theme.colors());
+    draw_command_bar(ctx, &app.theme.colors());
+    egui::CentralPanel::default().show(ctx, |ui| {
+        let rect = ui.available_rect_before_wrap();
+        let spacing_x = ui.spacing().item_spacing.x;
+        let panel_width = ((rect.width() - spacing_x) * 0.5).max(0.0);
+        let left_rect =
+            egui::Rect::from_min_size(rect.min, egui::Vec2::new(panel_width, rect.height()));
+        let right_rect = egui::Rect::from_min_size(
+            rect.min + egui::Vec2::new(panel_width + spacing_x, 0.0),
+            egui::Vec2::new(panel_width, rect.height()),
+        );
+
+        ui_cache.left_rows = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                if should_show_editor(app, ActivePanel::Left) {
+                    let is_focused = app.active_panel == ActivePanel::Left;
+                    let theme = app.theme.clone();
+                    let panel = app.panel_mut(ActivePanel::Left);
+                    if let PanelMode::Edit(ref mut edit) = panel.mode {
+                        draw_editor(
+                            ui,
+                            EditorRender {
+                                theme: &theme,
+                                is_focused,
+                                edit,
+                                highlight_cache,
+                                highlight_pending,
+                                highlight_req_tx,
+                                min_height: rect.height(),
+                            },
+                        );
+                    }
+                    ui_cache.left_rows
+                } else if should_show_preview(app, ActivePanel::Left) {
+                    let is_focused = app.active_panel == ActivePanel::Left;
+                    let theme = app.theme.clone();
+                    let panel = app.panel_mut(ActivePanel::Left);
+                    if let PanelMode::Preview(ref mut preview) = panel.mode {
+                        draw_preview(
+                            ui,
+                            PreviewRender {
+                                theme: &theme,
+                                is_focused,
+                                preview,
+                                image_cache,
+                                image_req_tx,
+                                highlight_cache,
+                                highlight_pending,
+                                highlight_req_tx,
+                                min_height: rect.height(),
+                            },
+                        );
+                    }
+                    ui_cache.left_rows
+                } else {
+                    draw_panel(
+                        ui,
+                        app,
+                        ActivePanel::Left,
+                        image_cache,
+                        image_req_tx,
+                        ui_cache.scroll_mode,
+                        rect.height(),
+                    )
+                }
+            })
+            .inner;
+        ui_cache.right_rows = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                if should_show_editor(app, ActivePanel::Right) {
+                    let is_focused = app.active_panel == ActivePanel::Right;
+                    let theme = app.theme.clone();
+                    let panel = app.panel_mut(ActivePanel::Right);
+                    if let PanelMode::Edit(ref mut edit) = panel.mode {
+                        draw_editor(
+                            ui,
+                            EditorRender {
+                                theme: &theme,
+                                is_focused,
+                                edit,
+                                highlight_cache,
+                                highlight_pending,
+                                highlight_req_tx,
+                                min_height: rect.height(),
+                            },
+                        );
+                    }
+                    ui_cache.right_rows
+                } else if should_show_preview(app, ActivePanel::Right) {
+                    let is_focused = app.active_panel == ActivePanel::Right;
+                    let theme = app.theme.clone();
+                    let panel = app.panel_mut(ActivePanel::Right);
+                    if let PanelMode::Preview(ref mut preview) = panel.mode {
+                        draw_preview(
+                            ui,
+                            PreviewRender {
+                                theme: &theme,
+                                is_focused,
+                                preview,
+                                image_cache,
+                                image_req_tx,
+                                highlight_cache,
+                                highlight_pending,
+                                highlight_req_tx,
+                                min_height: rect.height(),
+                            },
+                        );
+                    }
+                    ui_cache.right_rows
+                } else {
+                    draw_panel(
+                        ui,
+                        app,
+                        ActivePanel::Right,
+                        image_cache,
+                        image_req_tx,
+                        ui_cache.scroll_mode,
+                        rect.height(),
+                    )
+                }
+            })
+            .inner;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                rect.min + egui::Vec2::new(panel_width, 0.0),
+                egui::Vec2::new(spacing_x, rect.height()),
+            ),
+            egui::CornerRadius::ZERO,
+            color32(app.theme.colors().divider),
+        );
+    });
+    if app.pending_op.is_some() {
+        draw_confirmation(ctx, app);
+    }
+    if let Some(edit) = app.edit_panel_mut()
+        && edit.confirm_discard
+    {
+        draw_discard_modal(ctx, app);
+    }
+    if app.io_in_flight > 0 {
+        draw_progress_modal(ctx, app);
+    }
+}
+
+fn resolve_case_path(base: &std::path::Path, path: &PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path.clone()
+    } else {
+        base.join(path)
+    }
+}
+
+fn collect_fs_entries(
+    root: &std::path::Path,
+    rel: &std::path::Path,
+    out: &mut HashMap<String, FsEntryKind>,
+) -> Result<()> {
+    let full = root.join(rel);
+    if let Ok(read) = std::fs::read_dir(&full) {
+        for entry in read {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let name = entry.file_name();
+            let child_rel = rel.join(name);
+            let rel_string = child_rel.to_string_lossy().replace('\\', "/");
+            let kind = if file_type.is_dir() {
+                FsEntryKind::Dir
+            } else {
+                FsEntryKind::File
+            };
+            out.insert(rel_string, kind);
+            if file_type.is_dir() {
+                collect_fs_entries(root, &child_rel, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assert_fs(root: &std::path::Path, fs: &FsAssert) -> Result<()> {
+    let mut actual = HashMap::new();
+    collect_fs_entries(root, std::path::Path::new(""), &mut actual)?;
+    for entry in &fs.entries {
+        let expected_kind = entry.kind;
+        let rel = entry.path.replace('\\', "/");
+        let actual_kind = actual
+            .get(&rel)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Missing expected entry \"{}\"", entry.path))?;
+        if actual_kind != expected_kind {
+            return Err(anyhow::anyhow!(
+                "Entry \"{}\" kind mismatch: expected {:?}, got {:?}",
+                entry.path,
+                expected_kind,
+                actual_kind
+            ));
+        }
+    }
+    let mode = fs.mode.unwrap_or(FsCheckMode::Exact);
+    if let FsCheckMode::Exact = mode {
+        let expected_count = fs.entries.len();
+        let actual_count = actual.len();
+        if actual_count != expected_count {
+            return Err(anyhow::anyhow!(
+                "FS entry count mismatch: expected {}, got {}",
+                expected_count,
+                actual_count
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_files(root: &std::path::Path, files: &[FileAssert]) -> Result<()> {
+    for check in files {
+        let path = root.join(&check.path);
+        let data = std::fs::read_to_string(&path)
+            .map_err(|err| anyhow::anyhow!("Failed to read {}: {err}", path.to_string_lossy()))?;
+        if let Some(expected) = check.equals.as_ref() {
+            if data != *expected {
+                return Err(anyhow::anyhow!("File {} contents mismatch", check.path));
+            }
+        } else if let Some(expected) = check.contains.as_ref()
+            && !data.contains(expected)
+        {
+            return Err(anyhow::anyhow!("File {} missing expected text", check.path));
+        }
+    }
+    Ok(())
+}
+
+fn assert_snapshots(
+    base: &std::path::Path,
+    app: &mut AppState,
+    ui_cache: &mut UiCache,
+    snapshots: &[SnapshotAssert],
+) -> Result<()> {
+    for check in snapshots {
+        let actual = resolve_case_path(base, &check.path);
+        let expected = resolve_case_path(base, &check.expected);
+        if let Some(parent) = actual.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        render_snapshot(app, ui_cache, &actual)?;
+        let max_channel_diff = check.max_channel_diff.unwrap_or(4);
+        let max_pixel_fraction = check.max_pixel_fraction.unwrap_or(0.001);
+        let diff = compare_snapshots(&actual, &expected, max_channel_diff, max_pixel_fraction)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        println!(
+            "Snapshot diff: mismatched {} / {} ({:.6}), max channel diff {}",
+            diff.mismatched, diff.total, diff.fraction, diff.max_channel_diff
+        );
+    }
+    Ok(())
+}
+
+fn run_replay_asserts(
+    base: &std::path::Path,
+    root: &std::path::Path,
+    app: &mut AppState,
+    ui_cache: &mut UiCache,
+    asserts: &ReplayAsserts,
+) -> Result<()> {
+    if let Some(fs) = asserts.fs.as_ref() {
+        assert_fs(root, fs)?;
+    }
+    if let Some(files) = asserts.files.as_ref() {
+        assert_files(root, files)?;
+    }
+    if let Some(snapshots) = asserts.snapshots.as_ref() {
+        assert_snapshots(base, app, ui_cache, snapshots)?;
     }
     Ok(())
 }
@@ -3950,141 +4319,16 @@ fn render_snapshot(app: &mut AppState, ui_cache: &mut UiCache, path: &PathBuf) -
         ..Default::default()
     };
     let output = egui_ctx.run(raw_input, |ctx| {
-        apply_theme(ctx, &app.theme.colors());
-        draw_command_bar(ctx, &app.theme.colors());
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let rect = ui.available_rect_before_wrap();
-            let spacing_x = ui.spacing().item_spacing.x;
-            let panel_width = ((rect.width() - spacing_x) * 0.5).max(0.0);
-            let left_rect =
-                egui::Rect::from_min_size(rect.min, egui::Vec2::new(panel_width, rect.height()));
-            let right_rect = egui::Rect::from_min_size(
-                rect.min + egui::Vec2::new(panel_width + spacing_x, 0.0),
-                egui::Vec2::new(panel_width, rect.height()),
-            );
-
-            ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                if should_show_editor(app, ActivePanel::Left) {
-                    let is_focused = app.active_panel == ActivePanel::Left;
-                    let theme = app.theme.clone();
-                    let panel = app.panel_mut(ActivePanel::Left);
-                    if let PanelMode::Edit(ref mut edit) = panel.mode {
-                        draw_editor(
-                            ui,
-                            EditorRender {
-                                theme: &theme,
-                                is_focused,
-                                edit,
-                                highlight_cache: &highlight_cache,
-                                highlight_pending: &mut highlight_pending,
-                                highlight_req_tx: &highlight_req_tx,
-                                min_height: rect.height(),
-                            },
-                        );
-                    }
-                } else if should_show_preview(app, ActivePanel::Left) {
-                    let is_focused = app.active_panel == ActivePanel::Left;
-                    let theme = app.theme.clone();
-                    let panel = app.panel_mut(ActivePanel::Left);
-                    if let PanelMode::Preview(ref mut preview) = panel.mode {
-                        draw_preview(
-                            ui,
-                            PreviewRender {
-                                theme: &theme,
-                                is_focused,
-                                preview,
-                                image_cache: &mut image_cache,
-                                image_req_tx: &image_req_tx,
-                                highlight_cache: &highlight_cache,
-                                highlight_pending: &mut highlight_pending,
-                                highlight_req_tx: &highlight_req_tx,
-                                min_height: rect.height(),
-                            },
-                        );
-                    }
-                } else {
-                    draw_panel(
-                        ui,
-                        app,
-                        ActivePanel::Left,
-                        &mut image_cache,
-                        &image_req_tx,
-                        ui_cache.scroll_mode,
-                        rect.height(),
-                    );
-                }
-            });
-            ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                if should_show_editor(app, ActivePanel::Right) {
-                    let is_focused = app.active_panel == ActivePanel::Right;
-                    let theme = app.theme.clone();
-                    let panel = app.panel_mut(ActivePanel::Right);
-                    if let PanelMode::Edit(ref mut edit) = panel.mode {
-                        draw_editor(
-                            ui,
-                            EditorRender {
-                                theme: &theme,
-                                is_focused,
-                                edit,
-                                highlight_cache: &highlight_cache,
-                                highlight_pending: &mut highlight_pending,
-                                highlight_req_tx: &highlight_req_tx,
-                                min_height: rect.height(),
-                            },
-                        );
-                    }
-                } else if should_show_preview(app, ActivePanel::Right) {
-                    let is_focused = app.active_panel == ActivePanel::Right;
-                    let theme = app.theme.clone();
-                    let panel = app.panel_mut(ActivePanel::Right);
-                    if let PanelMode::Preview(ref mut preview) = panel.mode {
-                        draw_preview(
-                            ui,
-                            PreviewRender {
-                                theme: &theme,
-                                is_focused,
-                                preview,
-                                image_cache: &mut image_cache,
-                                image_req_tx: &image_req_tx,
-                                highlight_cache: &highlight_cache,
-                                highlight_pending: &mut highlight_pending,
-                                highlight_req_tx: &highlight_req_tx,
-                                min_height: rect.height(),
-                            },
-                        );
-                    }
-                } else {
-                    draw_panel(
-                        ui,
-                        app,
-                        ActivePanel::Right,
-                        &mut image_cache,
-                        &image_req_tx,
-                        ui_cache.scroll_mode,
-                        rect.height(),
-                    );
-                }
-            });
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(
-                    rect.min + egui::Vec2::new(panel_width, 0.0),
-                    egui::Vec2::new(spacing_x, rect.height()),
-                ),
-                egui::CornerRadius::ZERO,
-                color32(app.theme.colors().divider),
-            );
+        draw_root_ui(UiRender {
+            ctx,
+            app,
+            ui_cache,
+            image_cache: &mut image_cache,
+            image_req_tx: &image_req_tx,
+            highlight_cache: &highlight_cache,
+            highlight_pending: &mut highlight_pending,
+            highlight_req_tx: &highlight_req_tx,
         });
-        if app.pending_op.is_some() {
-            draw_confirmation(ctx, app);
-        }
-        if let Some(edit) = app.edit_panel_mut()
-            && edit.confirm_discard
-        {
-            draw_discard_modal(ctx, app);
-        }
-        if app.io_in_flight > 0 {
-            draw_progress_modal(ctx, app);
-        }
     });
 
     let paint_jobs = egui_ctx.tessellate(output.shapes, output.pixels_per_point);
