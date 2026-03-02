@@ -5,9 +5,13 @@ use blade_graphics::{
     RenderTargetSet, SurfaceConfig, SurfaceInfo, TextureColor, TextureDesc, TextureFormat,
     TextureSubresources, TextureUsage, TextureViewDesc, ViewDimension,
 };
+use egui::text_edit::TextEditOutput;
 use egui_winit::State as EguiWinitState;
 use exif::{Tag, Value};
 use once_cell::sync::Lazy;
+use png::AdaptiveFilterType;
+use png::Compression;
+use png::FilterType;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -26,10 +30,10 @@ use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    window::{Window, WindowAttributes, WindowId},
+    window::{Icon, Window, WindowAttributes, WindowId},
 };
+use zune_core::bit_depth::BitDepth;
 use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
-use zune_image::codecs::ImageFormat;
 use zune_image::image::Image as ZuneImage;
 
 use fileman::app_state::{
@@ -53,8 +57,8 @@ use replay::{ReplayKey, load_replay_case};
 
 const ROW_HEIGHT: f32 = 24.0;
 const SIZE_COL_WIDTH: f32 = 84.0;
-const SNAPSHOT_WIDTH: u32 = 1280;
-const SNAPSHOT_HEIGHT: u32 = 720;
+const SNAPSHOT_WIDTH: u32 = 800;
+const SNAPSHOT_HEIGHT: u32 = 600;
 const MAX_IMAGE_TEXTURES: usize = 64;
 const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 2;
 const MAX_TEXTURE_SIDE: u32 = 1024;
@@ -106,9 +110,16 @@ struct ImageRequest {
     source: ImageSource,
 }
 
+struct ImageMeta {
+    width: usize,
+    height: usize,
+    depth: BitDepth,
+}
+
 struct ImageResult {
     key: String,
     image: egui::ColorImage,
+    meta: ImageMeta,
 }
 
 enum ImageSource {
@@ -135,6 +146,7 @@ struct HighlightResult {
 #[derive(Default)]
 struct ImageCache {
     textures: HashMap<String, egui::TextureHandle>,
+    meta: HashMap<String, ImageMeta>,
     pending: HashSet<String>,
     order: VecDeque<String>,
 }
@@ -165,20 +177,26 @@ fn blend_color(base: Color, tint: Color, t: f32) -> Color {
     )
 }
 
-fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<egui::ColorImage> {
+fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(egui::ColorImage, ImageMeta)> {
     let options = DecoderOptions::new_fast();
     let image = ZuneImage::read(bytes, options).ok()?;
     let orientation = exif_orientation(&image).unwrap_or(1);
     let (width, height) = image.dimensions();
+    let depth = image.depth();
     let colorspace = image.colorspace();
     let mut frames = image.flatten_to_u8();
     let data = frames.pop()?;
     let rgba = convert_to_rgba(&data, width, height, colorspace)?;
     let (rgba, width, height) = apply_orientation_rgba(rgba, width, height, orientation);
     let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        [out_w, out_h],
-        &out_rgba,
+    let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    Some((
+        color,
+        ImageMeta {
+            width,
+            height,
+            depth,
+        },
     ))
 }
 
@@ -413,6 +431,23 @@ fn downscale_rgba(
     (out_w, out_h, out)
 }
 
+fn cursor_row_col(text: &str, cursor: usize) -> (usize, usize) {
+    let mut row = 1usize;
+    let mut col = 1usize;
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= cursor {
+            break;
+        }
+        if ch == '\n' {
+            row += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
+
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
@@ -439,6 +474,30 @@ fn apply_theme(ctx: &egui::Context, colors: &ThemeColors) {
     style.visuals.hyperlink_color = color32(colors.panel_border_active);
     style.visuals.override_text_color = Some(color32(colors.row_fg_active));
     ctx.set_style(style);
+}
+
+fn app_icon() -> Option<Icon> {
+    let size = 32u32;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let idx = ((y * size + x) * 4) as usize;
+            let (r, g, b) = if x == 0 || y == 0 || x == size - 1 || y == size - 1 {
+                (40, 60, 90)
+            } else if x == size / 2 {
+                (70, 90, 120)
+            } else if x < size / 2 {
+                (35, 45, 65)
+            } else {
+                (28, 38, 55)
+            };
+            rgba[idx] = r;
+            rgba[idx + 1] = g;
+            rgba[idx + 2] = b;
+            rgba[idx + 3] = 255;
+        }
+    }
+    Icon::from_rgba(rgba, size, size).ok()
 }
 
 fn pick_theme(theme_kind: ThemeKind) -> &'static SyntectTheme {
@@ -2274,7 +2333,7 @@ fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
             let editor_height = (ui.available_height() - footer_height).max(0.0);
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
             let desired_rows = (editor_height / row_height).floor().max(1.0) as usize;
-            let mut edit_response = None;
+            let mut edit_output: Option<TextEditOutput> = None;
             egui::ScrollArea::vertical()
                 .id_salt("editor_scroll")
                 .auto_shrink([false, false])
@@ -2288,9 +2347,12 @@ fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                         .desired_width(f32::INFINITY)
                         .desired_rows(desired_rows)
                         .show(ui);
-                    edit_response = Some(output.response);
+                    edit_output = Some(output);
                 });
-            let response = edit_response.unwrap_or_else(|| ui.label(" "));
+            let response = edit_output
+                .as_ref()
+                .map(|output| output.response.clone())
+                .unwrap_or_else(|| ui.label(" "));
             edit.text = text;
             if response.changed() {
                 edit.highlight_hash = hash_text(&edit.text);
@@ -2321,6 +2383,29 @@ fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                 ui.colored_label(
                     color32(colors.row_fg_inactive),
                     "Ctrl+S: save  •  Esc: close",
+                );
+                ui.add_space(6.0);
+                let (row, col) = edit_output
+                    .as_ref()
+                    .and_then(|output| output.cursor_range)
+                    .map(|range| range.primary.index)
+                    .map(|idx| cursor_row_col(&edit.text, idx))
+                    .unwrap_or((1, 1));
+                let info = format!("row: {row}, col: {col}");
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let width = ui
+                    .painter()
+                    .layout_no_wrap(info.clone(), font.clone(), color32(colors.row_fg_inactive))
+                    .size()
+                    .x;
+                let rect = ui.available_rect_before_wrap();
+                let pos = egui::pos2(rect.right() - width, rect.center().y);
+                ui.painter().text(
+                    pos,
+                    egui::Align2::LEFT_CENTER,
+                    info,
+                    font,
+                    color32(colors.row_fg_inactive),
                 );
             });
         });
@@ -2499,6 +2584,19 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                         };
                         if let Some(handle) = image_cache.textures.get(&key).cloned() {
                             touch_image(image_cache, &key);
+                            if let Some(meta) = image_cache.meta.get(&key) {
+                                let depth_bits = match meta.depth {
+                                    BitDepth::Eight => "8-bit",
+                                    BitDepth::Sixteen => "16-bit",
+                                    BitDepth::Float32 => "32-bit",
+                                    _ => "unknown",
+                                };
+                                ui.colored_label(
+                                    text_color,
+                                    format!("{}×{} · {}", meta.width, meta.height, depth_bits),
+                                );
+                                ui.add_space(6.0);
+                            }
                             let sized = egui::load::SizedTexture::from_handle(&handle);
                             let available = ui.available_size();
                             let tex = sized.size;
@@ -2776,18 +2874,18 @@ fn draw_panel(
                                     colors.row_fg_inactive
                                 };
                                 let mut fg = fg;
-                                if !is_selected && !entry.is_dir {
-                                    let tint = if is_text_name(&entry.name) {
-                                        Some(Color::rgba(0.25, 0.75, 0.55, 1.0))
-                                    } else if is_media_name(&entry.name) {
-                                        Some(Color::rgba(0.35, 0.65, 0.98, 1.0))
-                                    } else {
-                                        Some(Color::rgba(0.9, 0.7, 0.3, 1.0))
-                                    };
-                                    if let Some(tint) = tint {
-                                        let factor = if is_active { 0.32 } else { 0.22 };
-                                        fg = blend_color(fg, tint, factor);
-                                    }
+                                let file_tint = if entry.is_dir {
+                                    None
+                                } else if is_text_name(&entry.name) {
+                                    Some(Color::rgba(0.22, 0.78, 0.56, 1.0))
+                                } else if is_media_name(&entry.name) {
+                                    Some(Color::rgba(0.32, 0.68, 1.0, 1.0))
+                                } else {
+                                    Some(Color::rgba(0.92, 0.68, 0.28, 1.0))
+                                };
+                                if !is_selected && let Some(tint) = file_tint {
+                                    let factor = if is_active { 0.42 } else { 0.32 };
+                                    fg = blend_color(fg, tint, factor);
                                 }
 
                                 let (rect, response) = ui.allocate_exact_size(
@@ -2807,6 +2905,10 @@ fn draw_panel(
                                 let icon_rect = egui::Rect::from_min_size(icon_pos, icon_size);
                                 let icon_color = if entry.is_dir {
                                     colors.panel_border_active
+                                } else if is_selected {
+                                    fg
+                                } else if let Some(tint) = file_tint {
+                                    blend_color(fg, tint, 0.85)
                                 } else {
                                     fg
                                 };
@@ -2944,6 +3046,7 @@ struct Runtime {
 impl Runtime {
     fn shutdown(&mut self) {
         self.image_cache.textures.clear();
+        self.image_cache.meta.clear();
         self.image_cache.order.clear();
         self.image_cache.pending.clear();
         self.highlight_cache.clear();
@@ -2975,7 +3078,11 @@ impl ApplicationHandler for App {
         }
 
         let window = event_loop
-            .create_window(WindowAttributes::default().with_title("Fileman (egui)"))
+            .create_window(
+                WindowAttributes::default()
+                    .with_title("Fileman (egui)")
+                    .with_window_icon(app_icon()),
+            )
             .expect("create window");
         let window_id = window.id();
 
@@ -3067,10 +3174,11 @@ impl ApplicationHandler for App {
                         bytes.and_then(|data| decode_image_bytes(&data, MAX_TEXTURE_SIDE))
                     }
                 };
-                if let Some(image) = image {
+                if let Some((image, meta)) = image {
                     let result = ImageResult {
                         key: req.key,
                         image,
+                        meta,
                     };
                     let _ = image_res_tx.send(result);
                 }
@@ -3190,6 +3298,7 @@ impl ApplicationHandler for App {
         };
         let image_cache = ImageCache {
             textures: HashMap::new(),
+            meta: HashMap::new(),
             pending: HashSet::new(),
             order: VecDeque::new(),
         };
@@ -3287,12 +3396,17 @@ impl ApplicationHandler for App {
                             .image_cache
                             .textures
                             .insert(decoded.key.clone(), handle);
+                        runtime
+                            .image_cache
+                            .meta
+                            .insert(decoded.key.clone(), decoded.meta);
                         runtime.image_cache.pending.remove(&decoded.key);
                         while runtime.image_cache.order.len() > MAX_IMAGE_TEXTURES {
                             if let Some(old) = runtime.image_cache.order.pop_front()
                                 && old != decoded.key
                             {
                                 runtime.image_cache.textures.remove(&old);
+                                runtime.image_cache.meta.remove(&old);
                             }
                         }
                         runtime.needs_redraw = true;
@@ -3666,14 +3780,47 @@ fn apply_replay_key(
     ui_cache: &mut UiCache,
     key: &ReplayKey,
 ) {
-    let modifiers = key
-        .modifiers
-        .as_ref()
-        .map(|mods| parse_modifiers(mods))
-        .unwrap_or(egui::Modifiers::NONE);
+    let modifiers = parse_modifiers(&key.modifiers);
 
     let mut events = Vec::new();
     let key_name = key.key.as_str();
+    if key_name.eq_ignore_ascii_case("wait") {
+        wait_for_idle(headless, app, ui_cache, 600);
+        return;
+    }
+    if let Some(rest) = key_name.strip_prefix("wait:")
+        && let Ok(ms) = rest.trim().parse::<u64>()
+    {
+        wait_for_duration(
+            headless,
+            app,
+            ui_cache,
+            std::time::Duration::from_millis(ms),
+        );
+        return;
+    }
+    if let Some(rest) = key_name.strip_prefix("select:") {
+        let name = rest.trim();
+        let window_rows = match app.active_panel {
+            ActivePanel::Left => ui_cache.left_rows.max(1),
+            ActivePanel::Right => ui_cache.right_rows.max(1),
+        };
+        let panel = app.get_active_panel_mut();
+        if let Some(index) = panel.browser.entries.iter().position(|e| e.name == name) {
+            app.select_entry(index, window_rows);
+        } else {
+            let mut sample = String::new();
+            for entry in panel.browser.entries.iter().take(8) {
+                if !sample.is_empty() {
+                    sample.push_str(", ");
+                }
+                sample.push_str(&entry.name);
+            }
+            panic!("Replay select failed for \"{name}\". Entries: [{sample}]");
+        }
+        headless.run_frame(app, ui_cache, Vec::new());
+        return;
+    }
     if let Some(rest) = key_name.strip_prefix("text:") {
         events.push(egui::Event::Text(rest.to_string()));
     } else if key_name.len() == 1 && modifiers == egui::Modifiers::NONE {
@@ -3697,17 +3844,58 @@ fn apply_replay_key(
     headless.run_frame(app, ui_cache, events);
 }
 
+fn is_app_pending(app: &AppState) -> bool {
+    let left = &app.left_panel.browser;
+    let right = &app.right_panel.browser;
+    let edit_loading = app.edit_panel().map(|edit| edit.loading).unwrap_or(false);
+    let search_running = matches!(app.search_status, SearchStatus::Running(_));
+    app.io_in_flight > 0
+        || left.loading
+        || right.loading
+        || left.entries_rx.is_some()
+        || right.entries_rx.is_some()
+        || edit_loading
+        || search_running
+        || !app.dir_size_pending.is_empty()
+}
+
 fn drain_async(app: &mut AppState, max_iters: usize) {
     for _ in 0..max_iters {
         let changed = pump_async(app);
-        let pending = app.io_in_flight > 0
-            || app.left_panel.browser.loading
-            || app.right_panel.browser.loading
-            || app.left_panel.browser.entries_rx.is_some()
-            || app.right_panel.browser.entries_rx.is_some();
+        let pending = is_app_pending(app);
         if !changed && !pending {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+}
+
+fn wait_for_idle(
+    headless: &mut HeadlessUi,
+    app: &mut AppState,
+    ui_cache: &mut UiCache,
+    max_iters: usize,
+) {
+    for _ in 0..max_iters {
+        let changed = pump_async(app);
+        headless.run_frame(app, ui_cache, Vec::new());
+        if !changed && !is_app_pending(app) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+}
+
+fn wait_for_duration(
+    headless: &mut HeadlessUi,
+    app: &mut AppState,
+    ui_cache: &mut UiCache,
+    duration: std::time::Duration,
+) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < duration {
+        let _ = pump_async(app);
+        headless.run_frame(app, ui_cache, Vec::new());
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
 }
@@ -3819,20 +4007,18 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
 
 fn run_replay(case_path: &PathBuf, snapshot: Option<PathBuf>) -> Result<()> {
     let case = load_replay_case(case_path)?;
-    let base_dir = case_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let root = resolve_case_path(base_dir, &case.root);
+    let repo_root = std::env::current_dir()?;
+    let root = resolve_case_path(&repo_root, &case.root);
     let mut app = init_headless_app(Some(root.clone()))?;
     let left_root = case
         .left
         .as_ref()
-        .map(|p| resolve_case_path(base_dir, p))
+        .map(|p| resolve_case_path(&repo_root, p))
         .unwrap_or_else(|| root.clone());
     let right_root = case
         .right
         .as_ref()
-        .map(|p| resolve_case_path(base_dir, p))
+        .map(|p| resolve_case_path(&repo_root, p))
         .unwrap_or_else(|| root.clone());
     load_fs_directory_async(&mut app, left_root, ActivePanel::Left, None);
     load_fs_directory_async(&mut app, right_root, ActivePanel::Right, None);
@@ -3857,9 +4043,13 @@ fn run_replay(case_path: &PathBuf, snapshot: Option<PathBuf>) -> Result<()> {
     if let Some(path) = snapshot {
         render_snapshot(&mut app, &mut ui_cache, &path)?;
     }
-    if let Some(asserts) = case.asserts.as_ref() {
-        run_replay_asserts(base_dir, root.as_path(), &mut app, &mut ui_cache, asserts)?;
-    }
+    run_replay_asserts(
+        &repo_root,
+        root.as_path(),
+        &mut app,
+        &mut ui_cache,
+        &case.asserts,
+    )?;
     Ok(())
 }
 
@@ -4145,13 +4335,13 @@ fn assert_fs(root: &std::path::Path, fs: &FsAssert) -> Result<()> {
             ));
         }
     }
-    let mode = fs.mode.unwrap_or(FsCheckMode::Exact);
-    if let FsCheckMode::Exact = mode {
+    if let FsCheckMode::Exact = fs.mode {
         let expected_count = fs.entries.len();
         let actual_count = actual.len();
         if actual_count != expected_count {
             return Err(anyhow::anyhow!(
-                "FS entry count mismatch: expected {}, got {}",
+                "FS entry count mismatch at {}: expected {}, got {}",
+                root.to_string_lossy(),
                 expected_count,
                 actual_count
             ));
@@ -4191,10 +4381,20 @@ fn assert_snapshots(
             std::fs::create_dir_all(parent)?;
         }
         render_snapshot(app, ui_cache, &actual)?;
-        let max_channel_diff = check.max_channel_diff.unwrap_or(4);
-        let max_pixel_fraction = check.max_pixel_fraction.unwrap_or(0.001);
-        let diff = compare_snapshots(&actual, &expected, max_channel_diff, max_pixel_fraction)
-            .map_err(|err| anyhow::anyhow!(err))?;
+        if !expected.exists() {
+            println!(
+                "Snapshot reference missing, wrote {}",
+                actual.to_string_lossy()
+            );
+            continue;
+        }
+        let diff = compare_snapshots(
+            &actual,
+            &expected,
+            check.max_channel_diff,
+            check.max_pixel_fraction,
+        )
+        .map_err(|err| anyhow::anyhow!(err))?;
         println!(
             "Snapshot diff: mismatched {} / {} ({:.6}), max channel diff {}",
             diff.mismatched, diff.total, diff.fraction, diff.max_channel_diff
@@ -4213,11 +4413,11 @@ fn run_replay_asserts(
     if let Some(fs) = asserts.fs.as_ref() {
         assert_fs(root, fs)?;
     }
-    if let Some(files) = asserts.files.as_ref() {
-        assert_files(root, files)?;
+    if !asserts.files.is_empty() {
+        assert_files(root, &asserts.files)?;
     }
-    if let Some(snapshots) = asserts.snapshots.as_ref() {
-        assert_snapshots(base, app, ui_cache, snapshots)?;
+    if !asserts.snapshots.is_empty() {
+        assert_snapshots(base, app, ui_cache, &asserts.snapshots)?;
     }
     Ok(())
 }
@@ -4280,6 +4480,7 @@ fn render_snapshot(app: &mut AppState, ui_cache: &mut UiCache, path: &PathBuf) -
     let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<HighlightRequest>();
     let mut image_cache = ImageCache {
         textures: HashMap::new(),
+        meta: HashMap::new(),
         pending: HashSet::new(),
         order: VecDeque::new(),
     };
@@ -4437,10 +4638,25 @@ fn save_snapshot_png(
         dst_row.copy_from_slice(src_row);
     }
 
-    let image = ZuneImage::from_u8(&data, width as usize, height as usize, ColorSpace::RGBA);
-    image
-        .save_to(path, ImageFormat::PNG)
-        .map_err(|err| anyhow::anyhow!(format!("Failed to encode snapshot: {err:?}")))?;
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for chunk in data.chunks_exact(4) {
+        rgb.push(chunk[0]);
+        rgb.push(chunk[1]);
+        rgb.push(chunk[2]);
+    }
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(Compression::Best);
+    encoder.set_filter(FilterType::Paeth);
+    encoder.set_adaptive_filter(AdaptiveFilterType::Adaptive);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|err| anyhow::anyhow!(format!("Failed to write PNG header: {err}")))?;
+    writer
+        .write_image_data(&rgb)
+        .map_err(|err| anyhow::anyhow!(format!("Failed to write PNG data: {err}")))?;
     Ok(())
 }
 
