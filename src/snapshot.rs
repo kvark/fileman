@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use png::{AdaptiveFilterType, Compression, FilterType};
 use zune_core::colorspace::ColorSpace;
 use zune_image::image::Image as ZuneImage;
 
@@ -55,6 +56,48 @@ pub fn compare_snapshots(
         max_channel_diff: max_seen_diff,
         fraction,
     })
+}
+
+pub fn align_to(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
+}
+
+pub fn save_snapshot_png(
+    buffer: &blade_graphics::Buffer,
+    width: u32,
+    height: u32,
+    bytes_per_row: usize,
+    path: &PathBuf,
+) -> Result<(), String> {
+    let row_bytes = (width * 4) as usize;
+    let mut data = vec![0u8; row_bytes * height as usize];
+    let src = buffer.data() as *const u8;
+    for y in 0..height as usize {
+        let src_row = unsafe { std::slice::from_raw_parts(src.add(y * bytes_per_row), row_bytes) };
+        let dst_row = &mut data[y * row_bytes..(y + 1) * row_bytes];
+        dst_row.copy_from_slice(src_row);
+    }
+
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for chunk in data.chunks_exact(4) {
+        rgb.push(chunk[0]);
+        rgb.push(chunk[1]);
+        rgb.push(chunk[2]);
+    }
+    let file = std::fs::File::create(path).map_err(|err| format!("Failed to create PNG: {err}"))?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(Compression::Best);
+    encoder.set_filter(FilterType::Paeth);
+    encoder.set_adaptive_filter(AdaptiveFilterType::Adaptive);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|err| format!("Failed to write PNG header: {err}"))?;
+    writer
+        .write_image_data(&rgb)
+        .map_err(|err| format!("Failed to write PNG data: {err}"))?;
+    Ok(())
 }
 
 fn decode_rgba(path: &PathBuf) -> Result<(usize, usize, Vec<u8>), String> {

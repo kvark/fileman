@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path,
+    sync::Arc,
     sync::mpsc,
     time::Instant,
 };
@@ -39,6 +40,15 @@ pub struct BrowserState {
     pub history_forward: Vec<PanelSnapshot>,
 }
 
+pub struct ContainerDirCache {
+    pub entries: Vec<DirEntry>,
+    pub loading: bool,
+    pub loading_progress: Option<(usize, Option<usize>)>,
+    pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
+    pub selected_index: usize,
+    pub top_index: usize,
+}
+
 pub struct PreviewState {
     pub content: Option<PreviewContent>,
     pub key: Option<String>,
@@ -52,6 +62,10 @@ pub struct PreviewState {
     pub find_index: usize,
     pub find_focus: bool,
     pub request_id: u64,
+    pub wrap: bool,
+    pub show_whitespace: bool,
+    pub bytes_per_row: usize,
+    pub bytes_per_row_auto: bool,
 }
 
 pub struct EditState {
@@ -87,6 +101,7 @@ fn history_key(snapshot: &PanelSnapshot) -> String {
             "container:{}:{}:{}",
             match kind {
                 ContainerKind::Zip => "zip",
+                ContainerKind::Tar => "tar",
                 ContainerKind::TarGz => "tar.gz",
                 ContainerKind::TarBz2 => "tar.bz2",
             },
@@ -118,6 +133,7 @@ pub struct AppState {
     pub left_panel: PanelState,
     pub right_panel: PanelState,
     pub active_panel: ActivePanel,
+    pub wake: Option<Arc<dyn Fn() + Send + Sync>>,
     pub preview_tx: mpsc::Sender<PreviewRequest>,
     pub preview_rx: mpsc::Receiver<(u64, PreviewContent)>,
     pub preview_request_id: u64,
@@ -132,6 +148,7 @@ pub struct AppState {
     pub dir_size_pending: HashSet<path::PathBuf>,
     pub fs_last_selected_name: HashMap<path::PathBuf, String>,
     pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
+    pub container_dir_cache: HashMap<(path::PathBuf, String, ContainerKind), ContainerDirCache>,
     pub theme: Theme,
     pub theme_picker_open: bool,
     pub theme_picker_selected: Option<usize>,
@@ -350,6 +367,32 @@ impl AppState {
                     .insert((ap, cwd, kind), selected_name);
             }
         }
+    }
+
+    pub fn stash_container_cache(&mut self, which: ActivePanel) {
+        let (key, cache) = {
+            let panel = self.panel_mut(which);
+            let browser = &mut panel.browser;
+            let BrowserMode::Container {
+                ref archive_path,
+                ref cwd,
+                kind,
+            } = browser.browser_mode
+            else {
+                return;
+            };
+            let key = (archive_path.clone(), cwd.clone(), kind);
+            let cache = ContainerDirCache {
+                entries: browser.entries.clone(),
+                loading: browser.loading,
+                loading_progress: browser.loading_progress,
+                entries_rx: browser.entries_rx.take(),
+                selected_index: browser.selected_index,
+                top_index: browser.top_index,
+            };
+            (key, cache)
+        };
+        self.container_dir_cache.insert(key, cache);
     }
 
     pub fn select_entry_by_name(&mut self, which: ActivePanel, name: &str) {
@@ -600,6 +643,10 @@ impl AppState {
                 find_index: 0,
                 find_focus: false,
                 request_id,
+                wrap: true,
+                show_whitespace: false,
+                bytes_per_row: 16,
+                bytes_per_row_auto: true,
             };
             panel.mode = PanelMode::Preview(preview);
         }

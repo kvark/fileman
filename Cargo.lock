@@ -531,6 +531,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -856,6 +862,8 @@ dependencies = [
  "egui-winit",
  "env_logger",
  "flate2",
+ "gif",
+ "image-webp",
  "kamadak-exif",
  "log",
  "memchr",
@@ -870,6 +878,7 @@ dependencies = [
  "toml",
  "winit",
  "zip",
+ "zune-bmp",
  "zune-core",
  "zune-image",
 ]
@@ -994,6 +1003,16 @@ dependencies = [
  "libc",
  "r-efi",
  "wasip2",
+]
+
+[[package]]
+name = "gif"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5df2ba84018d80c213569363bdcd0c64e6933c67fe4c1d60ecf822971a3c35e"
+dependencies = [
+ "color_quant",
+ "weezl",
 ]
 
 [[package]]
@@ -1208,6 +1227,16 @@ dependencies = [
  "num-traits",
  "png 0.18.0",
  "tiff",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
 ]
 
 [[package]]
@@ -3655,6 +3684,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfcd145825aace48cff44a8844de64bf75feec3080e0aa5cdbde72961ae51a65"
 
 [[package]]
+name = "zune-bmp"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b1d6d8d84344ba202fcf02d6505ab57c2d775ae07dcb64809421735d8ce8c0f"
+dependencies = [
+ "zune-core",
+]
+
+[[package]]
 name = "zune-core"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3669,6 +3707,7 @@ dependencies = [
  "bytemuck",
  "jpeg-encoder",
  "kamadak-exif",
+ "zune-bmp",
  "zune-core",
  "zune-jpeg",
  "zune-png",
