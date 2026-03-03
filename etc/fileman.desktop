@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Fileman
+Exec=fileman
+Icon=fileman
+Categories=System;FileTools;FileManager;
+Terminal=false
