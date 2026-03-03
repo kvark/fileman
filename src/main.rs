@@ -8,16 +8,16 @@ use blade_graphics::{
 use egui::text_edit::TextEditOutput;
 use egui_winit::State as EguiWinitState;
 use exif::{Tag, Value};
+use gif::{ColorOutput, DecodeOptions};
+use image_webp::WebPDecoder;
 use once_cell::sync::Lazy;
-use png::AdaptiveFilterType;
-use png::Compression;
-use png::FilterType;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     hash::{Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
 };
 use syntect::{
@@ -32,6 +32,7 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::{Icon, Window, WindowAttributes, WindowId},
 };
+use zune_bmp::BmpDecoder;
 use zune_core::bit_depth::BitDepth;
 use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
 use zune_image::image::Image as ZuneImage;
@@ -44,7 +45,8 @@ use fileman::core::{
     ActivePanel, BrowserMode, ContainerKind, DirBatch, DirEntry, EditLoadRequest, EditLoadResult,
     EntryLocation, ImageLocation, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
     SearchMode, SearchProgress, SearchRequest, container_display_path, container_kind_from_path,
-    format_size, is_media_name, is_text_name, read_container_directory_with_progress,
+    format_size, hexdump_with_width, is_media_name, is_text_name,
+    read_container_directory_with_progress,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
 use fileman::workers::{
@@ -52,7 +54,7 @@ use fileman::workers::{
 };
 use replay::{FileAssert, FsAssert, FsCheckMode, FsEntryKind, ReplayAsserts, SnapshotAssert};
 mod replay;
-use fileman::snapshot::compare_snapshots;
+use fileman::snapshot::{align_to, compare_snapshots, save_snapshot_png};
 use replay::{ReplayKey, load_replay_case};
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -122,6 +124,11 @@ struct ImageResult {
     meta: ImageMeta,
 }
 
+enum ImageResponse {
+    Ok(ImageResult),
+    Err { key: String, message: String },
+}
+
 enum ImageSource {
     Fs(PathBuf),
     Container {
@@ -147,6 +154,7 @@ struct HighlightResult {
 struct ImageCache {
     textures: HashMap<String, egui::TextureHandle>,
     meta: HashMap<String, ImageMeta>,
+    failures: HashMap<String, String>,
     pending: HashSet<String>,
     order: VecDeque<String>,
 }
@@ -179,15 +187,105 @@ fn blend_color(base: Color, tint: Color, t: f32) -> Color {
 
 fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(egui::ColorImage, ImageMeta)> {
     let options = DecoderOptions::new_fast();
-    let image = ZuneImage::read(bytes, options).ok()?;
-    let orientation = exif_orientation(&image).unwrap_or(1);
-    let (width, height) = image.dimensions();
-    let depth = image.depth();
-    let colorspace = image.colorspace();
-    let mut frames = image.flatten_to_u8();
-    let data = frames.pop()?;
+    if let Ok(image) = ZuneImage::read(bytes, options) {
+        let orientation = exif_orientation(&image).unwrap_or(1);
+        let (width, height) = image.dimensions();
+        let depth = image.depth();
+        let colorspace = image.colorspace();
+        let mut frames = image.flatten_to_u8();
+        let data = frames.pop()?;
+        let rgba = convert_to_rgba(&data, width, height, colorspace)?;
+        let (rgba, width, height) = apply_orientation_rgba(rgba, width, height, orientation);
+        let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
+        let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+        return Some((
+            color,
+            ImageMeta {
+                width,
+                height,
+                depth,
+            },
+        ));
+    }
+
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return decode_webp_bytes(bytes, max_side);
+    }
+
+    if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return decode_gif_bytes(bytes, max_side);
+    }
+
+    if bytes.len() >= 2 && bytes[0] == b'B' && bytes[1] == b'M' {
+        return decode_bmp_bytes(bytes, max_side);
+    }
+
+    None
+}
+
+fn decode_gif_bytes(bytes: &[u8], max_side: u32) -> Option<(egui::ColorImage, ImageMeta)> {
+    let mut options = DecodeOptions::new();
+    options.set_color_output(ColorOutput::RGBA);
+    let cursor = std::io::Cursor::new(bytes);
+    let mut decoder = options.read_info(cursor).ok()?;
+    let frame = decoder.read_next_frame().ok()??;
+    let width = usize::from(frame.width);
+    let height = usize::from(frame.height);
+    let rgba = frame.buffer.to_vec();
+    if rgba.len() != width * height * 4 {
+        return None;
+    }
+    let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
+    let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    Some((
+        color,
+        ImageMeta {
+            width,
+            height,
+            depth: BitDepth::Eight,
+        },
+    ))
+}
+
+fn decode_webp_bytes(bytes: &[u8], max_side: u32) -> Option<(egui::ColorImage, ImageMeta)> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut decoder = WebPDecoder::new(cursor).ok()?;
+    let size = decoder.output_buffer_size()?;
+    let mut data = vec![0u8; size];
+    decoder.read_image(&mut data).ok()?;
+    let (width, height) = decoder.dimensions();
+    let width = width as usize;
+    let height = height as usize;
+    let has_alpha = decoder.has_alpha();
+    let rgba = if has_alpha {
+        data
+    } else {
+        let mut out = Vec::with_capacity(width * height * 4);
+        for rgb in data.chunks_exact(3) {
+            out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+        out
+    };
+    let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
+    let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    Some((
+        color,
+        ImageMeta {
+            width,
+            height,
+            depth: BitDepth::Eight,
+        },
+    ))
+}
+
+fn decode_bmp_bytes(bytes: &[u8], max_side: u32) -> Option<(egui::ColorImage, ImageMeta)> {
+    let mut decoder = BmpDecoder::new(bytes);
+    decoder.decode_headers().ok()?;
+    let (width, height) = decoder.get_dimensions()?;
+    let depth = decoder.get_depth();
+    let colorspace = decoder.get_colorspace()?;
+    let data = decoder.decode().ok()?;
     let rgba = convert_to_rgba(&data, width, height, colorspace)?;
-    let (rgba, width, height) = apply_orientation_rgba(rgba, width, height, orientation);
     let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
     let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
     Some((
@@ -853,8 +951,10 @@ fn load_fs_directory_async(
         has_parent_entry = true;
     }
 
+    app.stash_container_cache(target_panel.clone());
     let (tx, rx) = mpsc::channel::<DirBatch>();
     let path_clone = path.clone();
+    let wake = app.wake.clone();
     let dir_sizes_snapshot = app.dir_sizes.clone();
     let dir_sizes_fallback = app.dir_sizes.clone();
 
@@ -976,6 +1076,9 @@ fn load_fs_directory_async(
                 } else {
                     let _ = tx.send(DirBatch::Append(batch));
                 }
+                if let Some(ref wake) = wake {
+                    wake();
+                }
                 start = end;
             }
         });
@@ -1007,301 +1110,355 @@ fn load_container_directory_async(
     target_panel: ActivePanel,
     prefer_name: Option<String>,
 ) {
-    let mut initial: Vec<DirEntry> = Vec::new();
-    if !cwd.is_empty() {
-        let parent = cwd
-            .trim_end_matches('/')
-            .rsplit_once('/')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_default();
-        initial.push(DirEntry {
-            name: "..".into(),
-            is_dir: true,
-            location: EntryLocation::Container {
-                kind,
-                archive_path: archive_path.clone(),
-                inner_path: parent,
-            },
-            size: None,
-        });
+    app.stash_container_cache(target_panel.clone());
+    let cache_key = (archive_path.clone(), cwd.clone(), kind);
+    let mut cached = app.container_dir_cache.remove(&cache_key);
+    let mut initial: Vec<DirEntry> = if let Some(ref cache) = cached {
+        cache.entries.clone()
     } else {
-        let parent = archive_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-        initial.push(DirEntry {
-            name: "..".into(),
-            is_dir: true,
-            location: EntryLocation::Fs(parent),
-            size: None,
-        });
+        Vec::new()
+    };
+    let cached_selection = cached
+        .as_ref()
+        .map(|cache| (cache.selected_index, cache.top_index));
+    if initial.is_empty() {
+        if !cwd.is_empty() {
+            let parent = cwd
+                .trim_end_matches('/')
+                .rsplit_once('/')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            initial.push(DirEntry {
+                name: "..".into(),
+                is_dir: true,
+                location: EntryLocation::Container {
+                    kind,
+                    archive_path: archive_path.clone(),
+                    inner_path: parent,
+                },
+                size: None,
+            });
+        } else {
+            let parent = archive_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            initial.push(DirEntry {
+                name: "..".into(),
+                is_dir: true,
+                location: EntryLocation::Fs(parent),
+                size: None,
+            });
+        }
     }
 
+    let resume_rx = cached.as_mut().and_then(|cache| cache.entries_rx.take());
+    let skip_loading = resume_rx.is_some() || cached.as_ref().is_some_and(|c| !c.loading);
     let (tx, rx) = mpsc::channel::<DirBatch>();
     let archive_clone = archive_path.clone();
     let cwd_clone = cwd.clone();
     let kind_clone = kind;
+    let wake = app.wake.clone();
 
-    if kind == ContainerKind::TarBz2 {
-        thread::spawn(move || {
-            let prefix = if cwd_clone.is_empty() {
-                "".to_string()
-            } else {
-                format!("{}/", cwd_clone.trim_end_matches('/'))
-            };
-            let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut seen_files: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut pending: Vec<DirEntry> = Vec::new();
-            let mut loaded = 0usize;
-            let mut sent_first = false;
-            const BATCH: usize = 200;
-            const DECIDE_LIMIT: usize = 64;
-            let mut decided = false;
-            let mut implicit_root: Option<String> = None;
-            let mut buffered: Vec<String> = Vec::new();
-            let mut root_candidate: Option<String> = None;
-            let mut seen_root_file = false;
-            let mut seen_other_root = false;
-
-            struct TarEmitContext<'a> {
-                implicit_prefix: Option<&'a str>,
-                cwd: &'a str,
-                kind: ContainerKind,
-                archive_path: &'a Path,
-                pending: &'a mut Vec<DirEntry>,
-                seen_dirs: &'a mut std::collections::HashSet<String>,
-                seen_files: &'a mut std::collections::HashSet<String>,
-                loaded: &'a mut usize,
-            }
-
-            fn emit_name(name: &str, ctx: &mut TarEmitContext<'_>) {
-                let rem = if let Some(prefix) = ctx.implicit_prefix {
-                    if !name.starts_with(prefix) {
-                        return;
-                    }
-                    let trimmed = name[prefix.len()..].trim_start_matches('/');
-                    if trimmed.is_empty() {
-                        return;
-                    }
-                    trimmed
+    if !skip_loading {
+        if matches!(kind, ContainerKind::TarBz2 | ContainerKind::Tar) {
+            thread::spawn(move || {
+                let prefix = if cwd_clone.is_empty() {
+                    "".to_string()
                 } else {
-                    name
+                    format!("{}/", cwd_clone.trim_end_matches('/'))
                 };
+                let mut seen_dirs: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut seen_files: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut pending: Vec<DirEntry> = Vec::new();
+                let mut loaded = 0usize;
+                let mut sent_first = false;
+                const BATCH: usize = 200;
+                const DECIDE_LIMIT: usize = 64;
+                let mut decided = false;
+                let mut implicit_root: Option<String> = None;
+                let mut buffered: Vec<String> = Vec::new();
+                let mut root_candidate: Option<String> = None;
+                let mut seen_root_file = false;
+                let mut seen_other_root = false;
 
-                if let Some(slash) = rem.find('/') {
-                    let dir = rem[..slash].to_string();
-                    if ctx.seen_dirs.insert(dir.clone()) {
+                struct TarEmitContext<'a> {
+                    implicit_prefix: Option<&'a str>,
+                    cwd: &'a str,
+                    kind: ContainerKind,
+                    archive_path: &'a Path,
+                    pending: &'a mut Vec<DirEntry>,
+                    seen_dirs: &'a mut std::collections::HashSet<String>,
+                    seen_files: &'a mut std::collections::HashSet<String>,
+                    loaded: &'a mut usize,
+                }
+
+                fn emit_name(name: &str, ctx: &mut TarEmitContext<'_>) {
+                    let rem = if let Some(prefix) = ctx.implicit_prefix {
+                        if !name.starts_with(prefix) {
+                            return;
+                        }
+                        let trimmed = name[prefix.len()..].trim_start_matches('/');
+                        if trimmed.is_empty() {
+                            return;
+                        }
+                        trimmed
+                    } else {
+                        name
+                    };
+
+                    if let Some(slash) = rem.find('/') {
+                        let dir = rem[..slash].to_string();
+                        if ctx.seen_dirs.insert(dir.clone()) {
+                            ctx.pending.push(DirEntry {
+                                name: dir.clone(),
+                                is_dir: true,
+                                location: EntryLocation::Container {
+                                    kind: ctx.kind,
+                                    archive_path: ctx.archive_path.to_path_buf(),
+                                    inner_path: if let Some(prefix) = ctx.implicit_prefix {
+                                        format!("{}{}", prefix, dir)
+                                    } else if ctx.cwd.is_empty() {
+                                        dir
+                                    } else {
+                                        format!("{}/{}", ctx.cwd.trim_end_matches('/'), dir)
+                                    },
+                                },
+                                size: None,
+                            });
+                            *ctx.loaded += 1;
+                        }
+                    } else if ctx.seen_files.insert(rem.to_string()) {
+                        let file_name = rem.to_string();
                         ctx.pending.push(DirEntry {
-                            name: dir.clone(),
-                            is_dir: true,
+                            name: file_name.clone(),
+                            is_dir: false,
                             location: EntryLocation::Container {
                                 kind: ctx.kind,
                                 archive_path: ctx.archive_path.to_path_buf(),
                                 inner_path: if let Some(prefix) = ctx.implicit_prefix {
-                                    format!("{}{}", prefix, dir)
+                                    format!("{}{}", prefix, file_name)
                                 } else if ctx.cwd.is_empty() {
-                                    dir
+                                    file_name
                                 } else {
-                                    format!("{}/{}", ctx.cwd.trim_end_matches('/'), dir)
+                                    format!("{}/{}", ctx.cwd.trim_end_matches('/'), file_name)
                                 },
                             },
                             size: None,
                         });
                         *ctx.loaded += 1;
                     }
-                } else if ctx.seen_files.insert(rem.to_string()) {
-                    let file_name = rem.to_string();
-                    ctx.pending.push(DirEntry {
-                        name: file_name.clone(),
-                        is_dir: false,
-                        location: EntryLocation::Container {
-                            kind: ctx.kind,
-                            archive_path: ctx.archive_path.to_path_buf(),
-                            inner_path: if let Some(prefix) = ctx.implicit_prefix {
-                                format!("{}{}", prefix, file_name)
-                            } else if ctx.cwd.is_empty() {
-                                file_name
-                            } else {
-                                format!("{}/{}", ctx.cwd.trim_end_matches('/'), file_name)
-                            },
-                        },
-                        size: None,
-                    });
-                    *ctx.loaded += 1;
                 }
-            }
 
-            let file = match std::fs::File::open(&archive_clone) {
-                Ok(file) => file,
-                Err(e) => {
-                    let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
-                    return;
-                }
-            };
-            let reader = std::io::BufReader::new(file);
-            let decoder = bzip2::read::BzDecoder::new(reader);
-            let mut archive = tar::Archive::new(decoder);
-            let entries = match archive.entries() {
-                Ok(entries) => entries,
-                Err(e) => {
-                    let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
-                    return;
-                }
-            };
-
-            for entry in entries.flatten() {
-                let path = match entry.path() {
-                    Ok(path) => path,
-                    Err(_) => continue,
+                let file = match std::fs::File::open(&archive_clone) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
+                        if let Some(ref wake) = wake {
+                            wake();
+                        }
+                        return;
+                    }
                 };
-                let name = fileman::core::normalize_archive_path(&path);
-                if name.is_empty() || !name.starts_with(&prefix) {
-                    continue;
-                }
-                let rem = &name[prefix.len()..];
-                if rem.is_empty() {
-                    continue;
-                }
-                if !decided && cwd_clone.is_empty() {
-                    buffered.push(name.clone());
-                    if let Some(slash) = rem.find('/') {
-                        let root = rem[..slash].to_string();
-                        match root_candidate.as_ref() {
-                            None => root_candidate = Some(root),
-                            Some(existing) if existing != &root => seen_other_root = true,
-                            _ => {}
+                let reader = std::io::BufReader::new(file);
+                let reader: Box<dyn Read> = match kind_clone {
+                    ContainerKind::TarBz2 => Box::new(bzip2::read::BzDecoder::new(reader)),
+                    ContainerKind::Tar => Box::new(reader),
+                    _ => unreachable!(),
+                };
+                let mut archive = tar::Archive::new(reader);
+                let entries = match archive.entries() {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
+                        if let Some(ref wake) = wake {
+                            wake();
+                        }
+                        return;
+                    }
+                };
+
+                for entry in entries.flatten() {
+                    let path = match entry.path() {
+                        Ok(path) => path,
+                        Err(_) => continue,
+                    };
+                    let name = fileman::core::normalize_archive_path(&path);
+                    if name.is_empty() || !name.starts_with(&prefix) {
+                        continue;
+                    }
+                    let rem = &name[prefix.len()..];
+                    if rem.is_empty() {
+                        continue;
+                    }
+                    if !decided && cwd_clone.is_empty() {
+                        buffered.push(name.clone());
+                        if let Some(slash) = rem.find('/') {
+                            let root = rem[..slash].to_string();
+                            match root_candidate.as_ref() {
+                                None => root_candidate = Some(root),
+                                Some(existing) if existing != &root => seen_other_root = true,
+                                _ => {}
+                            }
+                        } else {
+                            seen_root_file = true;
+                        }
+
+                        if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
+                            decided = true;
+                            if !seen_root_file && !seen_other_root {
+                                implicit_root = root_candidate.clone();
+                            }
+                            let root_ref = implicit_root
+                                .as_ref()
+                                .map(|root| format!("{}/", root.trim_end_matches('/')));
+                            for buffered_name in buffered.drain(..) {
+                                let mut ctx = TarEmitContext {
+                                    implicit_prefix: root_ref.as_deref(),
+                                    cwd: &cwd_clone,
+                                    kind: kind_clone,
+                                    archive_path: archive_clone.as_path(),
+                                    pending: &mut pending,
+                                    seen_dirs: &mut seen_dirs,
+                                    seen_files: &mut seen_files,
+                                    loaded: &mut loaded,
+                                };
+                                emit_name(&buffered_name, &mut ctx);
+                            }
+                        } else {
+                            continue;
                         }
                     } else {
-                        seen_root_file = true;
-                    }
-
-                    if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
-                        decided = true;
-                        if !seen_root_file && !seen_other_root {
-                            implicit_root = root_candidate.clone();
-                        }
                         let root_ref = implicit_root
                             .as_ref()
                             .map(|root| format!("{}/", root.trim_end_matches('/')));
-                        for buffered_name in buffered.drain(..) {
-                            let mut ctx = TarEmitContext {
-                                implicit_prefix: root_ref.as_deref(),
-                                cwd: &cwd_clone,
-                                kind: kind_clone,
-                                archive_path: archive_clone.as_path(),
-                                pending: &mut pending,
-                                seen_dirs: &mut seen_dirs,
-                                seen_files: &mut seen_files,
-                                loaded: &mut loaded,
-                            };
-                            emit_name(&buffered_name, &mut ctx);
-                        }
-                    } else {
-                        continue;
+                        let emit_name_raw = if cwd_clone.is_empty() {
+                            name.as_str()
+                        } else {
+                            rem
+                        };
+                        let mut ctx = TarEmitContext {
+                            implicit_prefix: root_ref.as_deref(),
+                            cwd: &cwd_clone,
+                            kind: kind_clone,
+                            archive_path: archive_clone.as_path(),
+                            pending: &mut pending,
+                            seen_dirs: &mut seen_dirs,
+                            seen_files: &mut seen_files,
+                            loaded: &mut loaded,
+                        };
+                        emit_name(emit_name_raw, &mut ctx);
                     }
-                } else {
+
+                    if pending.len() >= BATCH || (!sent_first && !pending.is_empty()) {
+                        let _ = tx.send(DirBatch::Append(pending));
+                        pending = Vec::new();
+                        sent_first = true;
+                        let _ = tx.send(DirBatch::Progress {
+                            loaded,
+                            total: None,
+                        });
+                        if let Some(ref wake) = wake {
+                            wake();
+                        }
+                    }
+                }
+
+                if !decided && cwd_clone.is_empty() {
+                    if !seen_root_file && !seen_other_root {
+                        implicit_root = root_candidate.clone();
+                    }
                     let root_ref = implicit_root
                         .as_ref()
                         .map(|root| format!("{}/", root.trim_end_matches('/')));
-                    let mut ctx = TarEmitContext {
-                        implicit_prefix: root_ref.as_deref(),
-                        cwd: &cwd_clone,
-                        kind: kind_clone,
-                        archive_path: archive_clone.as_path(),
-                        pending: &mut pending,
-                        seen_dirs: &mut seen_dirs,
-                        seen_files: &mut seen_files,
-                        loaded: &mut loaded,
-                    };
-                    emit_name(&name, &mut ctx);
+                    for buffered_name in buffered.drain(..) {
+                        let mut ctx = TarEmitContext {
+                            implicit_prefix: root_ref.as_deref(),
+                            cwd: &cwd_clone,
+                            kind: kind_clone,
+                            archive_path: archive_clone.as_path(),
+                            pending: &mut pending,
+                            seen_dirs: &mut seen_dirs,
+                            seen_files: &mut seen_files,
+                            loaded: &mut loaded,
+                        };
+                        emit_name(&buffered_name, &mut ctx);
+                    }
                 }
 
-                if pending.len() >= BATCH || (!sent_first && !pending.is_empty()) {
+                if !pending.is_empty() {
                     let _ = tx.send(DirBatch::Append(pending));
-                    pending = Vec::new();
-                    sent_first = true;
-                    let _ = tx.send(DirBatch::Progress {
-                        loaded,
-                        total: None,
-                    });
+                    if let Some(ref wake) = wake {
+                        wake();
+                    }
                 }
-            }
-
-            if !decided && cwd_clone.is_empty() {
-                if !seen_root_file && !seen_other_root {
-                    implicit_root = root_candidate.clone();
-                }
-                let root_ref = implicit_root
-                    .as_ref()
-                    .map(|root| format!("{}/", root.trim_end_matches('/')));
-                for buffered_name in buffered.drain(..) {
-                    let mut ctx = TarEmitContext {
-                        implicit_prefix: root_ref.as_deref(),
-                        cwd: &cwd_clone,
-                        kind: kind_clone,
-                        archive_path: archive_clone.as_path(),
-                        pending: &mut pending,
-                        seen_dirs: &mut seen_dirs,
-                        seen_files: &mut seen_files,
-                        loaded: &mut loaded,
-                    };
-                    emit_name(&buffered_name, &mut ctx);
-                }
-            }
-
-            if !pending.is_empty() {
-                let _ = tx.send(DirBatch::Append(pending));
-            }
-            let _ = tx.send(DirBatch::Progress {
-                loaded,
-                total: Some(loaded),
-            });
-        });
-    } else {
-        thread::spawn(move || {
-            let all = match read_container_directory_with_progress(
-                kind_clone,
-                &archive_clone,
-                &cwd_clone,
-                |loaded| {
-                    let _ = tx.send(DirBatch::Progress {
-                        loaded,
-                        total: None,
-                    });
-                },
-            ) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("Failed to read container: {e}");
-                    let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
-                    return;
-                }
-            };
-            let total = all.len();
-            let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
-            let loaded = initial.len().min(total);
-            if !initial.is_empty() {
-                let _ = tx.send(DirBatch::Replace(initial));
                 let _ = tx.send(DirBatch::Progress {
                     loaded,
-                    total: Some(total),
+                    total: Some(loaded),
                 });
-            }
-            thread::spawn(move || {
-                let chunk = 500usize;
-                let mut start = 128.min(all.len());
-                while start < all.len() {
-                    let end = (start + chunk).min(all.len());
-                    let _ = tx.send(DirBatch::Append(all[start..end].to_vec()));
-                    let _ = tx.send(DirBatch::Progress {
-                        loaded: end,
-                        total: Some(total),
-                    });
-                    start = end;
+                if let Some(ref wake) = wake {
+                    wake();
                 }
             });
-        });
+        } else {
+            thread::spawn(move || {
+                let all = match read_container_directory_with_progress(
+                    kind_clone,
+                    &archive_clone,
+                    &cwd_clone,
+                    |loaded| {
+                        let _ = tx.send(DirBatch::Progress {
+                            loaded,
+                            total: None,
+                        });
+                        if let Some(ref wake) = wake {
+                            wake();
+                        }
+                    },
+                ) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        eprintln!("Failed to read container: {e}");
+                        let _ = tx.send(DirBatch::Error(format!("Failed to read archive: {e}")));
+                        if let Some(ref wake) = wake {
+                            wake();
+                        }
+                        return;
+                    }
+                };
+                let total = all.len();
+                let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
+                let loaded = initial.len().min(total);
+                if !initial.is_empty() {
+                    let _ = tx.send(DirBatch::Replace(initial));
+                    let _ = tx.send(DirBatch::Progress {
+                        loaded,
+                        total: Some(total),
+                    });
+                    if let Some(ref wake) = wake {
+                        wake();
+                    }
+                }
+                thread::spawn(move || {
+                    let chunk = 500usize;
+                    let mut start = 128.min(all.len());
+                    while start < all.len() {
+                        let end = (start + chunk).min(all.len());
+                        let _ = tx.send(DirBatch::Append(all[start..end].to_vec()));
+                        let _ = tx.send(DirBatch::Progress {
+                            loaded: end,
+                            total: Some(total),
+                        });
+                        if let Some(ref wake) = wake {
+                            wake();
+                        }
+                        start = end;
+                    }
+                });
+            });
+        }
     }
 
     let remembered = prefer_name.clone().or_else(|| {
@@ -1311,7 +1468,10 @@ fn load_container_directory_async(
     });
     let panel_state = app.panel_mut(target_panel);
     let browser = &mut panel_state.browser;
-    let initial_loading = true;
+    let initial_loading = cached
+        .as_ref()
+        .map(|cache| cache.loading)
+        .unwrap_or(!skip_loading);
 
     browser.current_path = archive_path.clone();
     browser.browser_mode = BrowserMode::Container {
@@ -1320,13 +1480,18 @@ fn load_container_directory_async(
         cwd: cwd.clone(),
     };
     browser.entries = initial;
-    browser.selected_index = 0;
-    browser.top_index = 0;
+    if let Some((selected_index, top_index)) = cached_selection {
+        browser.selected_index = selected_index.min(browser.entries.len().saturating_sub(1));
+        browser.top_index = top_index.min(browser.selected_index);
+    } else {
+        browser.selected_index = 0;
+        browser.top_index = 0;
+    }
     browser.dir_token = browser.dir_token.wrapping_add(1);
-    browser.entries_rx = Some(rx);
+    browser.entries_rx = resume_rx.or(if skip_loading { None } else { Some(rx) });
     browser.prefer_select_name = remembered;
     browser.loading = initial_loading;
-    browser.loading_progress = None;
+    browser.loading_progress = cached.and_then(|cache| cache.loading_progress);
 }
 
 fn open_selected(app: &mut AppState) {
@@ -1740,6 +1905,17 @@ fn handle_keyboard(
             ctx.request_repaint();
         }
     }
+    if input.key_pressed(egui::Key::Escape) {
+        let panel = app.get_active_panel();
+        if matches!(panel.browser.browser_mode, BrowserMode::Search { .. }) {
+            cancel_search(app);
+            if let Some(snapshot) = app.pop_history_back(app.active_panel.clone()) {
+                apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
+            }
+            ctx.request_repaint();
+            return;
+        }
+    }
     let window_rows = active_window_rows(app, cache);
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
     let ctrl_tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
@@ -1958,10 +2134,13 @@ fn handle_keyboard(
             app.clear_preview();
         }
     }
-    if input.key_pressed(egui::Key::F5) {
+    let other_panel_preview = app
+        .preview_panel_side()
+        .is_some_and(|side| side != app.active_panel);
+    if input.key_pressed(egui::Key::F5) && !other_panel_preview {
         app.prepare_copy_selected();
     }
-    if input.key_pressed(egui::Key::F6) {
+    if input.key_pressed(egui::Key::F6) && !other_panel_preview {
         app.prepare_move_selected();
     }
     if input.key_pressed(egui::Key::F4) {
@@ -1996,12 +2175,42 @@ fn open_parent(app: &mut AppState, window_rows: usize) {
 
 fn confirm_pending_op(app: &mut AppState) {
     if let Some(op) = app.take_pending_op() {
-        if let PendingOp::Delete { target } = &op
-            && let Some(name) = target.file_name().and_then(|n| n.to_str())
-        {
+        if let PendingOp::Delete { target } = &op {
+            let panel = app.get_active_panel();
+            let browser = &panel.browser;
+            let mut next_name: Option<String> = None;
+            if !browser.entries.is_empty() {
+                let mut next_idx = browser.selected_index.saturating_add(1);
+                while next_idx < browser.entries.len() {
+                    let candidate = &browser.entries[next_idx].name;
+                    if candidate != ".." {
+                        next_name = Some(candidate.clone());
+                        break;
+                    }
+                    next_idx += 1;
+                }
+                if next_name.is_none() {
+                    let mut prev_idx = browser.selected_index.saturating_sub(1);
+                    while prev_idx < browser.entries.len() {
+                        let candidate = &browser.entries[prev_idx].name;
+                        if candidate != ".." {
+                            next_name = Some(candidate.clone());
+                            break;
+                        }
+                        if prev_idx == 0 {
+                            break;
+                        }
+                        prev_idx -= 1;
+                    }
+                }
+            }
             let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
-            app.fs_last_selected_name
-                .insert(parent.to_path_buf(), name.to_string());
+            if let Some(next_name) = next_name {
+                app.fs_last_selected_name
+                    .insert(parent.to_path_buf(), next_name);
+            } else {
+                app.fs_last_selected_name.remove(parent);
+            }
         }
         if let PendingOp::Rename { src } = &op {
             let name = app.rename_input.clone().unwrap_or_default();
@@ -2505,6 +2714,7 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
 
             let page_height = ui.available_height();
             let output = egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .vertical_scroll_offset(preview.scroll)
                 .show(ui, |ui| match preview.content.as_ref() {
                     Some(PreviewContent::Text(text)) => {
@@ -2519,27 +2729,103 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                             });
                             ui.add_space(4.0);
                         }
-                        let ext = preview.ext.clone();
-                        let base_key = preview.key.clone().unwrap_or_else(|| "unknown".to_string());
-                        let key = format!("{base_key}:{:x}", hash_text(text));
-                        if let Some(job) = highlight_cache.get(&key) {
-                            ui.add(egui::Label::new(job.clone()).selectable(true));
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut preview.wrap, "Wrap");
+                            ui.checkbox(&mut preview.show_whitespace, "Show whitespace");
+                        });
+                        ui.add_space(6.0);
+
+                        let display_text = if preview.show_whitespace {
+                            text.replace('\t', "→   ")
+                                .lines()
+                                .map(|line| format!("{line}⏎"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         } else {
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Spinner::new());
-                                ui.colored_label(text_color, "Highlighting…");
-                            });
-                            ui.add_space(6.0);
-                            if highlight_pending.insert(key.clone()) {
-                                let _ = highlight_req_tx.send(HighlightRequest {
-                                    key: key.clone(),
-                                    text: text.clone(),
-                                    ext,
-                                    theme_kind: theme.kind,
-                                });
+                            text.clone()
+                        };
+
+                        if preview.show_whitespace {
+                            let label = egui::Label::new(display_text).selectable(true);
+                            if preview.wrap {
+                                ui.add(label.wrap());
+                            } else {
+                                ui.add(label);
                             }
-                            ui.colored_label(text_color, text);
+                        } else {
+                            let ext = preview.ext.clone();
+                            let base_key =
+                                preview.key.clone().unwrap_or_else(|| "unknown".to_string());
+                            let key = format!("{base_key}:{:x}", hash_text(text));
+                            if let Some(job) = highlight_cache.get(&key) {
+                                let mut job = job.clone();
+                                job.wrap.max_width = if preview.wrap {
+                                    ui.available_width()
+                                } else {
+                                    f32::INFINITY
+                                };
+                                ui.add(egui::Label::new(job).selectable(true));
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Spinner::new());
+                                    ui.colored_label(text_color, "Highlighting…");
+                                });
+                                ui.add_space(6.0);
+                                if highlight_pending.insert(key.clone()) {
+                                    let _ = highlight_req_tx.send(HighlightRequest {
+                                        key: key.clone(),
+                                        text: text.clone(),
+                                        ext,
+                                        theme_kind: theme.kind,
+                                    });
+                                }
+                                let label = egui::Label::new(display_text).selectable(true);
+                                if preview.wrap {
+                                    ui.add(label.wrap());
+                                } else {
+                                    ui.add(label);
+                                }
+                            }
                         }
+                    }
+                    Some(PreviewContent::Binary(bytes)) => {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut preview.bytes_per_row_auto, "Auto bytes/row");
+                            if !preview.bytes_per_row_auto {
+                                ui.add(
+                                    egui::Slider::new(&mut preview.bytes_per_row, 4..=32)
+                                        .step_by(4.0)
+                                        .text("bytes/row"),
+                                );
+                            }
+                        });
+                        ui.add_space(6.0);
+                        let width = if preview.bytes_per_row_auto {
+                            let mut best = 4usize;
+                            let options = [4usize, 8, 12, 16, 20, 24, 28, 32];
+                            let font = egui::TextStyle::Monospace.resolve(ui.style());
+                            for opt in options {
+                                let sample =
+                                    hexdump_with_width(&bytes[..bytes.len().min(opt)], opt);
+                                let sample = sample.lines().next().unwrap_or_default();
+                                let w = ui
+                                    .painter()
+                                    .layout_no_wrap(sample.to_string(), font.clone(), text_color)
+                                    .size()
+                                    .x;
+                                if w <= ui.available_width() {
+                                    best = opt;
+                                } else {
+                                    break;
+                                }
+                            }
+                            preview.bytes_per_row = best;
+                            best
+                        } else {
+                            preview.bytes_per_row
+                        };
+                        let dump = hexdump_with_width(bytes, width);
+                        ui.add(egui::Label::new(dump).selectable(true));
                     }
                     Some(PreviewContent::Image(path)) => {
                         let (key, request) = match path {
@@ -2563,6 +2849,7 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                     archive_path.to_string_lossy(),
                                     match kind {
                                         ContainerKind::Zip => "zip",
+                                        ContainerKind::Tar => "tar",
                                         ContainerKind::TarGz => "tar.gz",
                                         ContainerKind::TarBz2 => "tar.bz2",
                                     },
@@ -2581,7 +2868,12 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                 )
                             }
                         };
-                        if let Some(handle) = image_cache.textures.get(&key).cloned() {
+                        if let Some(message) = image_cache.failures.get(&key) {
+                            ui.colored_label(
+                                text_color,
+                                format!("Failed to decode image\n{message}"),
+                            );
+                        } else if let Some(handle) = image_cache.textures.get(&key).cloned() {
                             touch_image(image_cache, &key);
                             if let Some(meta) = image_cache.meta.get(&key) {
                                 let depth_bits = match meta.depth {
@@ -3037,8 +3329,8 @@ struct Runtime {
     highlight_res_rx: mpsc::Receiver<HighlightResult>,
     highlight_results: VecDeque<HighlightResult>,
     image_req_tx: mpsc::Sender<ImageRequest>,
-    image_res_rx: mpsc::Receiver<ImageResult>,
-    image_pending: VecDeque<ImageResult>,
+    image_res_rx: mpsc::Receiver<ImageResponse>,
+    image_pending: VecDeque<ImageResponse>,
     needs_redraw: bool,
 }
 
@@ -3046,6 +3338,7 @@ impl Runtime {
     fn shutdown(&mut self) {
         self.image_cache.textures.clear();
         self.image_cache.meta.clear();
+        self.image_cache.failures.clear();
         self.image_cache.order.clear();
         self.image_cache.pending.clear();
         self.highlight_cache.clear();
@@ -3155,7 +3448,7 @@ impl ApplicationHandler<UserEvent> for App {
         let (dir_size_tx, dir_size_rx) = start_dir_size_worker();
         let (search_tx, search_rx) = start_search_worker();
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
-        let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResult>();
+        let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResponse>();
         let (highlight_req_tx, highlight_req_rx) = mpsc::channel::<HighlightRequest>();
         let (highlight_res_tx, highlight_res_rx) = mpsc::channel::<HighlightResult>();
         let (edit_tx, edit_rx) = mpsc::channel::<EditLoadRequest>();
@@ -3189,9 +3482,14 @@ impl ApplicationHandler<UserEvent> for App {
                         image,
                         meta,
                     };
-                    let _ = image_res_tx.send(result);
-                    let _ = proxy.send_event(UserEvent::Wake);
+                    let _ = image_res_tx.send(ImageResponse::Ok(result));
+                } else {
+                    let _ = image_res_tx.send(ImageResponse::Err {
+                        key: req.key,
+                        message: "Unsupported image format".to_string(),
+                    });
                 }
+                let _ = proxy.send_event(UserEvent::Wake);
             }
         });
 
@@ -3257,6 +3555,12 @@ impl ApplicationHandler<UserEvent> for App {
                 mode: PanelMode::Browser,
             },
             active_panel: ActivePanel::Left,
+            wake: Some(Arc::new({
+                let proxy = self.proxy.clone();
+                move || {
+                    let _ = proxy.send_event(UserEvent::Wake);
+                }
+            })),
             preview_tx: preview_tx.clone(),
             preview_rx,
             preview_request_id: 0,
@@ -3271,6 +3575,7 @@ impl ApplicationHandler<UserEvent> for App {
             dir_size_pending: Default::default(),
             fs_last_selected_name: Default::default(),
             container_last_selected_name: Default::default(),
+            container_dir_cache: Default::default(),
             theme: Theme::dark(),
             theme_picker_open: false,
             theme_picker_selected: None,
@@ -3311,6 +3616,7 @@ impl ApplicationHandler<UserEvent> for App {
         let image_cache = ImageCache {
             textures: HashMap::new(),
             meta: HashMap::new(),
+            failures: HashMap::new(),
             pending: HashSet::new(),
             order: VecDeque::new(),
         };
@@ -3401,29 +3707,39 @@ impl ApplicationHandler<UserEvent> for App {
                     runtime.ui_cache.update_scroll_mode(&runtime.app);
 
                     for decoded in decoded_images.drain(..) {
-                        let handle = ctx.load_texture(
-                            format!("preview:{}", decoded.key),
-                            decoded.image,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        if !runtime.image_cache.textures.contains_key(&decoded.key) {
-                            runtime.image_cache.order.push_back(decoded.key.clone());
-                        }
-                        runtime
-                            .image_cache
-                            .textures
-                            .insert(decoded.key.clone(), handle);
-                        runtime
-                            .image_cache
-                            .meta
-                            .insert(decoded.key.clone(), decoded.meta);
-                        runtime.image_cache.pending.remove(&decoded.key);
-                        while runtime.image_cache.order.len() > MAX_IMAGE_TEXTURES {
-                            if let Some(old) = runtime.image_cache.order.pop_front()
-                                && old != decoded.key
-                            {
-                                runtime.image_cache.textures.remove(&old);
-                                runtime.image_cache.meta.remove(&old);
+                        match decoded {
+                            ImageResponse::Ok(decoded) => {
+                                let handle = ctx.load_texture(
+                                    format!("preview:{}", decoded.key),
+                                    decoded.image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                if !runtime.image_cache.textures.contains_key(&decoded.key) {
+                                    runtime.image_cache.order.push_back(decoded.key.clone());
+                                }
+                                runtime
+                                    .image_cache
+                                    .textures
+                                    .insert(decoded.key.clone(), handle);
+                                runtime
+                                    .image_cache
+                                    .meta
+                                    .insert(decoded.key.clone(), decoded.meta);
+                                runtime.image_cache.pending.remove(&decoded.key);
+                                runtime.image_cache.failures.remove(&decoded.key);
+                                while runtime.image_cache.order.len() > MAX_IMAGE_TEXTURES {
+                                    if let Some(old) = runtime.image_cache.order.pop_front()
+                                        && old != decoded.key
+                                    {
+                                        runtime.image_cache.textures.remove(&old);
+                                        runtime.image_cache.meta.remove(&old);
+                                        runtime.image_cache.failures.remove(&old);
+                                    }
+                                }
+                            }
+                            ImageResponse::Err { key, message } => {
+                                runtime.image_cache.pending.remove(&key);
+                                runtime.image_cache.failures.insert(key, message);
                             }
                         }
                         runtime.needs_redraw = true;
@@ -3700,6 +4016,7 @@ impl ApplicationHandler<UserEvent> for App {
                         archive_path.to_string_lossy(),
                         match kind {
                             ContainerKind::Zip => "zip",
+                            ContainerKind::Tar => "tar",
                             ContainerKind::TarGz => "tar.gz",
                             ContainerKind::TarBz2 => "tar.bz2",
                         },
@@ -3995,6 +4312,7 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
             mode: PanelMode::Browser,
         },
         active_panel: ActivePanel::Left,
+        wake: None,
         preview_tx,
         preview_rx,
         preview_request_id: 0,
@@ -4009,6 +4327,7 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
         dir_size_pending: Default::default(),
         fs_last_selected_name: Default::default(),
         container_last_selected_name: Default::default(),
+        container_dir_cache: Default::default(),
         theme: Theme::dark(),
         theme_picker_open: false,
         theme_picker_selected: None,
@@ -4525,6 +4844,7 @@ fn render_snapshot(app: &mut AppState, ui_cache: &mut UiCache, path: &PathBuf) -
     let mut image_cache = ImageCache {
         textures: HashMap::new(),
         meta: HashMap::new(),
+        failures: HashMap::new(),
         pending: HashSet::new(),
         order: VecDeque::new(),
     };
@@ -4632,7 +4952,8 @@ fn render_snapshot(app: &mut AppState, ui_cache: &mut UiCache, path: &PathBuf) -
         SNAPSHOT_HEIGHT,
         bytes_per_row as usize,
         path,
-    )?;
+    )
+    .map_err(|err| anyhow::anyhow!(err))?;
 
     context.destroy_texture_view(view);
     context.destroy_texture(texture);
@@ -4684,48 +5005,6 @@ fn run_snapshot(path: &PathBuf) -> Result<()> {
     load_fs_directory_async(&mut app, cur_dir, ActivePanel::Right, None);
     drain_async(&mut app, 50);
     render_snapshot(&mut app, &mut ui_cache, path)
-}
-
-fn align_to(value: u32, alignment: u32) -> u32 {
-    value.div_ceil(alignment) * alignment
-}
-
-fn save_snapshot_png(
-    buffer: &blade_graphics::Buffer,
-    width: u32,
-    height: u32,
-    bytes_per_row: usize,
-    path: &PathBuf,
-) -> Result<()> {
-    let row_bytes = (width * 4) as usize;
-    let mut data = vec![0u8; row_bytes * height as usize];
-    let src = buffer.data() as *const u8;
-    for y in 0..height as usize {
-        let src_row = unsafe { std::slice::from_raw_parts(src.add(y * bytes_per_row), row_bytes) };
-        let dst_row = &mut data[y * row_bytes..(y + 1) * row_bytes];
-        dst_row.copy_from_slice(src_row);
-    }
-
-    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for chunk in data.chunks_exact(4) {
-        rgb.push(chunk[0]);
-        rgb.push(chunk[1]);
-        rgb.push(chunk[2]);
-    }
-    let file = std::fs::File::create(path)?;
-    let mut encoder = png::Encoder::new(file, width, height);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(Compression::Best);
-    encoder.set_filter(FilterType::Paeth);
-    encoder.set_adaptive_filter(AdaptiveFilterType::Adaptive);
-    let mut writer = encoder
-        .write_header()
-        .map_err(|err| anyhow::anyhow!(format!("Failed to write PNG header: {err}")))?;
-    writer
-        .write_image_data(&rgb)
-        .map_err(|err| anyhow::anyhow!(format!("Failed to write PNG data: {err}")))?;
-    Ok(())
 }
 
 fn main() -> Result<()> {

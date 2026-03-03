@@ -20,6 +20,7 @@
 )]
 
 pub mod app_state;
+pub mod archive;
 pub mod core;
 pub mod snapshot;
 pub mod syntax;

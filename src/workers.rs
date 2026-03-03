@@ -9,7 +9,7 @@ use std::{
 use crate::core::{
     EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
     SearchMode, SearchProgress, SearchRequest, SearchResult, copy_container_dir,
-    copy_container_entry, copy_recursively, format_container_listing, hexdump, is_probably_text,
+    copy_container_entry, copy_recursively, format_container_listing, is_probably_text,
     is_text_name, read_bytes_prefix, read_container_bytes_prefix, read_container_directory,
 };
 
@@ -146,7 +146,7 @@ pub fn start_preview_worker() -> (
                                     let text = String::from_utf8_lossy(&bytes).into_owned();
                                     PreviewContent::Text(text)
                                 } else {
-                                    PreviewContent::Text(hexdump(&bytes))
+                                    PreviewContent::Binary(bytes)
                                 }
                             }
                             Err(e) => PreviewContent::Text(format!("Failed to read file: {e}")),
@@ -166,7 +166,7 @@ pub fn start_preview_worker() -> (
                                     let text = String::from_utf8_lossy(&bytes).into_owned();
                                     PreviewContent::Text(text)
                                 } else {
-                                    PreviewContent::Text(hexdump(&bytes))
+                                    PreviewContent::Binary(bytes)
                                 }
                             }
                             Err(e) => {

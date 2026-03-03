@@ -9,7 +9,10 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
 zune-core = "0.4"
-zune-image = { version = "0.4", default-features = false, features = ["jpeg", "png", "metadata"] }
+zune-bmp = "0.4"
+zune-image = { version = "0.4", default-features = false, features = ["jpeg", "png", "bmp", "metadata"] }
+gif = "0.14"
+image-webp = "0.2"
 png = "0.17"
 exif = { package = "kamadak-exif", version = "0.5.5" }
 zip = { version = "0.6", default-features = false, features = ["deflate", "time"] }
