@@ -29,7 +29,7 @@ use syntect::{
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::{Icon, Window, WindowAttributes, WindowId},
 };
 use zune_core::bit_depth::BitDepth;
@@ -2343,6 +2343,7 @@ fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                         .font(egui::TextStyle::Monospace)
                         .layouter(&mut layouter)
                         .code_editor()
+                        .cursor_at_end(false)
                         .id_source("editor_text")
                         .desired_width(f32::INFINITY)
                         .desired_rows(desired_rows)
@@ -2528,8 +2529,6 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                 ui.add(egui::Spinner::new());
                                 ui.colored_label(text_color, "Highlighting…");
                             });
-                            ui.ctx()
-                                .request_repaint_after(std::time::Duration::from_millis(120));
                             ui.add_space(6.0);
                             if highlight_pending.insert(key.clone()) {
                                 let _ = highlight_req_tx.send(HighlightRequest {
@@ -3063,15 +3062,24 @@ impl Runtime {
 
 struct App {
     runtime: Option<Runtime>,
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 impl App {
-    fn new() -> Self {
-        Self { runtime: None }
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self {
+            runtime: None,
+            proxy,
+        }
     }
 }
 
-impl ApplicationHandler for App {
+#[derive(Debug, Clone, Copy)]
+enum UserEvent {
+    Wake,
+}
+
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.runtime.is_some() {
             return;
@@ -3153,6 +3161,7 @@ impl ApplicationHandler for App {
         let (edit_tx, edit_rx) = mpsc::channel::<EditLoadRequest>();
         let (edit_res_tx, edit_res_rx) = mpsc::channel::<EditLoadResult>();
 
+        let proxy = self.proxy.clone();
         thread::spawn(move || {
             while let Ok(req) = image_req_rx.recv() {
                 let image = match req.source {
@@ -3181,14 +3190,17 @@ impl ApplicationHandler for App {
                         meta,
                     };
                     let _ = image_res_tx.send(result);
+                    let _ = proxy.send_event(UserEvent::Wake);
                 }
             }
         });
 
+        let proxy = self.proxy.clone();
         thread::spawn(move || {
             while let Ok(req) = highlight_req_rx.recv() {
                 let job = highlight_text_job(&req.text, req.ext.as_deref(), req.theme_kind);
                 let _ = highlight_res_tx.send(HighlightResult { key: req.key, job });
+                let _ = proxy.send_event(UserEvent::Wake);
             }
         });
 
@@ -3346,6 +3358,7 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::RedrawRequested => {
+                let mut highlight_updated = false;
                 let mut completed = 0usize;
                 while runtime.app.io_rx.try_recv().is_ok() {
                     completed += 1;
@@ -3370,10 +3383,14 @@ impl ApplicationHandler for App {
                 while let Some(res) = runtime.highlight_results.pop_front() {
                     runtime.highlight_cache.insert(res.key.clone(), res.job);
                     runtime.highlight_pending.remove(&res.key);
+                    runtime.needs_redraw = true;
+                    highlight_updated = true;
                 }
                 while let Ok(res) = runtime.highlight_res_rx.try_recv() {
                     runtime.highlight_cache.insert(res.key.clone(), res.job);
                     runtime.highlight_pending.remove(&res.key);
+                    runtime.needs_redraw = true;
+                    highlight_updated = true;
                 }
 
                 let raw_input = runtime.egui_state.take_egui_input(&runtime.window);
@@ -3612,6 +3629,9 @@ impl ApplicationHandler for App {
                 runtime.last_sync = Some(sync.clone());
                 runtime.painter.after_submit(&sync);
                 runtime.context.destroy_texture_view(view);
+                if highlight_updated {
+                    runtime.window.request_redraw();
+                }
             }
             other => {
                 let event_response = runtime.egui_state.on_window_event(&runtime.window, &other);
@@ -3645,6 +3665,13 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.needs_redraw = true;
+            runtime.window.request_redraw();
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Wait);
         if let Some(runtime) = self.runtime.as_mut() {
@@ -3655,6 +3682,9 @@ impl ApplicationHandler for App {
             while let Ok(res) = runtime.highlight_res_rx.try_recv() {
                 runtime.highlight_results.push_back(res);
                 runtime.needs_redraw = true;
+            }
+            if !runtime.highlight_results.is_empty() {
+                runtime.window.request_redraw();
             }
             if let Some(preview) = runtime.app.preview_panel_mut()
                 && let Some(PreviewContent::Image(path)) = preview.content.as_ref()
@@ -4712,8 +4742,9 @@ fn main() -> Result<()> {
         return run_snapshot(&snapshot_path);
     }
 
-    let event_loop = EventLoop::new()?;
-    let mut app = App::new();
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(proxy);
     event_loop
         .run_app(&mut app)
         .map_err(|e| anyhow::anyhow!(e))?;
