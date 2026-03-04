@@ -1098,6 +1098,7 @@ fn load_fs_directory_async(
     browser.entries = initial;
     browser.selected_index = 0;
     browser.top_index = 0;
+    browser.inline_rename = None;
     browser.dir_token = browser.dir_token.wrapping_add(1);
     browser.entries_rx = Some(rx);
     browser.prefer_select_name = remembered;
@@ -1490,6 +1491,7 @@ fn load_container_directory_async(
         browser.selected_index = 0;
         browser.top_index = 0;
     }
+    browser.inline_rename = None;
     browser.dir_token = browser.dir_token.wrapping_add(1);
     browser.entries_rx = resume_rx.or(if skip_loading { None } else { Some(rx) });
     browser.prefer_select_name = remembered;
@@ -1837,6 +1839,10 @@ fn handle_keyboard(
         ctx.request_repaint();
         return;
     }
+    if handle_inline_rename(app, input) {
+        ctx.request_repaint();
+        return;
+    }
     if let PanelMode::Edit(ref mut edit) = app.panel_mut(app.active_panel.clone()).mode {
         let enter = input.key_pressed(egui::Key::Enter);
         let escape = input.key_pressed(egui::Key::Escape);
@@ -2163,6 +2169,11 @@ fn handle_keyboard(
     }
     if input.key_pressed(egui::Key::F4) {
         app.prepare_edit_selected();
+        ctx.request_repaint();
+    }
+    let shift_f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4));
+    if shift_f4 {
+        app.start_inline_new_file();
         ctx.request_repaint();
     }
     let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
@@ -2638,6 +2649,11 @@ fn draw_props_modal(ctx: &egui::Context, app: &mut AppState) {
                     ui.end_row();
                     ui.colored_label(normal_color, "Permissions");
                     ui.vertical(|ui| {
+                        let perm_colors = PermRowColors {
+                            original_mode: original_perms,
+                            changed_color,
+                            normal_color,
+                        };
                         egui::Grid::new("perm_grid")
                             .spacing([8.0, 4.0])
                             .show(ui, |ui| {
@@ -2653,9 +2669,7 @@ fn draw_props_modal(ctx: &egui::Context, app: &mut AppState) {
                                     0o200,
                                     0o100,
                                     &mut dialog.current.mode,
-                                    original_perms,
-                                    changed_color,
-                                    normal_color,
+                                    perm_colors,
                                 );
                                 perms_row(
                                     ui,
@@ -2664,9 +2678,7 @@ fn draw_props_modal(ctx: &egui::Context, app: &mut AppState) {
                                     0o020,
                                     0o010,
                                     &mut dialog.current.mode,
-                                    original_perms,
-                                    changed_color,
-                                    normal_color,
+                                    perm_colors,
                                 );
                                 perms_row(
                                     ui,
@@ -2675,9 +2687,7 @@ fn draw_props_modal(ctx: &egui::Context, app: &mut AppState) {
                                     0o002,
                                     0o001,
                                     &mut dialog.current.mode,
-                                    original_perms,
-                                    changed_color,
-                                    normal_color,
+                                    perm_colors,
                                 );
                             });
                     });
@@ -2720,6 +2730,13 @@ fn draw_props_modal(ctx: &egui::Context, app: &mut AppState) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PermRowColors {
+    original_mode: u32,
+    changed_color: Color32,
+    normal_color: Color32,
+}
+
 fn perms_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -2727,13 +2744,18 @@ fn perms_row(
     write_bit: u32,
     exec_bit: u32,
     mode: &mut u32,
-    original_mode: u32,
-    changed_color: Color32,
-    normal_color: Color32,
+    colors: PermRowColors,
 ) {
     let row_mask = read_bit | write_bit | exec_bit;
-    let changed = (*mode & row_mask) != (original_mode & row_mask);
-    ui.colored_label(if changed { changed_color } else { normal_color }, label);
+    let changed = (*mode & row_mask) != (colors.original_mode & row_mask);
+    ui.colored_label(
+        if changed {
+            colors.changed_color
+        } else {
+            colors.normal_color
+        },
+        label,
+    );
     let mut r = *mode & read_bit != 0;
     let mut w = *mode & write_bit != 0;
     let mut x = *mode & exec_bit != 0;
@@ -2802,6 +2824,81 @@ fn apply_props_dialog(app: &mut AppState, recursive: bool) {
     app.props_dialog = None;
     app.store_selection_memory_for(app.active_panel.clone());
     refresh_active_panel(app);
+}
+
+fn handle_inline_rename(app: &mut AppState, input: &egui::InputState) -> bool {
+    let enter = input.key_pressed(egui::Key::Enter);
+    let escape = input.key_pressed(egui::Key::Escape);
+    let (action, next_selection, handled) = {
+        let panel = app.get_active_panel_mut();
+        let browser = &mut panel.browser;
+        let Some(_rename) = browser.inline_rename.as_ref() else {
+            return false;
+        };
+        if !enter && !escape {
+            return true;
+        }
+        let rename = browser.inline_rename.take().unwrap();
+        if escape {
+            if rename.new_file && rename.index < browser.entries.len() {
+                browser.entries.remove(rename.index);
+                if browser.selected_index >= browser.entries.len() && !browser.entries.is_empty() {
+                    browser.selected_index = browser.entries.len() - 1;
+                }
+            }
+            return true;
+        }
+        let new_name = rename.text.trim();
+        if new_name.is_empty()
+            || new_name == "."
+            || new_name == ".."
+            || new_name.contains('/')
+            || new_name.contains('\\')
+        {
+            return true;
+        }
+        let mut action: Option<fileman::core::IOTask> = None;
+        let mut next_selection: Option<(PathBuf, String)> = None;
+        if rename.new_file {
+            let dir = browser.current_path.clone();
+            let path = dir.join(new_name);
+            action = Some(fileman::core::IOTask::WriteFile {
+                path,
+                contents: Vec::new(),
+            });
+            next_selection = Some((dir, new_name.to_string()));
+        } else if rename.index < browser.entries.len() {
+            let entry = &browser.entries[rename.index];
+            if let EntryLocation::Fs(path) = &entry.location {
+                let current = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if current != new_name {
+                    action = Some(fileman::core::IOTask::Rename {
+                        src: path.clone(),
+                        new_name: new_name.to_string(),
+                    });
+                    next_selection = Some((
+                        path.parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf(),
+                        new_name.to_string(),
+                    ));
+                }
+            }
+        }
+        (action, next_selection, true)
+    };
+    if !handled {
+        return false;
+    }
+    if let Some(task) = action {
+        let _ = app.io_tx.send(task);
+        app.io_in_flight = app.io_in_flight.saturating_add(1);
+        if let Some((dir, name)) = next_selection {
+            app.fs_last_selected_name.insert(dir, name);
+        }
+        refresh_active_panel(app);
+    }
+    true
 }
 
 struct EditorRender<'a> {
@@ -3312,7 +3409,9 @@ fn draw_theme_picker(ctx: &egui::Context, app: &mut AppState) {
 fn draw_command_bar(ctx: &egui::Context, app: &AppState, colors: &ThemeColors) {
     let modifiers = ctx.input(|i| i.modifiers);
     let preview_side = app.preview_panel_side();
-    let other_panel_preview = preview_side.is_some_and(|side| side != app.active_panel);
+    let other_panel_preview = preview_side
+        .as_ref()
+        .is_some_and(|side| *side != app.active_panel);
     egui::TopBottomPanel::bottom("command_bar")
         .exact_height(30.0)
         .show(ctx, |ui| {
@@ -3321,13 +3420,16 @@ fn draw_command_bar(ctx: &egui::Context, app: &AppState, colors: &ThemeColors) {
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let (f3, f4, mut f5, mut f6, f7, f8) = if modifiers.alt {
+                        let (mut f3, f4, mut f5, mut f6, f7, f8) = if modifiers.alt {
                             ("", "", "Pack", "Unpack", "Search", "Command")
                         } else if modifiers.shift {
                             ("", "New", "Copy", "Rename", "", "")
                         } else {
                             ("View", "Edit", "Copy", "Move", "Mkdir", "Delete")
                         };
+                        if preview_side.is_some() && !modifiers.alt && !modifiers.shift {
+                            f3 = "Exit";
+                        }
                         if other_panel_preview {
                             if !f5.is_empty() {
                                 f5 = "";
@@ -3525,8 +3627,16 @@ fn draw_panel(
                         scroll.show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
                             visible_range = row_range.clone();
                             for idx in row_range {
-                                let browser = &app.panel(panel_side_for_closure.clone()).browser;
-                                let entry = &browser.entries[idx];
+                                let (entry, rename_active) = {
+                                    let browser =
+                                        &app.panel(panel_side_for_closure.clone()).browser;
+                                    let entry = browser.entries[idx].clone();
+                                    let rename_active = browser
+                                        .inline_rename
+                                        .as_ref()
+                                        .is_some_and(|rename| rename.index == idx);
+                                    (entry, rename_active)
+                                };
                                 let is_selected = selected_index == idx;
                                 let stripe = idx % 2 == 0;
                                 let bg = if is_selected {
@@ -3615,13 +3725,41 @@ fn draw_panel(
                                     egui::pos2(name_min.x, rect.top()),
                                     egui::pos2(rect.right() - SIZE_COL_WIDTH, rect.bottom()),
                                 );
-                                ui.painter().with_clip_rect(name_rect).text(
-                                    name_min,
-                                    egui::Align2::LEFT_CENTER,
-                                    entry.name.as_str(),
-                                    font_id,
-                                    color32(fg),
-                                );
+                                if rename_active {
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new().max_rect(name_rect),
+                                        |ui| {
+                                            ui.set_clip_rect(name_rect);
+                                            let rename = app
+                                                .panel_mut(panel_side_for_closure.clone())
+                                                .browser
+                                                .inline_rename
+                                                .as_mut()
+                                                .expect("rename active");
+                                            let response = ui.add_sized(
+                                                name_rect.size(),
+                                                egui::TextEdit::singleline(&mut rename.text)
+                                                    .font(egui::TextStyle::Body)
+                                                    .id_source(match panel_side_for_closure {
+                                                        ActivePanel::Left => "inline_rename_left",
+                                                        ActivePanel::Right => "inline_rename_right",
+                                                    }),
+                                            );
+                                            if rename.focus {
+                                                response.request_focus();
+                                                rename.focus = false;
+                                            }
+                                        },
+                                    );
+                                } else {
+                                    ui.painter().with_clip_rect(name_rect).text(
+                                        name_min,
+                                        egui::Align2::LEFT_CENTER,
+                                        entry.name.as_str(),
+                                        font_id,
+                                        color32(fg),
+                                    );
+                                }
 
                                 if response.clicked_by(egui::PointerButton::Primary) {
                                     clicked_index = Some(idx);
@@ -3917,6 +4055,7 @@ impl ApplicationHandler<UserEvent> for App {
                     dir_token: 0,
                     history_back: Vec::new(),
                     history_forward: Vec::new(),
+                    inline_rename: None,
                 },
                 mode: PanelMode::Browser,
             },
@@ -3934,6 +4073,7 @@ impl ApplicationHandler<UserEvent> for App {
                     dir_token: 0,
                     history_back: Vec::new(),
                     history_forward: Vec::new(),
+                    inline_rename: None,
                 },
                 mode: PanelMode::Browser,
             },
@@ -4678,6 +4818,7 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
                 dir_token: 0,
                 history_back: Vec::new(),
                 history_forward: Vec::new(),
+                inline_rename: None,
             },
             mode: PanelMode::Browser,
         },
@@ -4695,6 +4836,7 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
                 dir_token: 0,
                 history_back: Vec::new(),
                 history_forward: Vec::new(),
+                inline_rename: None,
             },
             mode: PanelMode::Browser,
         },

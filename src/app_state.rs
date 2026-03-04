@@ -61,6 +61,14 @@ pub struct BrowserState {
     pub dir_token: u64,
     pub history_back: Vec<PanelSnapshot>,
     pub history_forward: Vec<PanelSnapshot>,
+    pub inline_rename: Option<InlineRename>,
+}
+
+pub struct InlineRename {
+    pub index: usize,
+    pub text: String,
+    pub new_file: bool,
+    pub focus: bool,
 }
 
 pub struct ContainerDirCache {
@@ -511,7 +519,7 @@ impl AppState {
     }
 
     pub fn prepare_rename_selected(&mut self) {
-        let (path, name) = {
+        let name = {
             let panel = self.get_active_panel();
             let browser = &panel.browser;
             if browser.entries.is_empty() {
@@ -523,20 +531,68 @@ impl AppState {
                 return;
             }
             if let EntryLocation::Fs(path) = entry.location.clone() {
-                let name = path
-                    .file_name()
+                path.file_name()
                     .and_then(|s| s.to_str())
-                    .map(|s| s.to_string());
-                (Some(path.clone()), name)
+                    .map(|s| s.to_string())
             } else {
-                (None, None)
+                None
             }
         };
-        if let (Some(path), Some(name)) = (path, name) {
-            self.rename_input = Some(name);
-            self.pending_op = Some(PendingOp::Rename { src: path });
-            self.rename_focus = true;
+        if let Some(name) = name {
+            let panel = self.get_active_panel_mut();
+            let browser = &mut panel.browser;
+            browser.inline_rename = Some(InlineRename {
+                index: browser.selected_index,
+                text: name,
+                new_file: false,
+                focus: true,
+            });
+            self.rename_input = None;
+            self.pending_op = None;
+            self.rename_focus = false;
         }
+    }
+
+    pub fn start_inline_new_file(&mut self) {
+        let target_dir = {
+            let panel = self.get_active_panel();
+            let browser = &panel.browser;
+            if !matches!(browser.browser_mode, BrowserMode::Fs) {
+                return;
+            }
+            browser.current_path.clone()
+        };
+        let panel = self.get_active_panel_mut();
+        let browser = &mut panel.browser;
+        let base = "new_file".to_string();
+        let mut candidate = base.clone();
+        let mut counter = 1;
+        while browser.entries.iter().any(|e| e.name == candidate) {
+            candidate = format!("{base}_{counter}");
+            counter += 1;
+        }
+        let insert_at = browser
+            .entries
+            .iter()
+            .position(|e| e.name != "..")
+            .unwrap_or(browser.entries.len());
+        let new_path = target_dir.join(&candidate);
+        browser.entries.insert(
+            insert_at,
+            DirEntry {
+                name: candidate.clone(),
+                is_dir: false,
+                location: EntryLocation::Fs(new_path),
+                size: None,
+            },
+        );
+        browser.selected_index = insert_at;
+        browser.inline_rename = Some(InlineRename {
+            index: insert_at,
+            text: candidate,
+            new_file: true,
+            focus: true,
+        });
     }
 
     pub fn prepare_edit_selected(&mut self) {
