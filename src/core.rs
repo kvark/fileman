@@ -141,6 +141,13 @@ pub enum IOTask {
         path: path::PathBuf,
         contents: Vec<u8>,
     },
+    SetProps {
+        path: path::PathBuf,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        recursive: bool,
+    },
 }
 
 pub enum IOResult {

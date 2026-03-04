@@ -13,6 +13,8 @@ zune-bmp = "0.4"
 zune-image = { version = "0.4", default-features = false, features = ["jpeg", "png", "bmp", "metadata"] }
 gif = "0.14"
 image-webp = "0.2"
+libc = "0.2"
+users = "0.11"
 png = "0.17"
 exif = { package = "kamadak-exif", version = "0.5.5" }
 zip = { version = "0.6", default-features = false, features = ["deflate", "time"] }

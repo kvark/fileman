@@ -865,6 +865,7 @@ dependencies = [
  "gif",
  "image-webp",
  "kamadak-exif",
+ "libc",
  "log",
  "memchr",
  "once_cell",
@@ -876,6 +877,7 @@ dependencies = [
  "syntect",
  "tar",
  "toml",
+ "users",
  "winit",
  "zip",
  "zune-bmp",
@@ -2897,6 +2899,16 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "users"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24cc0f6d6f267b73e5a2cadf007ba8f9bc39c6a6f9666f8cf25ea809a153b032"
+dependencies = [
+ "libc",
+ "log",
 ]
 
 [[package]]
