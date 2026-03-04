@@ -2826,6 +2826,14 @@ fn apply_props_dialog(app: &mut AppState, recursive: bool) {
     refresh_active_panel(app);
 }
 
+fn make_whitespace_visible(text: &str) -> String {
+    text.replace('\t', "→   ")
+        .lines()
+        .map(|line| format!("{line}⏎"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn handle_inline_rename(app: &mut AppState, input: &egui::InputState) -> bool {
     let enter = input.key_pressed(egui::Key::Enter);
     let escape = input.key_pressed(egui::Key::Escape);
@@ -3180,7 +3188,12 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
             ui.add_space(4.0);
 
             let page_height = ui.available_height();
-            let output = egui::ScrollArea::both()
+            let scroll = if preview.wrap {
+                egui::ScrollArea::vertical()
+            } else {
+                egui::ScrollArea::both()
+            };
+            let output = scroll
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .vertical_scroll_offset(preview.scroll)
                 .show(ui, |ui| match preview.content.as_ref() {
@@ -3203,56 +3216,62 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                         ui.add_space(6.0);
 
                         let display_text = if preview.show_whitespace {
-                            text.replace('\t', "→   ")
-                                .lines()
-                                .map(|line| format!("{line}⏎"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
+                            make_whitespace_visible(text)
                         } else {
                             text.clone()
                         };
 
-                        if preview.show_whitespace {
-                            let label = egui::Label::new(display_text).selectable(true);
-                            if preview.wrap {
-                                ui.add(label.wrap());
-                            } else {
-                                ui.add(label);
-                            }
+                        let ext = preview.ext.clone();
+                        let base_key = preview.key.clone().unwrap_or_else(|| "unknown".to_string());
+                        let key = format!("{base_key}:{:x}", hash_text(&display_text));
+                        let wrap_width = if preview.wrap {
+                            ui.available_width()
                         } else {
-                            let ext = preview.ext.clone();
-                            let base_key =
-                                preview.key.clone().unwrap_or_else(|| "unknown".to_string());
-                            let key = format!("{base_key}:{:x}", hash_text(text));
-                            if let Some(job) = highlight_cache.get(&key) {
-                                let mut job = job.clone();
-                                job.wrap.max_width = if preview.wrap {
-                                    ui.available_width()
-                                } else {
-                                    f32::INFINITY
-                                };
-                                ui.add(egui::Label::new(job).selectable(true));
-                            } else {
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::Spinner::new());
-                                    ui.colored_label(text_color, "Highlighting…");
-                                });
-                                ui.add_space(6.0);
-                                if highlight_pending.insert(key.clone()) {
-                                    let _ = highlight_req_tx.send(HighlightRequest {
-                                        key: key.clone(),
-                                        text: text.clone(),
-                                        ext,
-                                        theme_kind: theme.kind,
+                            f32::INFINITY
+                        };
+                        if let Some(job) = highlight_cache.get(&key) {
+                            let mut job = job.clone();
+                            job.wrap.max_width = wrap_width;
+                            job.wrap.break_anywhere = preview.wrap;
+                            let label =
+                                egui::Label::new(job)
+                                    .selectable(true)
+                                    .wrap_mode(if preview.wrap {
+                                        egui::TextWrapMode::Wrap
+                                    } else {
+                                        egui::TextWrapMode::Extend
                                     });
-                                }
-                                let label = egui::Label::new(display_text).selectable(true);
-                                if preview.wrap {
-                                    ui.add(label.wrap());
-                                } else {
-                                    ui.add(label);
-                                }
+                            ui.add(label);
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new());
+                                ui.colored_label(text_color, "Highlighting…");
+                            });
+                            ui.add_space(6.0);
+                            if highlight_pending.insert(key.clone()) {
+                                let _ = highlight_req_tx.send(HighlightRequest {
+                                    key: key.clone(),
+                                    text: display_text.clone(),
+                                    ext,
+                                    theme_kind: theme.kind,
+                                });
                             }
+                            let mut job = egui::text::LayoutJob::simple(
+                                display_text.clone(),
+                                egui::TextStyle::Monospace.resolve(ui.style()),
+                                egui::Color32::LIGHT_GRAY,
+                                wrap_width,
+                            );
+                            job.wrap.break_anywhere = preview.wrap;
+                            let label =
+                                egui::Label::new(job)
+                                    .selectable(true)
+                                    .wrap_mode(if preview.wrap {
+                                        egui::TextWrapMode::Wrap
+                                    } else {
+                                        egui::TextWrapMode::Extend
+                                    });
+                            ui.add(label);
                         }
                     }
                     Some(PreviewContent::Binary(bytes)) => {
