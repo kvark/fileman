@@ -1,3 +1,5 @@
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::File,
     io::Read,
@@ -115,11 +117,52 @@ pub fn start_io_worker() -> (
                         eprintln!("Write error: {e}");
                     }
                 }
+                IOTask::SetProps {
+                    path,
+                    mode,
+                    uid,
+                    gid,
+                    recursive,
+                } => {
+                    let res = if recursive {
+                        apply_props_recursive(&path, mode, uid, gid)
+                    } else {
+                        apply_props(&path, mode, uid, gid)
+                    };
+                    if let Err(e) = res {
+                        eprintln!("Props error: {e}");
+                    }
+                }
             }
             let _ = result_tx.send(IOResult::Completed);
         }
     });
     (tx, result_rx, cancel_tx)
+}
+
+fn apply_props(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io::Result<()> {
+    let permissions = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, permissions)?;
+    let res = unsafe { libc::chown(path.as_os_str().as_bytes().as_ptr().cast(), uid, gid) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn apply_props_recursive(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    apply_props(path, mode, uid, gid)?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            apply_props_recursive(&entry.path(), mode, uid, gid)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn start_preview_worker() -> (
