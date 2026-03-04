@@ -5,6 +5,7 @@ use blade_graphics::{
     RenderTargetSet, SurfaceConfig, SurfaceInfo, TextureColor, TextureDesc, TextureFormat,
     TextureSubresources, TextureUsage, TextureViewDesc, ViewDimension,
 };
+use egui::Color32;
 use egui::text_edit::TextEditOutput;
 use egui_winit::State as EguiWinitState;
 use exif::{Tag, Value};
@@ -16,6 +17,7 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     io::Read,
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
@@ -38,8 +40,8 @@ use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
 use zune_image::image::Image as ZuneImage;
 
 use fileman::app_state::{
-    AppState, BrowserState, EditState, PanelMode, PanelState, PendingOp, PreviewState,
-    SearchStatus, SearchUiState,
+    AppState, BrowserState, EditState, FileProps, FilePropsEdit, PanelMode, PanelState, PendingOp,
+    PreviewState, PropsDialog, SearchStatus, SearchUiState,
 };
 use fileman::core::{
     ActivePanel, BrowserMode, ContainerKind, DirBatch, DirEntry, EditLoadRequest, EditLoadResult,
@@ -56,6 +58,7 @@ use replay::{FileAssert, FsAssert, FsCheckMode, FsEntryKind, ReplayAsserts, Snap
 mod replay;
 use fileman::snapshot::{align_to, compare_snapshots, save_snapshot_png};
 use replay::{ReplayKey, load_replay_case};
+use users::{get_group_by_gid, get_group_by_name, get_user_by_name, get_user_by_uid};
 
 const ROW_HEIGHT: f32 = 24.0;
 const SIZE_COL_WIDTH: f32 = 84.0;
@@ -1817,6 +1820,13 @@ fn handle_keyboard(
         ctx.request_repaint();
         return;
     }
+    if app.props_dialog.is_some() {
+        if input.key_pressed(egui::Key::Escape) {
+            app.props_dialog = None;
+            ctx.request_repaint();
+        }
+        return;
+    }
     if app.pending_op.is_some() {
         if input.key_pressed(egui::Key::Enter) {
             confirm_pending_op(app);
@@ -1905,6 +1915,12 @@ fn handle_keyboard(
             ctx.request_repaint();
         }
     }
+    let alt_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter));
+    if alt_enter {
+        open_props_dialog(app);
+        ctx.request_repaint();
+        return;
+    }
     if input.key_pressed(egui::Key::Escape) {
         let panel = app.get_active_panel();
         if matches!(panel.browser.browser_mode, BrowserMode::Search { .. }) {
@@ -1920,7 +1936,9 @@ fn handle_keyboard(
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
     let ctrl_tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
     if tab_pressed || ctrl_tab_pressed {
-        app.switch_panel();
+        if app.props_dialog.is_none() {
+            app.switch_panel();
+        }
         ctx.request_repaint();
     }
     let ctrl_pgup = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
@@ -2434,6 +2452,358 @@ fn draw_discard_modal(ctx: &egui::Context, app: &mut AppState) {
     }
 }
 
+fn open_props_dialog(app: &mut AppState) {
+    let panel = app.get_active_panel();
+    let browser = &panel.browser;
+    if !matches!(browser.browser_mode, BrowserMode::Fs) {
+        return;
+    }
+    if browser.entries.is_empty() {
+        return;
+    }
+    let entry = &browser.entries[browser.selected_index];
+    if entry.name == ".." {
+        return;
+    }
+    let EntryLocation::Fs(path) = &entry.location else {
+        return;
+    };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!("Failed to read metadata: {e}");
+            return;
+        }
+    };
+    let mode = meta.mode();
+    let uid = meta.uid();
+    let gid = meta.gid();
+    let file_type = file_type_label(&meta);
+    let is_dir = meta.is_dir();
+    let user_label = get_user_by_uid(uid)
+        .map(|user| user.name().to_string_lossy().into_owned())
+        .unwrap_or_else(|| uid.to_string());
+    let group_label = get_group_by_gid(gid)
+        .map(|group| group.name().to_string_lossy().into_owned())
+        .unwrap_or_else(|| gid.to_string());
+
+    app.props_dialog = Some(PropsDialog {
+        target: path.clone(),
+        original: FileProps {
+            mode,
+            uid,
+            gid,
+            file_type,
+            is_dir,
+            user_label: user_label.clone(),
+            group_label: group_label.clone(),
+        },
+        current: FilePropsEdit {
+            mode: mode & 0o777,
+            user: user_label,
+            group: group_label,
+        },
+        error: None,
+    });
+}
+
+fn file_type_label(meta: &std::fs::Metadata) -> String {
+    let file_type = meta.file_type();
+    if file_type.is_dir() {
+        "Directory".to_string()
+    } else if file_type.is_file() {
+        "Regular file".to_string()
+    } else if file_type.is_symlink() {
+        "Symlink".to_string()
+    } else if file_type.is_block_device() {
+        "Block device".to_string()
+    } else if file_type.is_char_device() {
+        "Character device".to_string()
+    } else if file_type.is_fifo() {
+        "FIFO".to_string()
+    } else if file_type.is_socket() {
+        "Socket".to_string()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
+fn parse_user_value(input: &str) -> Result<u32, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Owner user is required".to_string());
+    }
+    if let Ok(uid) = trimmed.parse::<u32>() {
+        return Ok(uid);
+    }
+    get_user_by_name(trimmed)
+        .map(|user| user.uid())
+        .ok_or_else(|| format!("Unknown user: {trimmed}"))
+}
+
+fn parse_group_value(input: &str) -> Result<u32, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Owner group is required".to_string());
+    }
+    if let Ok(gid) = trimmed.parse::<u32>() {
+        return Ok(gid);
+    }
+    get_group_by_name(trimmed)
+        .map(|group| group.gid())
+        .ok_or_else(|| format!("Unknown group: {trimmed}"))
+}
+
+fn draw_props_modal(ctx: &egui::Context, app: &mut AppState) {
+    let Some(dialog) = app.props_dialog.as_mut() else {
+        return;
+    };
+    let colors = app.theme.colors();
+    let screen = ctx.available_rect();
+    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "props_overlay".into());
+    ctx.layer_painter(overlay_layer).rect_filled(
+        screen,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_black_alpha(140),
+    );
+
+    let original_perms = dialog.original.mode & 0o777;
+    let user_changed = dialog.current.user.trim() != dialog.original.user_label;
+    let group_changed = dialog.current.group.trim() != dialog.original.group_label;
+    let changed_color = color32(colors.row_fg_selected);
+    let normal_color = color32(colors.row_fg_active);
+
+    let mut action: Option<(&'static str, bool)> = None;
+    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+    let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+    if escape {
+        app.props_dialog = None;
+        return;
+    }
+
+    if tab_pressed {
+        if ctx.memory(|mem| mem.has_focus(egui::Id::new("props_owner_user"))) {
+            ctx.memory_mut(|mem| mem.request_focus(egui::Id::new("props_owner_group")));
+        } else {
+            ctx.memory_mut(|mem| mem.request_focus(egui::Id::new("props_owner_user")));
+        }
+    }
+
+    egui::Window::new("Properties")
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size(egui::Vec2::new(480.0, 300.0))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.label(dialog.target.to_string_lossy());
+            ui.add_space(6.0);
+            egui::Grid::new("props_grid")
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.colored_label(color32(colors.row_fg_inactive), "Type");
+                    ui.colored_label(color32(colors.row_fg_active), &dialog.original.file_type);
+                    ui.end_row();
+                    ui.colored_label(
+                        if user_changed {
+                            changed_color
+                        } else {
+                            normal_color
+                        },
+                        "Owner (user)",
+                    );
+                    let user_response = ui.add(
+                        egui::TextEdit::singleline(&mut dialog.current.user)
+                            .desired_width(220.0)
+                            .id(egui::Id::new("props_owner_user")),
+                    );
+                    ui.end_row();
+                    ui.colored_label(
+                        if group_changed {
+                            changed_color
+                        } else {
+                            normal_color
+                        },
+                        "Owner (group)",
+                    );
+                    let group_response = ui.add(
+                        egui::TextEdit::singleline(&mut dialog.current.group)
+                            .desired_width(220.0)
+                            .id(egui::Id::new("props_owner_group")),
+                    );
+                    if user_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                        group_response.request_focus();
+                    }
+                    ui.end_row();
+                    ui.colored_label(normal_color, "Permissions");
+                    ui.vertical(|ui| {
+                        egui::Grid::new("perm_grid")
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.colored_label(color32(colors.row_fg_inactive), "");
+                                ui.label("Read");
+                                ui.label("Write");
+                                ui.label("Exec");
+                                ui.end_row();
+                                perms_row(
+                                    ui,
+                                    "User",
+                                    0o400,
+                                    0o200,
+                                    0o100,
+                                    &mut dialog.current.mode,
+                                    original_perms,
+                                    changed_color,
+                                    normal_color,
+                                );
+                                perms_row(
+                                    ui,
+                                    "Group",
+                                    0o040,
+                                    0o020,
+                                    0o010,
+                                    &mut dialog.current.mode,
+                                    original_perms,
+                                    changed_color,
+                                    normal_color,
+                                );
+                                perms_row(
+                                    ui,
+                                    "Other",
+                                    0o004,
+                                    0o002,
+                                    0o001,
+                                    &mut dialog.current.mode,
+                                    original_perms,
+                                    changed_color,
+                                    normal_color,
+                                );
+                            });
+                    });
+                    ui.end_row();
+                    if user_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                        group_response.request_focus();
+                    }
+                });
+            if let Some(error) = dialog.error.as_ref() {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                let apply = ui.add(egui::Button::new("Apply").min_size(egui::vec2(110.0, 0.0)));
+                if dialog.original.is_dir {
+                    let recursive =
+                        ui.add(egui::Button::new("Recursive").min_size(egui::vec2(130.0, 0.0)));
+                    if recursive.clicked() {
+                        action = Some(("apply", true));
+                    }
+                }
+                let cancel = ui.add(egui::Button::new("Cancel").min_size(egui::vec2(110.0, 0.0)));
+                if apply.clicked() || enter {
+                    action = Some(("apply", false));
+                }
+                if cancel.clicked() {
+                    action = Some(("cancel", false));
+                }
+            });
+        });
+
+    if let Some((what, recursive)) = action {
+        match what {
+            "apply" => apply_props_dialog(app, recursive),
+            "cancel" => app.props_dialog = None,
+            _ => {}
+        }
+    }
+}
+
+fn perms_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    read_bit: u32,
+    write_bit: u32,
+    exec_bit: u32,
+    mode: &mut u32,
+    original_mode: u32,
+    changed_color: Color32,
+    normal_color: Color32,
+) {
+    let row_mask = read_bit | write_bit | exec_bit;
+    let changed = (*mode & row_mask) != (original_mode & row_mask);
+    ui.colored_label(if changed { changed_color } else { normal_color }, label);
+    let mut r = *mode & read_bit != 0;
+    let mut w = *mode & write_bit != 0;
+    let mut x = *mode & exec_bit != 0;
+    if ui.checkbox(&mut r, "").changed() {
+        if r {
+            *mode |= read_bit;
+        } else {
+            *mode &= !read_bit;
+        }
+    }
+    if ui.checkbox(&mut w, "").changed() {
+        if w {
+            *mode |= write_bit;
+        } else {
+            *mode &= !write_bit;
+        }
+    }
+    if ui.checkbox(&mut x, "").changed() {
+        if x {
+            *mode |= exec_bit;
+        } else {
+            *mode &= !exec_bit;
+        }
+    }
+    ui.end_row();
+}
+
+fn apply_props_dialog(app: &mut AppState, recursive: bool) {
+    let Some(dialog) = app.props_dialog.as_mut() else {
+        return;
+    };
+    dialog.error = None;
+    let uid = match parse_user_value(&dialog.current.user) {
+        Ok(uid) => uid,
+        Err(err) => {
+            dialog.error = Some(err);
+            return;
+        }
+    };
+    let gid = match parse_group_value(&dialog.current.group) {
+        Ok(gid) => gid,
+        Err(err) => {
+            dialog.error = Some(err);
+            return;
+        }
+    };
+    let new_mode = (dialog.original.mode & !0o777) | (dialog.current.mode & 0o777);
+    let changed = new_mode != dialog.original.mode
+        || uid != dialog.original.uid
+        || gid != dialog.original.gid;
+    if !changed {
+        app.props_dialog = None;
+        return;
+    }
+    if let Err(e) = app.io_tx.send(fileman::core::IOTask::SetProps {
+        path: dialog.target.clone(),
+        mode: new_mode,
+        uid,
+        gid,
+        recursive,
+    }) {
+        dialog.error = Some(format!("Failed to queue update: {e}"));
+        return;
+    }
+    app.io_in_flight = app.io_in_flight.saturating_add(1);
+    app.props_dialog = None;
+    app.store_selection_memory_for(app.active_panel.clone());
+    refresh_active_panel(app);
+}
+
 struct EditorRender<'a> {
     theme: &'a Theme,
     is_focused: bool,
@@ -2939,8 +3309,10 @@ fn draw_theme_picker(ctx: &egui::Context, app: &mut AppState) {
         });
 }
 
-fn draw_command_bar(ctx: &egui::Context, colors: &ThemeColors) {
+fn draw_command_bar(ctx: &egui::Context, app: &AppState, colors: &ThemeColors) {
     let modifiers = ctx.input(|i| i.modifiers);
+    let preview_side = app.preview_panel_side();
+    let other_panel_preview = preview_side.is_some_and(|side| side != app.active_panel);
     egui::TopBottomPanel::bottom("command_bar")
         .exact_height(30.0)
         .show(ctx, |ui| {
@@ -2949,13 +3321,24 @@ fn draw_command_bar(ctx: &egui::Context, colors: &ThemeColors) {
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let (f3, f4, f5, f6, f7, f8) = if modifiers.alt {
+                        let (f3, f4, mut f5, mut f6, f7, f8) = if modifiers.alt {
                             ("", "", "Pack", "Unpack", "Search", "Command")
                         } else if modifiers.shift {
                             ("", "New", "Copy", "Rename", "", "")
                         } else {
                             ("View", "Edit", "Copy", "Move", "Mkdir", "Delete")
                         };
+                        if other_panel_preview {
+                            if !f5.is_empty() {
+                                f5 = "";
+                            }
+                            if !f6.is_empty() {
+                                f6 = "";
+                            }
+                            if modifiers.shift {
+                                f5 = "";
+                            }
+                        }
                         draw_key_cap(ui, "F3", f3, colors);
                         draw_key_cap(ui, "F4", f4, colors);
                         draw_key_cap(ui, "F5", f5, colors);
@@ -3576,6 +3959,7 @@ impl ApplicationHandler<UserEvent> for App {
             fs_last_selected_name: Default::default(),
             container_last_selected_name: Default::default(),
             container_dir_cache: Default::default(),
+            props_dialog: None,
             theme: Theme::dark(),
             theme_picker_open: false,
             theme_picker_selected: None,
@@ -3745,7 +4129,7 @@ impl ApplicationHandler<UserEvent> for App {
                         runtime.needs_redraw = true;
                     }
 
-                    draw_command_bar(ctx, &runtime.app.theme.colors());
+                    draw_command_bar(ctx, &runtime.app, &runtime.app.theme.colors());
 
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let rect = ui.available_rect_before_wrap();
@@ -3882,6 +4266,9 @@ impl ApplicationHandler<UserEvent> for App {
                         && edit.confirm_discard
                     {
                         draw_discard_modal(ctx, &mut runtime.app);
+                    }
+                    if runtime.app.props_dialog.is_some() {
+                        draw_props_modal(ctx, &mut runtime.app);
                     }
                     if runtime.app.io_in_flight > 0 {
                         draw_progress_modal(ctx, &runtime.app);
@@ -4328,6 +4715,7 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
         fs_last_selected_name: Default::default(),
         container_last_selected_name: Default::default(),
         container_dir_cache: Default::default(),
+        props_dialog: None,
         theme: Theme::dark(),
         theme_picker_open: false,
         theme_picker_selected: None,
@@ -4500,7 +4888,7 @@ fn draw_root_ui(render: UiRender<'_>) {
         highlight_req_tx,
     } = render;
     apply_theme(ctx, &app.theme.colors());
-    draw_command_bar(ctx, &app.theme.colors());
+    draw_command_bar(ctx, app, &app.theme.colors());
     egui::CentralPanel::default().show(ctx, |ui| {
         let rect = ui.available_rect_before_wrap();
         let spacing_x = ui.spacing().item_spacing.x;
@@ -4638,6 +5026,9 @@ fn draw_root_ui(render: UiRender<'_>) {
         && edit.confirm_discard
     {
         draw_discard_modal(ctx, app);
+    }
+    if app.props_dialog.is_some() {
+        draw_props_modal(ctx, app);
     }
     if app.io_in_flight > 0 {
         draw_progress_modal(ctx, app);

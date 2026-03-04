@@ -19,6 +19,29 @@ pub struct PanelState {
     pub mode: PanelMode,
 }
 
+pub struct FileProps {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub file_type: String,
+    pub is_dir: bool,
+    pub user_label: String,
+    pub group_label: String,
+}
+
+pub struct FilePropsEdit {
+    pub mode: u32,
+    pub user: String,
+    pub group: String,
+}
+
+pub struct PropsDialog {
+    pub target: path::PathBuf,
+    pub original: FileProps,
+    pub current: FilePropsEdit,
+    pub error: Option<String>,
+}
+
 pub enum PanelMode {
     Browser,
     Preview(PreviewState),
@@ -149,6 +172,7 @@ pub struct AppState {
     pub fs_last_selected_name: HashMap<path::PathBuf, String>,
     pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
     pub container_dir_cache: HashMap<(path::PathBuf, String, ContainerKind), ContainerDirCache>,
+    pub props_dialog: Option<PropsDialog>,
     pub theme: Theme,
     pub theme_picker_open: bool,
     pub theme_picker_selected: Option<usize>,
