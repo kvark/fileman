@@ -13,6 +13,7 @@ use gif::{ColorOutput, DecodeOptions};
 use image_webp::WebPDecoder;
 use once_cell::sync::Lazy;
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     fs,
     hash::{Hash, Hasher},
@@ -21,6 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
+    time::UNIX_EPOCH,
 };
 use syntect::{
     easy::HighlightLines,
@@ -46,8 +48,8 @@ use fileman::app_state::{
 use fileman::core::{
     ActivePanel, BrowserMode, ContainerKind, DirBatch, DirEntry, EditLoadRequest, EditLoadResult,
     EntryLocation, ImageLocation, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
-    SearchMode, SearchProgress, SearchRequest, container_display_path, container_kind_from_path,
-    format_size, hexdump_with_width, is_media_name, is_text_name,
+    SearchMode, SearchProgress, SearchRequest, SearchResult, SortMode, container_display_path,
+    container_kind_from_path, format_size, hexdump_with_width, is_media_name, is_text_name,
     read_container_directory_with_progress,
 };
 use fileman::theme::{Color, Theme, ThemeColors, ThemeKind};
@@ -85,11 +87,17 @@ enum ScrollMode {
     ForceActive,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContainerLoadMode {
+    UseCache,
+    ForceReload,
+}
+
 impl UiCache {
     fn update_scroll_mode(&mut self, app: &AppState) {
         let left_selected = app.left_panel.browser.selected_index;
         let right_selected = app.right_panel.browser.selected_index;
-        let active = app.active_panel.clone();
+        let active = app.active_panel;
         let left_dir = app.left_panel.browser.dir_token;
         let right_dir = app.right_panel.browser.dir_token;
         let selection_changed = left_selected != self.last_left_selected
@@ -724,6 +732,136 @@ fn panel_path_display(panel: &PanelState) -> String {
     }
 }
 
+fn cmp_option_u64(a: Option<u64>, b: Option<u64>, descending: bool) -> Ordering {
+    match (a, b) {
+        (Some(av), Some(bv)) => {
+            if descending {
+                bv.cmp(&av)
+            } else {
+                av.cmp(&bv)
+            }
+        }
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+    }
+}
+
+fn sort_entries(entries: &mut Vec<DirEntry>, mode: SortMode, descending: bool) {
+    if mode == SortMode::Raw {
+        return;
+    }
+
+    let parent_index = entries.iter().position(|entry| entry.name == "..");
+    let parent = parent_index.map(|idx| entries.remove(idx));
+
+    entries.sort_by(|a, b| {
+        if a.is_dir != b.is_dir {
+            return b.is_dir.cmp(&a.is_dir);
+        }
+        let mut ord = match mode {
+            SortMode::Name => {
+                if descending {
+                    b.name.cmp(&a.name)
+                } else {
+                    a.name.cmp(&b.name)
+                }
+            }
+            SortMode::Date => cmp_option_u64(a.modified, b.modified, descending),
+            SortMode::Size => {
+                if a.is_dir && b.is_dir {
+                    if descending {
+                        b.name.cmp(&a.name)
+                    } else {
+                        a.name.cmp(&b.name)
+                    }
+                } else {
+                    cmp_option_u64(a.size, b.size, descending)
+                }
+            }
+            SortMode::Raw => Ordering::Equal,
+        };
+        if ord == Ordering::Equal {
+            ord = if descending {
+                b.name.cmp(&a.name)
+            } else {
+                a.name.cmp(&b.name)
+            };
+        }
+        ord
+    });
+
+    if let Some(parent) = parent {
+        entries.insert(0, parent);
+    }
+}
+
+fn resort_browser_entries(browser: &mut BrowserState) {
+    let selected_name = browser
+        .entries
+        .get(browser.selected_index)
+        .map(|entry| entry.name.clone());
+    sort_entries(&mut browser.entries, browser.sort_mode, browser.sort_desc);
+    if let Some(name) = selected_name
+        && let Some(idx) = browser.entries.iter().position(|entry| entry.name == name)
+    {
+        browser.selected_index = idx;
+    }
+    if browser.selected_index < browser.top_index {
+        browser.top_index = browser.selected_index;
+    }
+}
+
+fn sort_mode_label(mode: SortMode) -> &'static str {
+    match mode {
+        SortMode::Name => "Name",
+        SortMode::Date => "Date",
+        SortMode::Size => "Size",
+        SortMode::Raw => "Raw",
+    }
+}
+
+fn rebuild_search_entries(browser: &mut BrowserState, results: &[SearchResult]) {
+    let BrowserState {
+        browser_mode: ref mode,
+        ..
+    } = *browser;
+    browser.entries = results
+        .iter()
+        .map(|result| {
+            let display_name = match mode {
+                BrowserMode::Search { root, .. } => result
+                    .path
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        result
+                            .path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("<unknown>")
+                            .to_string()
+                    }),
+                _ => result
+                    .path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<unknown>")
+                    .to_string(),
+            };
+            DirEntry {
+                name: display_name,
+                is_dir: result.is_dir,
+                location: EntryLocation::Fs(result.path.clone()),
+                size: result.size,
+                modified: result.modified,
+            }
+        })
+        .collect();
+}
+
 fn apply_dir_batch(browser: &mut BrowserState, batch: DirBatch) {
     let prior_selection = browser
         .entries
@@ -742,6 +880,7 @@ fn apply_dir_batch(browser: &mut BrowserState, batch: DirBatch) {
                 is_dir: false,
                 location: EntryLocation::Fs(browser.current_path.clone()),
                 size: None,
+                modified: None,
             }];
             browser.selected_index = 0;
             browser.top_index = 0;
@@ -767,17 +906,21 @@ fn apply_dir_batch(browser: &mut BrowserState, batch: DirBatch) {
     }
 
     let restore_name = browser.prefer_select_name.take().or(prior_selection);
+    sort_entries(&mut browser.entries, browser.sort_mode, browser.sort_desc);
     if let Some(pref) = restore_name
         && let Some(idx) = browser.entries.iter().position(|e| e.name == pref)
     {
         browser.selected_index = idx;
+    }
+    if browser.selected_index < browser.top_index {
+        browser.top_index = browser.selected_index;
     }
 }
 
 fn pump_async(app: &mut AppState) -> bool {
     let mut changed = false;
     for side in [ActivePanel::Left, ActivePanel::Right] {
-        let panel = app.panel_mut(side.clone());
+        let panel = app.panel_mut(side);
         let browser = &mut panel.browser;
         if let Some(rx) = browser.entries_rx.take() {
             let mut handled = 0usize;
@@ -810,15 +953,20 @@ fn pump_async(app: &mut AppState) -> bool {
         app.dir_size_pending.remove(&path);
         app.dir_sizes.insert(path.clone(), size);
         for side in [ActivePanel::Left, ActivePanel::Right] {
-            let panel = app.panel_mut(side.clone());
+            let panel = app.panel_mut(side);
             let browser = &mut panel.browser;
+            let mut updated = false;
             for entry in &mut browser.entries {
                 if entry.is_dir
                     && let EntryLocation::Fs(p) = &entry.location
                     && *p == path
                 {
                     entry.size = Some(size);
+                    updated = true;
                 }
+            }
+            if updated && browser.sort_mode == SortMode::Size {
+                resort_browser_entries(browser);
             }
         }
         changed = true;
@@ -892,7 +1040,9 @@ fn pump_async(app: &mut AppState) -> bool {
                         is_dir: result.is_dir,
                         location: EntryLocation::Fs(result.path),
                         size: result.size,
+                        modified: result.modified,
                     });
+                    resort_browser_entries(browser);
                     if let Some(progress) = progress_for_panel {
                         browser.loading_progress = Some(progress);
                     }
@@ -950,11 +1100,12 @@ fn load_fs_directory_async(
             is_dir: true,
             location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
             size: None,
+            modified: None,
         });
         has_parent_entry = true;
     }
 
-    app.stash_container_cache(target_panel.clone());
+    app.stash_container_cache(target_panel);
     let (tx, rx) = mpsc::channel::<DirBatch>();
     let path_clone = path.clone();
     let wake = app.wake.clone();
@@ -968,16 +1119,22 @@ fn load_fs_directory_async(
                 Some(Ok(entry)) => {
                     let file_name = entry.file_name().to_string_lossy().to_string();
                     let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    let metadata = entry.metadata().ok();
                     let size = if is_dir {
                         dir_sizes_snapshot.get(&entry.path()).copied()
                     } else {
-                        entry.metadata().ok().map(|m| m.len())
+                        metadata.as_ref().map(|m| m.len())
                     };
+                    let modified = metadata
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs());
                     snapshot.push(DirEntry {
                         name: file_name,
                         is_dir,
                         location: EntryLocation::Fs(entry.path()),
                         size,
+                        modified,
                     });
                 }
                 Some(Err(_)) | None => break,
@@ -993,20 +1150,25 @@ fn load_fs_directory_async(
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if let Ok(file_type) = entry.file_type() {
                     let is_dir = file_type.is_dir();
+                    let metadata = entry.metadata().ok();
                     let size = if is_dir {
                         dir_sizes_snapshot.get(&entry.path()).copied()
                     } else {
-                        entry.metadata().ok().map(|m| m.len())
+                        metadata.as_ref().map(|m| m.len())
                     };
+                    let modified = metadata
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs());
                     all.push(DirEntry {
                         name: file_name,
                         is_dir,
                         location: EntryLocation::Fs(entry.path()),
                         size,
+                        modified,
                     });
                 }
             }
-            all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
             let mut sorted: Vec<DirEntry> = Vec::new();
             if let Some(parent) = path_clone.parent() {
                 sorted.push(DirEntry {
@@ -1014,6 +1176,7 @@ fn load_fs_directory_async(
                     is_dir: true,
                     location: EntryLocation::Fs(parent.to_path_buf()),
                     size: None,
+                    modified: None,
                 });
             }
             sorted.extend(all);
@@ -1042,21 +1205,26 @@ fn load_fs_directory_async(
                     let file_name = entry.file_name().to_string_lossy().to_string();
                     if let Ok(file_type) = entry.file_type() {
                         let is_dir = file_type.is_dir();
+                        let metadata = entry.metadata().ok();
                         let size = if is_dir {
                             dir_sizes_fallback.get(&entry.path()).copied()
                         } else {
-                            entry.metadata().ok().map(|m| m.len())
+                            metadata.as_ref().map(|m| m.len())
                         };
+                        let modified = metadata
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs());
                         all.push(DirEntry {
                             name: file_name,
                             is_dir,
                             location: EntryLocation::Fs(entry.path()),
                             size,
+                            modified,
                         });
                     }
                 }
             }
-            all.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
             let mut sorted: Vec<DirEntry> = Vec::new();
             if let Some(parent) = path_clone.parent() {
                 sorted.push(DirEntry {
@@ -1064,6 +1232,7 @@ fn load_fs_directory_async(
                     is_dir: true,
                     location: EntryLocation::Fs(parent.to_path_buf()),
                     size: None,
+                    modified: None,
                 });
             }
             sorted.extend(all);
@@ -1113,10 +1282,14 @@ fn load_container_directory_async(
     cwd: String,
     target_panel: ActivePanel,
     prefer_name: Option<String>,
+    cache_mode: ContainerLoadMode,
 ) {
-    app.stash_container_cache(target_panel.clone());
+    app.stash_container_cache(target_panel);
     let cache_key = (archive_path.clone(), cwd.clone(), kind);
     let mut cached = app.container_dir_cache.remove(&cache_key);
+    if cache_mode == ContainerLoadMode::ForceReload {
+        cached = None;
+    }
     let mut initial: Vec<DirEntry> = if let Some(ref cache) = cached {
         cache.entries.clone()
     } else {
@@ -1141,6 +1314,7 @@ fn load_container_directory_async(
                     inner_path: parent,
                 },
                 size: None,
+                modified: None,
             });
         } else {
             let parent = archive_path
@@ -1152,6 +1326,7 @@ fn load_container_directory_async(
                 is_dir: true,
                 location: EntryLocation::Fs(parent),
                 size: None,
+                modified: None,
             });
         }
     }
@@ -1231,6 +1406,7 @@ fn load_container_directory_async(
                                     },
                                 },
                                 size: None,
+                                modified: None,
                             });
                             *ctx.loaded += 1;
                         }
@@ -1251,6 +1427,7 @@ fn load_container_directory_async(
                                 },
                             },
                             size: None,
+                            modified: None,
                         });
                         *ctx.loaded += 1;
                     }
@@ -1500,9 +1677,9 @@ fn load_container_directory_async(
 }
 
 fn open_selected(app: &mut AppState) {
-    let active = app.active_panel.clone();
+    let active = app.active_panel;
 
-    open_selected_from_to(app, active.clone(), active);
+    open_selected_from_to(app, active, active);
 }
 
 fn should_show_preview(app: &AppState, panel_side: ActivePanel) -> bool {
@@ -1515,9 +1692,41 @@ fn should_show_editor(app: &AppState, panel_side: ActivePanel) -> bool {
     matches!(mode, PanelMode::Edit(_))
 }
 
+fn open_with_default_app(path: &Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", path.to_string_lossy().as_ref()])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to open with default app: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to open with default app: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to open with default app: {e}"))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
 fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: ActivePanel) {
     let (selected_entry, current_path, container_cwd) = {
-        let panel = app.panel(source.clone());
+        let panel = app.panel(source);
         let browser = &panel.browser;
         if browser.entries.is_empty() {
             return;
@@ -1536,7 +1745,7 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
     };
 
     app.store_selection_memory_for(source);
-    app.push_history(target.clone());
+    app.push_history(target);
 
     match selected_entry.location.clone() {
         EntryLocation::Fs(path) => {
@@ -1548,7 +1757,7 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
                 } else {
                     None
                 };
-                load_fs_directory_async(app, path.clone(), target.clone(), prefer_name);
+                load_fs_directory_async(app, path.clone(), target, prefer_name);
 
                 if selected_entry.name != ".."
                     && let Some(name) = app.fs_last_selected_name.get(&path).cloned()
@@ -1563,7 +1772,12 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
                     "".to_string(),
                     target,
                     None,
+                    ContainerLoadMode::UseCache,
                 );
+            } else if app.allow_external_open
+                && let Err(err) = open_with_default_app(&path)
+            {
+                eprintln!("{err}");
             }
         }
         EntryLocation::Container {
@@ -1587,8 +1801,9 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
                     kind,
                     archive_path.clone(),
                     inner_path.clone(),
-                    target.clone(),
+                    target,
                     prefer_name,
+                    ContainerLoadMode::UseCache,
                 );
 
                 if selected_entry.name != ".."
@@ -1607,7 +1822,7 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
         app.dir_size_pending.remove(&path);
         app.dir_sizes.insert(path.clone(), size);
         for side in [ActivePanel::Left, ActivePanel::Right] {
-            let panel = app.panel_mut(side.clone());
+            let panel = app.panel_mut(side);
             let browser = &mut panel.browser;
             for entry in &mut browser.entries {
                 if entry.is_dir
@@ -1689,6 +1904,7 @@ fn apply_panel_snapshot(
                 cwd,
                 which,
                 snapshot.selected_name,
+                ContainerLoadMode::UseCache,
             );
         }
         BrowserMode::Search { .. } => {
@@ -1730,8 +1946,10 @@ fn apply_panel_snapshot(
                     is_dir: result.is_dir,
                     location: EntryLocation::Fs(result.path.clone()),
                     size: result.size,
+                    modified: result.modified,
                 }
             }));
+            sort_entries(&mut browser.entries, browser.sort_mode, browser.sort_desc);
             browser.entries_rx = None;
             browser.selected_index = snapshot
                 .selected_name
@@ -1782,7 +2000,7 @@ fn start_search(app: &mut AppState) {
         browser.current_path.clone()
     };
     {
-        app.push_history(app.active_panel.clone());
+        app.push_history(app.active_panel);
         let panel = app.get_active_panel_mut();
         let browser = &mut panel.browser;
         browser.current_path = root.clone();
@@ -1843,7 +2061,7 @@ fn handle_keyboard(
         ctx.request_repaint();
         return;
     }
-    if let PanelMode::Edit(ref mut edit) = app.panel_mut(app.active_panel.clone()).mode {
+    if let PanelMode::Edit(ref mut edit) = app.panel_mut(app.active_panel).mode {
         let enter = input.key_pressed(egui::Key::Enter);
         let escape = input.key_pressed(egui::Key::Escape);
         let ctrl_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
@@ -1858,8 +2076,8 @@ fn handle_keyboard(
             }
             ctx.request_repaint();
             if close_editor {
-                let return_focus = edit.return_focus.clone();
-                let panel = app.panel_mut(app.active_panel.clone());
+                let return_focus = edit.return_focus;
+                let panel = app.panel_mut(app.active_panel);
                 panel.mode = PanelMode::Browser;
                 app.active_panel = return_focus;
             }
@@ -1881,8 +2099,8 @@ fn handle_keyboard(
                 let _ = io_tx.send(fileman::core::IOTask::WriteFile { path, contents });
             }
             if close_editor {
-                let return_focus = edit.return_focus.clone();
-                let panel = app.panel_mut(app.active_panel.clone());
+                let return_focus = edit.return_focus;
+                let panel = app.panel_mut(app.active_panel);
                 panel.mode = PanelMode::Browser;
                 app.active_panel = return_focus;
             }
@@ -1899,8 +2117,8 @@ fn handle_keyboard(
             }
             ctx.request_repaint();
             if close_editor {
-                let return_focus = edit.return_focus.clone();
-                let panel = app.panel_mut(app.active_panel.clone());
+                let return_focus = edit.return_focus;
+                let panel = app.panel_mut(app.active_panel);
                 panel.mode = PanelMode::Browser;
                 app.active_panel = return_focus;
             }
@@ -1931,8 +2149,8 @@ fn handle_keyboard(
         let panel = app.get_active_panel();
         if matches!(panel.browser.browser_mode, BrowserMode::Search { .. }) {
             cancel_search(app);
-            if let Some(snapshot) = app.pop_history_back(app.active_panel.clone()) {
-                apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
+            if let Some(snapshot) = app.pop_history_back(app.active_panel) {
+                apply_panel_snapshot(app, app.active_panel, snapshot);
             }
             ctx.request_repaint();
             return;
@@ -1994,12 +2212,12 @@ fn handle_keyboard(
         open_selected_from_to(app, ActivePanel::Left, ActivePanel::Right);
     }
     let alt_left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft));
-    if alt_left && let Some(snapshot) = app.pop_history_back(app.active_panel.clone()) {
-        apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
+    if alt_left && let Some(snapshot) = app.pop_history_back(app.active_panel) {
+        apply_panel_snapshot(app, app.active_panel, snapshot);
     }
     let alt_right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight));
-    if alt_right && let Some(snapshot) = app.pop_history_forward(app.active_panel.clone()) {
-        apply_panel_snapshot(app, app.active_panel.clone(), snapshot);
+    if alt_right && let Some(snapshot) = app.pop_history_forward(app.active_panel) {
+        apply_panel_snapshot(app, app.active_panel, snapshot);
     }
     let alt_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F7));
     if alt_f7 {
@@ -2025,7 +2243,7 @@ fn handle_keyboard(
             app.get_active_panel().browser.browser_mode,
             BrowserMode::Search { .. }
         ) {
-            app.push_history(app.active_panel.clone());
+            app.push_history(app.active_panel);
             let panel = app.get_active_panel();
             let browser = &panel.browser;
             let entry = browser.entries.get(browser.selected_index).cloned();
@@ -2033,18 +2251,13 @@ fn handle_keyboard(
                 && let EntryLocation::Fs(path) = entry.location
             {
                 if entry.is_dir {
-                    load_fs_directory_async(app, path, app.active_panel.clone(), None);
+                    load_fs_directory_async(app, path, app.active_panel, None);
                 } else if let Some(parent) = path.parent() {
                     let name = path
                         .file_name()
                         .and_then(|s| s.to_str())
                         .map(|s| s.to_string());
-                    load_fs_directory_async(
-                        app,
-                        parent.to_path_buf(),
-                        app.active_panel.clone(),
-                        name,
-                    );
+                    load_fs_directory_async(app, parent.to_path_buf(), app.active_panel, name);
                 }
             }
             app.search_ui = SearchUiState::Closed;
@@ -2054,7 +2267,7 @@ fn handle_keyboard(
             open_selected(app);
         }
     }
-    if let PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel.clone()).mode {
+    if let PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode {
         let line = preview.line_height.max(16.0);
         let page = preview.page_height.max(200.0);
         let mut consumed = false;
@@ -2095,7 +2308,7 @@ fn handle_keyboard(
     }
     let ctrl_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F));
     if ctrl_f {
-        if let PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel.clone()).mode {
+        if let PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode {
             preview.find_open = true;
             preview.find_focus = true;
         }
@@ -2103,7 +2316,7 @@ fn handle_keyboard(
     }
     let PanelState {
         mode: active_mode, ..
-    } = app.panel(app.active_panel.clone());
+    } = app.panel(app.active_panel);
     let active_is_browser = matches!(active_mode, PanelMode::Browser);
     if input.key_pressed(egui::Key::ArrowDown) && active_is_browser {
         if app.theme_picker_open {
@@ -2258,7 +2471,7 @@ fn confirm_pending_op(app: &mut AppState) {
                 app.clear_pending_op();
                 return;
             }
-            app.store_selection_memory_for(app.active_panel.clone());
+            app.store_selection_memory_for(app.active_panel);
             app.fs_last_selected_name.insert(
                 src.parent()
                     .unwrap_or_else(|| std::path::Path::new("."))
@@ -2277,8 +2490,8 @@ fn confirm_pending_op(app: &mut AppState) {
 }
 
 fn refresh_active_panel(app: &mut AppState) {
-    let which = app.active_panel.clone();
-    let panel = app.panel(which.clone());
+    let which = app.active_panel;
+    let panel = app.panel(which);
     let browser = &panel.browser;
     let path = browser.current_path.clone();
     if matches!(browser.browser_mode, BrowserMode::Fs) {
@@ -2288,7 +2501,7 @@ fn refresh_active_panel(app: &mut AppState) {
 
 fn refresh_fs_panels(app: &mut AppState) {
     for which in [ActivePanel::Left, ActivePanel::Right] {
-        let browser = &app.panel(which.clone()).browser;
+        let browser = &app.panel(which).browser;
         if !matches!(browser.browser_mode, BrowserMode::Fs) {
             continue;
         }
@@ -2297,11 +2510,58 @@ fn refresh_fs_panels(app: &mut AppState) {
     }
 }
 
+fn reload_panel(app: &mut AppState, which: ActivePanel) {
+    let (mode, current_path, selected_name) = {
+        let panel = app.panel(which);
+        let browser = &panel.browser;
+        (
+            browser.browser_mode.clone(),
+            browser.current_path.clone(),
+            browser
+                .entries
+                .get(browser.selected_index)
+                .map(|entry| entry.name.clone()),
+        )
+    };
+    match mode {
+        BrowserMode::Fs => load_fs_directory_async(app, current_path, which, selected_name),
+        BrowserMode::Container {
+            kind,
+            archive_path,
+            cwd,
+        } => load_container_directory_async(
+            app,
+            kind,
+            archive_path,
+            cwd,
+            which,
+            selected_name,
+            ContainerLoadMode::ForceReload,
+        ),
+        BrowserMode::Search { .. } => {
+            let results = app.search_results.clone();
+            let panel = app.panel_mut(which);
+            let browser = &mut panel.browser;
+            rebuild_search_entries(browser, &results);
+            if let Some(name) = selected_name
+                && let Some(idx) = browser.entries.iter().position(|entry| entry.name == name)
+            {
+                browser.selected_index = idx;
+            }
+            if browser.selected_index < browser.top_index {
+                browser.top_index = browser.selected_index;
+            }
+        }
+    }
+}
+
 fn draw_confirmation(ctx: &egui::Context, app: &mut AppState) {
     let op = match app.pending_op.clone() {
         Some(op) => op,
         None => return,
     };
+    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+    let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
     let colors = app.theme.colors();
     let screen = ctx.available_rect();
@@ -2366,6 +2626,15 @@ fn draw_confirmation(ctx: &egui::Context, app: &mut AppState) {
                 });
             }
         });
+
+    if !is_rename {
+        if enter {
+            confirmed = true;
+        }
+        if escape {
+            cancelled = true;
+        }
+    }
 
     if confirmed {
         confirm_pending_op(app);
@@ -2449,11 +2718,11 @@ fn draw_discard_modal(ctx: &egui::Context, app: &mut AppState) {
             });
         });
     if let Some(accept) = action {
-        let panel = app.panel_mut(side.clone());
+        let panel = app.panel_mut(side);
         if accept {
             let return_focus = match panel.mode {
-                PanelMode::Edit(ref edit) => edit.return_focus.clone(),
-                _ => side.clone(),
+                PanelMode::Edit(ref edit) => edit.return_focus,
+                _ => side,
             };
             panel.mode = PanelMode::Browser;
             app.active_panel = return_focus;
@@ -2822,7 +3091,7 @@ fn apply_props_dialog(app: &mut AppState, recursive: bool) {
     }
     app.io_in_flight = app.io_in_flight.saturating_add(1);
     app.props_dialog = None;
-    app.store_selection_memory_for(app.active_panel.clone());
+    app.store_selection_memory_for(app.active_panel);
     refresh_active_panel(app);
 }
 
@@ -3507,8 +3776,15 @@ fn draw_panel(
     let colors = app.theme.colors();
     let is_active = app.active_panel == panel_side;
 
-    let (entries_len, selected_index, header_text, selected_label, loading, loading_progress) = {
-        let panel = app.panel(panel_side.clone());
+    let (
+        mut entries_len,
+        mut selected_index,
+        header_text,
+        mut selected_label,
+        mut loading,
+        mut loading_progress,
+    ) = {
+        let panel = app.panel(panel_side);
         let browser = &panel.browser;
         let entries_len = browser.entries.len();
         let selected_index = browser.selected_index;
@@ -3541,8 +3817,9 @@ fn draw_panel(
     let mut clicked_index: Option<usize> = None;
     let mut open_on_double_click = false;
     let mut new_top_index: Option<usize> = None;
-    let panel_side_for_closure = panel_side.clone();
+    let panel_side_for_closure = panel_side;
 
+    let mut request_raw_reload = false;
     let panel_response = egui::Frame::NONE
         .fill(color32(Color::rgba(0.0, 0.0, 0.0, 0.0)))
         .stroke(egui::Stroke::new(
@@ -3569,15 +3846,114 @@ fn draw_panel(
                             .fill(color32(colors.header_bg))
                             .corner_radius(egui::CornerRadius::same(4))
                             .show(ui, |ui| {
+                                let panel = app.panel_mut(panel_side);
+                                let browser = &mut panel.browser;
+                                let mut sort_mode = browser.sort_mode;
+                                let mut sort_desc = browser.sort_desc;
+                                let mut sort_changed = false;
+                                let previous_sort_mode = browser.sort_mode;
+
+                                let full_width = ui.available_width();
+                                let controls_width = 120.0;
+                                let gap = 24.0;
+                                let left_width = (full_width - controls_width - gap).max(0.0);
                                 ui.horizontal(|ui| {
-                                    if is_active {
-                                        ui.colored_label(color32(colors.header_fg), "●");
+                                    ui.allocate_ui_with_layout(
+                                        egui::Vec2::new(left_width, ui.available_height()),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            if is_active {
+                                                ui.colored_label(color32(colors.header_fg), "●");
+                                            }
+                                            ui.colored_label(
+                                                color32(colors.header_fg),
+                                                header_text,
+                                            );
+                                        },
+                                    );
+                                    if left_width > 0.0 {
+                                        ui.add_space(gap);
                                     }
-                                    ui.colored_label(color32(colors.header_fg), header_text);
+                                    ui.allocate_ui_with_layout(
+                                        egui::Vec2::new(controls_width, ui.available_height()),
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            egui::ComboBox::from_id_salt(match panel_side {
+                                                ActivePanel::Left => "left_sort_mode",
+                                                ActivePanel::Right => "right_sort_mode",
+                                            })
+                                            .selected_text(sort_mode_label(sort_mode))
+                                            .show_ui(
+                                                ui,
+                                                |ui| {
+                                                    sort_changed |= ui
+                                                        .selectable_value(
+                                                            &mut sort_mode,
+                                                            SortMode::Name,
+                                                            "Name",
+                                                        )
+                                                        .changed();
+                                                    sort_changed |= ui
+                                                        .selectable_value(
+                                                            &mut sort_mode,
+                                                            SortMode::Date,
+                                                            "Date",
+                                                        )
+                                                        .changed();
+                                                    sort_changed |= ui
+                                                        .selectable_value(
+                                                            &mut sort_mode,
+                                                            SortMode::Size,
+                                                            "Size",
+                                                        )
+                                                        .changed();
+                                                    sort_changed |= ui
+                                                        .selectable_value(
+                                                            &mut sort_mode,
+                                                            SortMode::Raw,
+                                                            "Raw",
+                                                        )
+                                                        .changed();
+                                                },
+                                            );
+                                            let arrow = if sort_desc { "v" } else { "^" };
+                                            if ui.small_button(arrow).clicked() {
+                                                sort_desc = !sort_desc;
+                                                sort_changed = true;
+                                            }
+                                        },
+                                    );
                                 });
+
+                                if sort_changed {
+                                    browser.sort_mode = sort_mode;
+                                    browser.sort_desc = sort_desc;
+                                    if sort_mode == SortMode::Raw
+                                        && previous_sort_mode != SortMode::Raw
+                                    {
+                                        request_raw_reload = true;
+                                    } else {
+                                        resort_browser_entries(browser);
+                                    }
+                                }
                             });
                     },
                 );
+
+                if request_raw_reload {
+                    reload_panel(app, panel_side);
+                    let panel = app.panel(panel_side);
+                    let browser = &panel.browser;
+                    entries_len = browser.entries.len();
+                    selected_index = browser.selected_index.min(entries_len.saturating_sub(1));
+                    selected_label = browser
+                        .entries
+                        .get(selected_index)
+                        .map(|e| e.name.clone())
+                        .unwrap_or_else(|| "-".to_string());
+                    loading = browser.loading;
+                    loading_progress = browser.loading_progress;
+                }
 
                 if loading {
                     let progress = loading_progress.unwrap_or((0, None));
@@ -3587,7 +3963,7 @@ fn draw_panel(
                     };
                     ui.add_space(4.0);
                     let loading_label = matches!(
-                        app.panel(panel_side.clone()).browser.browser_mode,
+                        app.panel(panel_side).browser.browser_mode,
                         BrowserMode::Search { .. }
                     );
                     let prefix = if loading_label {
@@ -3647,8 +4023,7 @@ fn draw_panel(
                             visible_range = row_range.clone();
                             for idx in row_range {
                                 let (entry, rename_active) = {
-                                    let browser =
-                                        &app.panel(panel_side_for_closure.clone()).browser;
+                                    let browser = &app.panel(panel_side_for_closure).browser;
                                     let entry = browser.entries[idx].clone();
                                     let rename_active = browser
                                         .inline_rename
@@ -3750,7 +4125,7 @@ fn draw_panel(
                                         |ui| {
                                             ui.set_clip_rect(name_rect);
                                             let rename = app
-                                                .panel_mut(panel_side_for_closure.clone())
+                                                .panel_mut(panel_side_for_closure)
                                                 .browser
                                                 .inline_rename
                                                 .as_mut()
@@ -3829,15 +4204,15 @@ fn draw_panel(
         });
 
     if panel_response.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
-        app.active_panel = panel_side.clone();
+        app.active_panel = panel_side;
     }
 
     if let Some(top) = new_top_index {
-        app.panel_mut(panel_side.clone()).browser.top_index = top;
+        app.panel_mut(panel_side).browser.top_index = top;
     }
 
     if let Some(idx) = clicked_index {
-        app.active_panel = panel_side.clone();
+        app.active_panel = panel_side;
         app.select_entry(idx, rows);
         if open_on_double_click {
             open_selected(app);
@@ -4075,6 +4450,8 @@ impl ApplicationHandler<UserEvent> for App {
                     history_back: Vec::new(),
                     history_forward: Vec::new(),
                     inline_rename: None,
+                    sort_mode: SortMode::Name,
+                    sort_desc: false,
                 },
                 mode: PanelMode::Browser,
             },
@@ -4093,10 +4470,13 @@ impl ApplicationHandler<UserEvent> for App {
                     history_back: Vec::new(),
                     history_forward: Vec::new(),
                     inline_rename: None,
+                    sort_mode: SortMode::Name,
+                    sort_desc: false,
                 },
                 mode: PanelMode::Browser,
             },
             active_panel: ActivePanel::Left,
+            allow_external_open: true,
             wake: Some(Arc::new({
                 let proxy = self.proxy.clone();
                 move || {
@@ -4677,6 +5057,16 @@ fn apply_replay_key(
 
     let mut events = Vec::new();
     let key_name = key.key.as_str();
+    if key_name.eq_ignore_ascii_case("enter")
+        && matches!(
+            app.pending_op,
+            Some(PendingOp::Delete { .. } | PendingOp::Copy { .. } | PendingOp::Move { .. })
+        )
+    {
+        confirm_pending_op(app);
+        headless.run_frame(app, ui_cache, Vec::new());
+        return;
+    }
     if key_name.eq_ignore_ascii_case("wait") {
         wait_for_idle(headless, app, ui_cache, 600);
         return;
@@ -4838,6 +5228,8 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
                 history_back: Vec::new(),
                 history_forward: Vec::new(),
                 inline_rename: None,
+                sort_mode: SortMode::Name,
+                sort_desc: false,
             },
             mode: PanelMode::Browser,
         },
@@ -4856,10 +5248,13 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
                 history_back: Vec::new(),
                 history_forward: Vec::new(),
                 inline_rename: None,
+                sort_mode: SortMode::Name,
+                sort_desc: false,
             },
             mode: PanelMode::Browser,
         },
         active_panel: ActivePanel::Left,
+        allow_external_open: false,
         wake: None,
         preview_tx,
         preview_rx,

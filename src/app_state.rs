@@ -9,7 +9,7 @@ use std::{
 use crate::core::{
     ActivePanel, BrowserMode, ContainerKind, DirBatch, DirEntry, EditLoadRequest, EditLoadResult,
     EntryLocation, IOResult, IOTask, ImageLocation, PreviewContent, PreviewRequest, SearchCase,
-    SearchMode, SearchResult, container_display_path, container_kind_from_path,
+    SearchMode, SearchResult, SortMode, container_display_path, container_kind_from_path,
     format_preview_info, is_image_name, is_image_path, is_text_name, is_text_path,
 };
 use crate::theme::Theme;
@@ -62,6 +62,8 @@ pub struct BrowserState {
     pub history_back: Vec<PanelSnapshot>,
     pub history_forward: Vec<PanelSnapshot>,
     pub inline_rename: Option<InlineRename>,
+    pub sort_mode: SortMode,
+    pub sort_desc: bool,
 }
 
 pub struct InlineRename {
@@ -164,6 +166,7 @@ pub struct AppState {
     pub left_panel: PanelState,
     pub right_panel: PanelState,
     pub active_panel: ActivePanel,
+    pub allow_external_open: bool,
     pub wake: Option<Arc<dyn Fn() + Send + Sync>>,
     pub preview_tx: mpsc::Sender<PreviewRequest>,
     pub preview_rx: mpsc::Receiver<(u64, PreviewContent)>,
@@ -257,11 +260,11 @@ impl AppState {
     }
 
     pub fn get_active_panel(&self) -> &PanelState {
-        self.panel(self.active_panel.clone())
+        self.panel(self.active_panel)
     }
 
     pub fn get_active_panel_mut(&mut self) -> &mut PanelState {
-        self.panel_mut(self.active_panel.clone())
+        self.panel_mut(self.active_panel)
     }
 
     pub fn preview_panel_side(&self) -> Option<ActivePanel> {
@@ -362,7 +365,7 @@ impl AppState {
     }
 
     pub fn store_current_selection_memory(&mut self) {
-        self.store_selection_memory_for(self.active_panel.clone());
+        self.store_selection_memory_for(self.active_panel);
     }
 
     pub fn store_selection_memory_for(&mut self, which: ActivePanel) {
@@ -437,7 +440,7 @@ impl AppState {
 
     pub fn push_history(&mut self, which: ActivePanel) {
         let snapshot = {
-            let panel = self.panel(which.clone());
+            let panel = self.panel(which);
             let browser = &panel.browser;
             let selected = browser.entries.get(browser.selected_index).map(|e| {
                 if matches!(browser.browser_mode, BrowserMode::Search { .. })
@@ -466,7 +469,7 @@ impl AppState {
 
     pub fn pop_history_back(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
         let current = {
-            let panel = self.panel(which.clone());
+            let panel = self.panel(which);
             let browser = &panel.browser;
             let selected = browser.entries.get(browser.selected_index).map(|e| {
                 if matches!(browser.browser_mode, BrowserMode::Search { .. })
@@ -493,7 +496,7 @@ impl AppState {
 
     pub fn pop_history_forward(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
         let current = {
-            let panel = self.panel(which.clone());
+            let panel = self.panel(which);
             let browser = &panel.browser;
             let selected = browser.entries.get(browser.selected_index).map(|e| {
                 if matches!(browser.browser_mode, BrowserMode::Search { .. })
@@ -584,6 +587,7 @@ impl AppState {
                 is_dir: false,
                 location: EntryLocation::Fs(new_path),
                 size: None,
+                modified: None,
             },
         );
         browser.selected_index = insert_at;
@@ -625,8 +629,8 @@ impl AppState {
                 ActivePanel::Right => ActivePanel::Left,
             }
         };
-        let return_focus = self.active_panel.clone();
-        let target_panel_clone = target_panel.clone();
+        let return_focus = self.active_panel;
+        let target_panel_clone = target_panel;
         let request_id = self.edit_request_id.wrapping_add(1);
         self.edit_request_id = request_id;
         let path_to_send = {
@@ -707,7 +711,7 @@ impl AppState {
             self.preview_request_id = list_id;
             list_request = Some((kind, path.clone(), list_id));
         }
-        let _target_panel_clone = target_panel.clone();
+        let _target_panel_clone = target_panel;
         {
             let panel = self.panel_mut(target_panel);
             let preview = PreviewState {

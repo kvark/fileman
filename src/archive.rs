@@ -335,8 +335,10 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
     let file = fs::File::open(archive_path)?;
     let reader = std::io::BufReader::new(file);
     let mut zip = zip::ZipArchive::new(reader)?;
-    let mut dirs: HashSet<String> = HashSet::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut seen_dirs: HashSet<String> = HashSet::new();
     let mut files: Vec<String> = Vec::new();
+    let mut seen_files: HashSet<String> = HashSet::new();
 
     let prefix = if cwd.is_empty() {
         "".to_string()
@@ -355,8 +357,10 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         }
         if let Some(slash) = rem.find('/') {
             let dir = rem[..slash].to_string();
-            dirs.insert(dir);
-        } else {
+            if seen_dirs.insert(dir.clone()) {
+                dirs.push(dir);
+            }
+        } else if seen_files.insert(rem.to_string()) {
             files.push(rem.to_string());
         }
     }
@@ -378,6 +382,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                 inner_path: parent,
             },
             size: None,
+            modified: None,
         });
     } else {
         let parent = archive_path
@@ -389,10 +394,11 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
             is_dir: true,
             location: EntryLocation::Fs(parent),
             size: None,
+            modified: None,
         });
     }
 
-    let mut dir_entries: Vec<DirEntry> = dirs
+    let dir_entries: Vec<DirEntry> = dirs
         .into_iter()
         .map(|d| DirEntry {
             name: d.clone(),
@@ -407,10 +413,11 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                 },
             },
             size: None,
+            modified: None,
         })
         .collect();
 
-    let mut file_entries: Vec<DirEntry> = files
+    let file_entries: Vec<DirEntry> = files
         .into_iter()
         .map(|f| DirEntry {
             name: f.clone(),
@@ -425,11 +432,9 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                 },
             },
             size: None,
+            modified: None,
         })
         .collect();
-
-    dir_entries.sort_by(|a, b| a.name.cmp(&b.name));
-    file_entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries.extend(dir_entries);
     entries.extend(file_entries);
 
@@ -534,8 +539,10 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
     let file = fs::File::open(archive_path)?;
     let reader = std::io::BufReader::new(file);
     let mut archive = tar::Archive::new(reader);
-    let mut dirs: HashSet<String> = HashSet::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut seen_dirs: HashSet<String> = HashSet::new();
     let mut files: Vec<String> = Vec::new();
+    let mut seen_files: HashSet<String> = HashSet::new();
 
     let prefix = if cwd.is_empty() {
         "".to_string()
@@ -556,8 +563,10 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         }
         if let Some(slash) = rem.find('/') {
             let dir = rem[..slash].to_string();
-            dirs.insert(dir);
-        } else {
+            if seen_dirs.insert(dir.clone()) {
+                dirs.push(dir);
+            }
+        } else if seen_files.insert(rem.to_string()) {
             files.push(rem.to_string());
         }
     }
@@ -579,6 +588,7 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                 inner_path: parent,
             },
             size: None,
+            modified: None,
         });
     } else {
         let parent = archive_path
@@ -590,10 +600,11 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
             is_dir: true,
             location: EntryLocation::Fs(parent),
             size: None,
+            modified: None,
         });
     }
 
-    let mut dir_entries: Vec<DirEntry> = dirs
+    let dir_entries: Vec<DirEntry> = dirs
         .into_iter()
         .map(|d| DirEntry {
             name: d.clone(),
@@ -608,10 +619,11 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                 },
             },
             size: None,
+            modified: None,
         })
         .collect();
 
-    let mut file_entries: Vec<DirEntry> = files
+    let file_entries: Vec<DirEntry> = files
         .into_iter()
         .map(|f| DirEntry {
             name: f.clone(),
@@ -626,11 +638,9 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
                 },
             },
             size: None,
+            modified: None,
         })
         .collect();
-
-    dir_entries.sort_by(|a, b| a.name.cmp(&b.name));
-    file_entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries.extend(dir_entries);
     entries.extend(file_entries);
 
@@ -642,8 +652,10 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
     let reader = std::io::BufReader::new(file);
     let decoder = flate2::read::GzDecoder::new(reader);
     let mut archive = tar::Archive::new(decoder);
-    let mut dirs: HashSet<String> = HashSet::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut seen_dirs: HashSet<String> = HashSet::new();
     let mut files: Vec<String> = Vec::new();
+    let mut seen_files: HashSet<String> = HashSet::new();
 
     let prefix = if cwd.is_empty() {
         "".to_string()
@@ -664,8 +676,10 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
         }
         if let Some(slash) = rem.find('/') {
             let dir = rem[..slash].to_string();
-            dirs.insert(dir);
-        } else {
+            if seen_dirs.insert(dir.clone()) {
+                dirs.push(dir);
+            }
+        } else if seen_files.insert(rem.to_string()) {
             files.push(rem.to_string());
         }
     }
@@ -687,6 +701,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
                 inner_path: parent,
             },
             size: None,
+            modified: None,
         });
     } else {
         let parent = archive_path
@@ -698,10 +713,11 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
             is_dir: true,
             location: EntryLocation::Fs(parent),
             size: None,
+            modified: None,
         });
     }
 
-    let mut dir_entries: Vec<DirEntry> = dirs
+    let dir_entries: Vec<DirEntry> = dirs
         .into_iter()
         .map(|d| DirEntry {
             name: d.clone(),
@@ -716,10 +732,11 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
                 },
             },
             size: None,
+            modified: None,
         })
         .collect();
 
-    let mut file_entries: Vec<DirEntry> = files
+    let file_entries: Vec<DirEntry> = files
         .into_iter()
         .map(|f| DirEntry {
             name: f.clone(),
@@ -734,11 +751,9 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
                 },
             },
             size: None,
+            modified: None,
         })
         .collect();
-
-    dir_entries.sort_by(|a, b| a.name.cmp(&b.name));
-    file_entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries.extend(dir_entries);
     entries.extend(file_entries);
 
@@ -819,8 +834,10 @@ fn read_tar_bz2_directory_with_progress(
     let reader = std::io::BufReader::new(file);
     let decoder = bzip2::read::BzDecoder::new(reader);
     let mut archive = tar::Archive::new(decoder);
-    let mut dirs: HashSet<String> = HashSet::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut seen_dirs: HashSet<String> = HashSet::new();
     let mut files: Vec<String> = Vec::new();
+    let mut seen_files: HashSet<String> = HashSet::new();
     let mut seen = 0usize;
     const PROGRESS_INTERVAL: usize = 1000;
 
@@ -851,8 +868,10 @@ fn read_tar_bz2_directory_with_progress(
         }
         if let Some(slash) = rem.find('/') {
             let dir = rem[..slash].to_string();
-            dirs.insert(dir);
-        } else {
+            if seen_dirs.insert(dir.clone()) {
+                dirs.push(dir);
+            }
+        } else if seen_files.insert(rem.to_string()) {
             files.push(rem.to_string());
         }
         seen += 1;
@@ -878,6 +897,7 @@ fn read_tar_bz2_directory_with_progress(
                 inner_path: parent,
             },
             size: None,
+            modified: None,
         });
     } else {
         let parent = archive_path
@@ -889,10 +909,11 @@ fn read_tar_bz2_directory_with_progress(
             is_dir: true,
             location: EntryLocation::Fs(parent),
             size: None,
+            modified: None,
         });
     }
 
-    let mut dir_entries: Vec<DirEntry> = dirs
+    let dir_entries: Vec<DirEntry> = dirs
         .into_iter()
         .map(|d| DirEntry {
             name: d.clone(),
@@ -907,10 +928,11 @@ fn read_tar_bz2_directory_with_progress(
                 },
             },
             size: None,
+            modified: None,
         })
         .collect();
 
-    let mut file_entries: Vec<DirEntry> = files
+    let file_entries: Vec<DirEntry> = files
         .into_iter()
         .map(|f| DirEntry {
             name: f.clone(),
@@ -925,11 +947,9 @@ fn read_tar_bz2_directory_with_progress(
                 },
             },
             size: None,
+            modified: None,
         })
         .collect();
-
-    dir_entries.sort_by(|a, b| a.name.cmp(&b.name));
-    file_entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries.extend(dir_entries);
     entries.extend(file_entries);
 

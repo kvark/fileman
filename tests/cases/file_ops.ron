@@ -14,6 +14,7 @@
     (key: "Backspace"),
     (key: "text: source_copy.txt"),
     (key: "Enter"),
+    (key: "Wait"),
     (key: "F8"),
     (key: "Enter"),
   ],

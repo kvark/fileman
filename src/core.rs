@@ -3,6 +3,7 @@ use std::{
     io::{self, Read},
     path::{self, Path},
     sync::Arc,
+    time::UNIX_EPOCH,
 };
 
 pub use crate::archive::{
@@ -45,6 +46,7 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub location: EntryLocation,
     pub size: Option<u64>,
+    pub modified: Option<u64>,
 }
 
 pub enum DirBatch {
@@ -55,7 +57,7 @@ pub enum DirBatch {
     Error(String),
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ActivePanel {
     Left,
     Right,
@@ -154,6 +156,14 @@ pub enum IOResult {
     Completed,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    Name,
+    Date,
+    Size,
+    Raw,
+}
+
 pub struct EditLoadRequest {
     pub id: u64,
     pub path: path::PathBuf,
@@ -190,6 +200,7 @@ pub struct SearchResult {
     pub path: path::PathBuf,
     pub is_dir: bool,
     pub size: Option<u64>,
+    pub modified: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -242,16 +253,22 @@ pub fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
         let file_type = entry.file_type()?;
         let is_dir = file_type.is_dir();
 
+        let metadata = entry.metadata().ok();
         let size = if is_dir {
             None
         } else {
-            entry.metadata().ok().map(|m| m.len())
+            metadata.as_ref().map(|m| m.len())
         };
+        let modified = metadata
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
         dir_entries.push(DirEntry {
             name: file_name,
             is_dir,
             location: EntryLocation::Fs(entry.path()),
             size,
+            modified,
         });
     }
 
@@ -263,6 +280,7 @@ pub fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
             is_dir: true,
             location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
             size: None,
+            modified: None,
         });
     }
 
