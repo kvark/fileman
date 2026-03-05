@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
+    time::UNIX_EPOCH,
 };
 
 use crate::core::{
@@ -318,6 +319,12 @@ pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<Sea
                         Ok(ft) => ft,
                         Err(_) => continue,
                     };
+                    let metadata = entry.metadata().ok();
+                    let modified = metadata
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs());
                     match request.mode {
                         SearchMode::Name => {
                             let name = entry.file_name().to_string_lossy().to_string();
@@ -333,7 +340,7 @@ pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<Sea
                             };
                             if matched {
                                 let size = if file_type.is_file() {
-                                    entry.metadata().ok().map(|m| m.len())
+                                    metadata.as_ref().map(|m| m.len())
                                 } else {
                                     None
                                 };
@@ -343,6 +350,7 @@ pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<Sea
                                         path: path.clone(),
                                         is_dir: file_type.is_dir(),
                                         size,
+                                        modified,
                                     },
                                 });
                                 progress.matched = progress.matched.saturating_add(1);
@@ -360,13 +368,14 @@ pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<Sea
                                 continue;
                             }
                             if file_contains(&path, &needle, request.case).unwrap_or(false) {
-                                let size = entry.metadata().ok().map(|m| m.len());
+                                let size = metadata.as_ref().map(|m| m.len());
                                 let _ = result_tx.send(SearchEvent::Match {
                                     id: request.id,
                                     result: SearchResult {
                                         path: path.clone(),
                                         is_dir: false,
                                         size,
+                                        modified,
                                     },
                                 });
                                 progress.matched = progress.matched.saturating_add(1);
