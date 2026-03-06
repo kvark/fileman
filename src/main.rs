@@ -1682,6 +1682,25 @@ fn open_selected(app: &mut AppState) {
     open_selected_from_to(app, active, active);
 }
 
+fn open_selected_external(app: &mut AppState) {
+    if !app.allow_external_open {
+        return;
+    }
+    let entry = {
+        let panel = app.get_active_panel();
+        let browser = &panel.browser;
+        if browser.entries.is_empty() {
+            return;
+        }
+        browser.entries[browser.selected_index].clone()
+    };
+    if let EntryLocation::Fs(path) = entry.location {
+        if let Err(err) = open_with_default_app(&path) {
+            eprintln!("{err}");
+        }
+    }
+}
+
 fn should_show_preview(app: &AppState, panel_side: ActivePanel) -> bool {
     let PanelState { mode, .. } = app.panel(panel_side);
     matches!(mode, PanelMode::Preview(_))
@@ -1774,10 +1793,6 @@ fn open_selected_from_to(app: &mut AppState, source: ActivePanel, target: Active
                     None,
                     ContainerLoadMode::UseCache,
                 );
-            } else if app.allow_external_open
-                && let Err(err) = open_with_default_app(&path)
-            {
-                eprintln!("{err}");
             }
         }
         EntryLocation::Container {
@@ -2142,6 +2157,12 @@ fn handle_keyboard(
     let alt_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter));
     if alt_enter {
         open_props_dialog(app);
+        ctx.request_repaint();
+        return;
+    }
+    let shift_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
+    if shift_enter {
+        open_selected_external(app);
         ctx.request_repaint();
         return;
     }
