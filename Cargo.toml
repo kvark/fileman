@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 default-run = "fileman"
 
+[package.metadata.bundle]
+name = "Fileman"
+identifier = "com.fileman.app"
+icon = ["etc/macos/icon.png"]
+
 [dependencies]
 anyhow = "1.0"
 log = "0.4"
