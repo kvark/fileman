@@ -50,28 +50,16 @@ fn plugin_for_kind(kind: ContainerKind) -> &'static dyn ContainerPlugin {
     &ZIP_PLUGIN
 }
 
-fn container_scheme(kind: ContainerKind) -> &'static str {
-    plugin_for_kind(kind).scheme()
-}
-
 pub fn container_display_path(
     kind: ContainerKind,
     archive_path: &Path,
     inner_path: &str,
 ) -> String {
+    let _ = kind;
     if inner_path.is_empty() {
-        format!(
-            "{}::{}:/",
-            archive_path.to_string_lossy(),
-            container_scheme(kind)
-        )
+        archive_path.to_string_lossy().to_string()
     } else {
-        format!(
-            "{}::{}:/{}",
-            archive_path.to_string_lossy(),
-            container_scheme(kind),
-            inner_path
-        )
+        format!("{}/{}", archive_path.to_string_lossy(), inner_path)
     }
 }
 
