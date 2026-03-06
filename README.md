@@ -30,6 +30,18 @@ cargo run
 RUST_LOG=info cargo run
 ```
 
+## macOS App Bundle
+This project uses `cargo-bundle` for macOS bundling. Install it once:
+```bash
+cargo install cargo-bundle
+```
+Then build the bundle:
+```bash
+cargo bundle --release
+```
+The icon is set via `package.metadata.bundle.icon` in `Cargo.toml` and uses
+`etc/macos/icon.png`.
+
 ### Test Replays
 Replay cases live in `tests/cases/` and use the RON format. To run a case and emit a snapshot:
 ```bash
