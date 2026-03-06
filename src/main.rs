@@ -4500,6 +4500,7 @@ impl ApplicationHandler<UserEvent> for App {
             },
             active_panel: ActivePanel::Left,
             allow_external_open: true,
+            preview_return_focus: None,
             wake: Some(Arc::new({
                 let proxy = self.proxy.clone();
                 move || {
@@ -5278,6 +5279,7 @@ fn init_headless_app(root: Option<PathBuf>) -> Result<AppState> {
         },
         active_panel: ActivePanel::Left,
         allow_external_open: false,
+        preview_return_focus: None,
         wake: None,
         preview_tx,
         preview_rx,

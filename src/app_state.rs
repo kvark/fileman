@@ -166,6 +166,7 @@ pub struct AppState {
     pub left_panel: PanelState,
     pub right_panel: PanelState,
     pub active_panel: ActivePanel,
+    pub preview_return_focus: Option<ActivePanel>,
     pub allow_external_open: bool,
     pub wake: Option<Arc<dyn Fn() + Send + Sync>>,
     pub preview_tx: mpsc::Sender<PreviewRequest>,
@@ -701,6 +702,7 @@ impl AppState {
             ActivePanel::Left => ActivePanel::Right,
             ActivePanel::Right => ActivePanel::Left,
         };
+        self.preview_return_focus = Some(self.active_panel);
         let mut request_id = self.preview_request_id.wrapping_add(1);
         self.preview_request_id = request_id;
         let mut list_request: Option<(ContainerKind, path::PathBuf, u64)> = None;
@@ -1132,5 +1134,8 @@ impl AppState {
         };
         let panel = self.panel_mut(side);
         panel.mode = PanelMode::Browser;
+        if let Some(return_focus) = self.preview_return_focus.take() {
+            self.active_panel = return_focus;
+        }
     }
 }
