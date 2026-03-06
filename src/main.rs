@@ -862,6 +862,75 @@ fn rebuild_search_entries(browser: &mut BrowserState, results: &[SearchResult]) 
         .collect();
 }
 
+fn hexdump_job(
+    bytes: &[u8],
+    width: usize,
+    colors: &ThemeColors,
+    ui: &egui::Ui,
+) -> egui::text::LayoutJob {
+    let width = width.clamp(4, 32);
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let offset_color = color32(colors.row_fg_inactive);
+    let hex_color = color32(colors.row_fg_active);
+    let ascii_color = color32(colors.row_fg_inactive);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    job.wrap.break_anywhere = false;
+
+    let offset_format = egui::TextFormat {
+        font_id: font_id.clone(),
+        color: offset_color,
+        ..Default::default()
+    };
+    let hex_format = egui::TextFormat {
+        font_id: font_id.clone(),
+        color: hex_color,
+        ..Default::default()
+    };
+    let ascii_format = egui::TextFormat {
+        font_id,
+        color: ascii_color,
+        ..Default::default()
+    };
+
+    let mut offset = 0usize;
+    for chunk in bytes.chunks(width) {
+        let mut line = String::new();
+        line.push_str(&format!("{:08x}: ", offset));
+        job.append(&line, 0.0, offset_format.clone());
+
+        let mut hex = String::new();
+        for i in 0..width {
+            if i < chunk.len() {
+                hex.push_str(&format!("{:02x} ", chunk[i]));
+            } else {
+                hex.push_str("   ");
+            }
+            if i == (width / 2).saturating_sub(1) {
+                hex.push(' ');
+            }
+        }
+        job.append(&hex, 0.0, hex_format.clone());
+
+        let mut ascii = String::new();
+        ascii.push(' ');
+        for &b in chunk {
+            let ch = if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '.'
+            };
+            ascii.push(ch);
+        }
+        ascii.push('\n');
+        job.append(&ascii, 0.0, ascii_format.clone());
+
+        offset += width;
+    }
+
+    job
+}
+
 fn apply_dir_batch(browser: &mut BrowserState, batch: DirBatch) {
     let prior_selection = browser
         .entries
@@ -1694,10 +1763,10 @@ fn open_selected_external(app: &mut AppState) {
         }
         browser.entries[browser.selected_index].clone()
     };
-    if let EntryLocation::Fs(path) = entry.location {
-        if let Err(err) = open_with_default_app(&path) {
-            eprintln!("{err}");
-        }
+    if let EntryLocation::Fs(path) = entry.location
+        && let Err(err) = open_with_default_app(&path)
+    {
+        eprintln!("{err}");
     }
 }
 
@@ -3600,8 +3669,8 @@ fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                         } else {
                             preview.bytes_per_row
                         };
-                        let dump = hexdump_with_width(bytes, width);
-                        ui.add(egui::Label::new(dump).selectable(true));
+                        let job = hexdump_job(bytes, width, &colors, ui);
+                        ui.add(egui::Label::new(job).selectable(true));
                     }
                     Some(PreviewContent::Image(path)) => {
                         let (key, request) = match path {
