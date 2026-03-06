@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: fileman-linux-x86_64.tar.gz
+          - os: windows-latest
+            artifact: fileman-windows-x86_64.zip
+          - os: macos-latest
+            artifact: fileman-macos-aarch64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo build --release --bin fileman
+          mkdir -p dist
+          tar -C target/release -czf dist/${{ matrix.artifact }} fileman
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cargo build --release --bin fileman
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/fileman.exe -DestinationPath dist/${{ matrix.artifact }}
+
+      - name: Build (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo install cargo-bundle
+          rustup target add aarch64-apple-darwin
+          cargo bundle --release --target aarch64-apple-darwin
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent target/aarch64-apple-darwin/release/bundle/osx/Fileman.app dist/${{ matrix.artifact }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.artifact }}
