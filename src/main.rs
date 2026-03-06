@@ -196,6 +196,15 @@ fn blend_color(base: Color, tint: Color, t: f32) -> Color {
     )
 }
 
+fn fade_color(color: Color, factor: f32) -> Color {
+    Color::rgba(
+        color.r,
+        color.g,
+        color.b,
+        (color.a * factor).clamp(0.0, 1.0),
+    )
+}
+
 fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(egui::ColorImage, ImageMeta)> {
     let options = DecoderOptions::new_fast();
     if let Ok(image) = ZuneImage::read(bytes, options) {
@@ -4183,6 +4192,8 @@ fn draw_panel(
                                     colors.row_fg_inactive
                                 };
                                 let mut fg = fg;
+                                let is_hidden =
+                                    entry.name.starts_with('.') && entry.name.as_str() != "..";
                                 let file_tint = if entry.is_dir {
                                     None
                                 } else if is_text_name(&entry.name) {
@@ -4195,6 +4206,9 @@ fn draw_panel(
                                 if !is_selected && let Some(tint) = file_tint {
                                     let factor = if is_active { 0.42 } else { 0.32 };
                                     fg = blend_color(fg, tint, factor);
+                                }
+                                if is_hidden && !is_selected {
+                                    fg = fade_color(fg, 0.55);
                                 }
 
                                 let (rect, response) = ui.allocate_exact_size(
@@ -4220,6 +4234,11 @@ fn draw_panel(
                                     blend_color(fg, tint, 0.85)
                                 } else {
                                     fg
+                                };
+                                let icon_color = if is_hidden && !is_selected {
+                                    fade_color(icon_color, 0.55)
+                                } else {
+                                    icon_color
                                 };
                                 ui.painter().rect_filled(
                                     icon_rect,
