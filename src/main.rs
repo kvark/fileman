@@ -3857,19 +3857,25 @@ fn draw_panel(
                                 let controls_width = 120.0;
                                 let gap = 24.0;
                                 let left_width = (full_width - controls_width - gap).max(0.0);
+                                let prev_spacing = ui.spacing().item_spacing;
+                                ui.spacing_mut().item_spacing.x = 0.0;
                                 ui.horizontal(|ui| {
-                                    ui.allocate_ui_with_layout(
+                                    let (left_rect, _) = ui.allocate_exact_size(
                                         egui::Vec2::new(left_width, ui.available_height()),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            if is_active {
-                                                ui.colored_label(color32(colors.header_fg), "●");
-                                            }
-                                            ui.colored_label(
-                                                color32(colors.header_fg),
-                                                header_text,
-                                            );
-                                        },
+                                        egui::Sense::hover(),
+                                    );
+                                    let header_display = if is_active {
+                                        format!("● {header_text}")
+                                    } else {
+                                        header_text.clone()
+                                    };
+                                    let header_font = egui::TextStyle::Body.resolve(ui.style());
+                                    ui.painter().with_clip_rect(left_rect).text(
+                                        left_rect.left_center(),
+                                        egui::Align2::LEFT_CENTER,
+                                        header_display,
+                                        header_font,
+                                        color32(colors.header_fg),
                                     );
                                     if left_width > 0.0 {
                                         ui.add_space(gap);
@@ -3924,6 +3930,7 @@ fn draw_panel(
                                         },
                                     );
                                 });
+                                ui.spacing_mut().item_spacing = prev_spacing;
 
                                 if sort_changed {
                                     browser.sort_mode = sort_mode;
