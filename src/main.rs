@@ -4198,11 +4198,6 @@ fn draw_panel(
                                             app.search_focus = false;
                                         }
                                     });
-                                } else {
-                                    let footer_text = format!(
-                                        "items: {entries_len} | selected: {selected_label}"
-                                    );
-                                    ui.colored_label(color32(colors.footer_fg), footer_text);
                                 }
                             });
                     },
