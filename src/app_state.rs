@@ -46,6 +46,7 @@ pub enum PanelMode {
     Browser,
     Preview(PreviewState),
     Edit(EditState),
+    Help(HelpState),
 }
 
 pub struct BrowserState {
@@ -116,6 +117,9 @@ pub struct EditState {
     pub request_id: u64,
 }
 
+pub struct HelpState {
+    pub return_focus: ActivePanel,
+}
 #[derive(Clone)]
 pub struct PanelSnapshot {
     pub mode: BrowserMode,
@@ -320,6 +324,32 @@ impl AppState {
             return Some(ActivePanel::Right);
         }
         None
+    }
+
+    pub fn help_panel_side(&self) -> Option<ActivePanel> {
+        let PanelState {
+            mode: ref left_mode,
+            ..
+        } = self.left_panel;
+        if let PanelMode::Help(_) = *left_mode {
+            return Some(ActivePanel::Left);
+        }
+        let PanelState {
+            mode: ref right_mode,
+            ..
+        } = self.right_panel;
+        if let PanelMode::Help(_) = *right_mode {
+            return Some(ActivePanel::Right);
+        }
+        None
+    }
+
+    pub fn help_panel(&self, which: ActivePanel) -> Option<&HelpState> {
+        let panel = self.panel(which);
+        match panel.mode {
+            PanelMode::Help(ref help) => Some(help),
+            _ => None,
+        }
     }
 
     pub fn edit_panel(&self) -> Option<&EditState> {
@@ -839,6 +869,27 @@ impl AppState {
             return;
         }
         self.update_preview_for_current_selection();
+    }
+
+    pub fn toggle_help(&mut self) {
+        if let Some(side) = self.help_panel_side() {
+            let fallback = self.active_panel;
+            let panel = self.panel_mut(side);
+            let return_focus = match panel.mode {
+                PanelMode::Help(HelpState { return_focus }) => return_focus,
+                _ => fallback,
+            };
+            panel.mode = PanelMode::Browser;
+            self.active_panel = return_focus;
+            return;
+        }
+        let target_panel = match self.active_panel {
+            ActivePanel::Left => ActivePanel::Right,
+            ActivePanel::Right => ActivePanel::Left,
+        };
+        let return_focus = self.active_panel;
+        let panel = self.panel_mut(target_panel);
+        panel.mode = PanelMode::Help(HelpState { return_focus });
     }
 
     pub fn prepare_copy_selected(&mut self) {

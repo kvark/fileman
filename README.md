@@ -20,6 +20,18 @@ Fileman is a fast, responsive two-panel file manager built with egui via blade-e
 - Snapshot rendering via `--snapshot` for CI.
 - Replay runner for tests via `--replay` (RON format).
 
+## Keyboard Shortcuts
+- Navigation: Enter (open), Tab/Ctrl+I (switch panels), Alt+Left/Right (back/forward).
+- Parent/child: Backspace/Ctrl+PgUp (parent), Ctrl+PgDn (open selected).
+- Panels: Ctrl+Left/Right (open selected dir in the other panel).
+- Preview: F3 (toggle), Shift+Enter (open with system default app).
+- Edit: F4 (edit), Shift+F4 (new file + inline rename), Shift+F6 (rename).
+- Ops: F5 copy, F6 move, F8 delete, Space computes folder size.
+- Search: Alt+F7 (name search).
+- Properties: Alt+Enter (file properties).
+- Refresh: Ctrl+R.
+- Theme: F9 (toggle), F10 (picker).
+
 ## Screenshot
 ![Fileman screenshot](etc/snapshots/tests/preview.png)
 
