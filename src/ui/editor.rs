@@ -1,0 +1,195 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
+
+use egui;
+
+use fileman::{app_state, theme};
+
+use crate::{HighlightRequest, color32, cursor_row_col, hash_text};
+
+pub struct EditorRender<'a> {
+    pub theme: &'a theme::Theme,
+    pub is_focused: bool,
+    pub edit: &'a mut app_state::EditState,
+    pub highlight_cache: &'a HashMap<String, egui::text::LayoutJob>,
+    pub highlight_pending: &'a mut HashSet<String>,
+    pub highlight_req_tx: &'a mpsc::Sender<HighlightRequest>,
+    pub min_height: f32,
+}
+
+pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
+    let EditorRender {
+        theme,
+        is_focused,
+        edit,
+        highlight_cache,
+        highlight_pending,
+        highlight_req_tx,
+        min_height,
+    } = ctx;
+    let colors = theme.colors();
+    egui::Frame::NONE
+        .fill(color32(colors.preview_bg))
+        .stroke(egui::Stroke::new(
+            1.0,
+            color32(if is_focused {
+                colors.panel_border_active
+            } else {
+                colors.panel_border_inactive
+            }),
+        ))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::Vec2::new(ui.available_width(), min_height));
+            egui::Frame::NONE
+                .fill(color32(colors.preview_header_bg))
+                .show(ui, |ui| {
+                    let title = edit
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Edit".to_string());
+                    ui.colored_label(color32(colors.preview_header_fg), format!("Edit — {title}"));
+                });
+            ui.add_space(4.0);
+            if edit.loading {
+                ui.colored_label(color32(colors.row_fg_inactive), "Loading…");
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(60));
+                if is_focused {
+                    ui.ctx().request_repaint();
+                }
+                return;
+            }
+            let mut text = std::mem::take(&mut edit.text);
+            let edit_ext = edit.ext.clone();
+            let theme_kind = theme.kind;
+            let mut key = edit.highlight_key.clone();
+            if key.is_none()
+                && let Some(path) = edit.path.as_ref()
+            {
+                key = Some(format!("edit:{}", path.to_string_lossy()));
+                edit.highlight_key = key.clone();
+            }
+            let key_with_hash = key
+                .as_ref()
+                .map(|base| format!("{base}:{}", edit.highlight_hash));
+            if let Some(key) = key_with_hash.as_ref() {
+                let cached = highlight_cache.contains_key(key);
+                let ready = edit
+                    .highlight_dirty_at
+                    .map(|t| t.elapsed().as_millis() > 250)
+                    .unwrap_or(true);
+                if !cached && !highlight_pending.contains(key) && !text.is_empty() && ready {
+                    edit.highlight_wrap_width = ui.available_width();
+                    highlight_pending.insert(key.clone());
+                    edit.highlight_dirty_at = None;
+                    let _ = highlight_req_tx.send(HighlightRequest {
+                        key: key.clone(),
+                        text: text.clone(),
+                        ext: edit_ext.clone(),
+                        theme_kind,
+                    });
+                }
+            }
+            let mut needs_highlight = false;
+            let mut layouter = |ui: &egui::Ui, string: &dyn egui::TextBuffer, wrap_width: f32| {
+                if let Some(key) = key_with_hash.as_ref() {
+                    let _wrap_changed = (edit.highlight_wrap_width - wrap_width).abs() > 0.5;
+                    if let Some(cached) = highlight_cache.get(key) {
+                        let mut job = cached.clone();
+                        job.wrap.max_width = wrap_width;
+                        return ui.fonts_mut(|f| f.layout_job(job));
+                    }
+                    needs_highlight = true;
+                }
+                ui.fonts_mut(|f| {
+                    f.layout_job(egui::text::LayoutJob::simple(
+                        string.as_str().to_string(),
+                        egui::TextStyle::Monospace.resolve(ui.style()),
+                        egui::Color32::LIGHT_GRAY,
+                        wrap_width,
+                    ))
+                })
+            };
+            let footer_height = ui.text_style_height(&egui::TextStyle::Body).max(1.0) + 8.0;
+            let editor_height = (ui.available_height() - footer_height).max(0.0);
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+            let desired_rows = (editor_height / row_height).floor().max(1.0) as usize;
+            let mut edit_output: Option<egui::text_edit::TextEditOutput> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("editor_scroll")
+                .auto_shrink([false, false])
+                .max_height(editor_height)
+                .show(ui, |ui| {
+                    let output = egui::TextEdit::multiline(&mut text)
+                        .font(egui::TextStyle::Monospace)
+                        .layouter(&mut layouter)
+                        .code_editor()
+                        .cursor_at_end(false)
+                        .id_source("editor_text")
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(desired_rows)
+                        .show(ui);
+                    edit_output = Some(output);
+                });
+            let response = edit_output
+                .as_ref()
+                .map(|output| output.response.clone())
+                .unwrap_or_else(|| ui.label(" "));
+            edit.text = text;
+            if response.changed() {
+                edit.highlight_hash = hash_text(&edit.text);
+                edit.highlight_wrap_width = 0.0;
+                edit.highlight_dirty_at = Some(std::time::Instant::now());
+                edit.dirty = true;
+            }
+            if needs_highlight && let Some(key) = edit.highlight_key.clone() {
+                let wrap_width = ui.available_width();
+                if !highlight_pending.contains(&key) {
+                    edit.highlight_wrap_width = wrap_width;
+                    highlight_pending.insert(key.clone());
+                    let _ = highlight_req_tx.send(HighlightRequest {
+                        key,
+                        text: edit.text.clone(),
+                        ext: edit_ext,
+                        theme_kind,
+                    });
+                }
+            }
+            if is_focused {
+                response.request_focus();
+                ui.memory_mut(|mem| mem.request_focus(response.id));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    color32(colors.row_fg_inactive),
+                    "Ctrl+S: save  •  Esc: close",
+                );
+                ui.add_space(6.0);
+                let (row, col) = edit_output
+                    .as_ref()
+                    .and_then(|output| output.cursor_range)
+                    .map(|range| range.primary.index)
+                    .map(|idx| cursor_row_col(&edit.text, idx))
+                    .unwrap_or((1, 1));
+                let info = format!("row: {row}, col: {col}");
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let width = ui
+                    .painter()
+                    .layout_no_wrap(info.clone(), font.clone(), color32(colors.row_fg_inactive))
+                    .size()
+                    .x;
+                let rect = ui.available_rect_before_wrap();
+                let pos = egui::pos2(rect.right() - width, rect.center().y);
+                ui.painter().text(
+                    pos,
+                    egui::Align2::LEFT_CENTER,
+                    info,
+                    font,
+                    color32(colors.row_fg_inactive),
+                );
+            });
+        });
+}

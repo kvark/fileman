@@ -63,6 +63,10 @@ To run all replay cases:
 ```bash
 scripts/replay_runner.sh
 ```
+To update the reference images for replay tests:
+```bash
+cp target/test-artifacts/*.png etc/snapshots/tests/
+```
 
 ### GPU Backend Notes
 If you see `NoSupportedDeviceFound`, blade-graphics couldn't find a supported GPU backend.
