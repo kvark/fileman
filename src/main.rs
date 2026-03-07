@@ -2128,6 +2128,12 @@ fn handle_keyboard(
     cache: &mut UiCache,
 ) {
     let io_tx = app.io_tx.clone();
+    let f1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1));
+    if f1 {
+        app.toggle_help();
+        ctx.request_repaint();
+        return;
+    }
     if app.io_in_flight > 0 && input.key_pressed(egui::Key::Escape) {
         app.request_io_cancel();
         ctx.request_repaint();
@@ -2136,6 +2142,13 @@ fn handle_keyboard(
     if app.props_dialog.is_some() {
         if input.key_pressed(egui::Key::Escape) {
             app.props_dialog = None;
+            ctx.request_repaint();
+        }
+        return;
+    }
+    if app.help_panel_side().is_some() {
+        if input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::Enter) {
+            app.toggle_help();
             ctx.request_repaint();
         }
         return;
@@ -3841,6 +3854,7 @@ fn draw_command_bar(ctx: &egui::Context, app: &AppState, colors: &ThemeColors) {
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        draw_key_cap(ui, "F1", "Help", colors);
                         let (mut f3, f4, mut f5, mut f6, f7, f8) = if modifiers.alt {
                             ("", "", "Pack", "Unpack", "Search", "Command")
                         } else if modifiers.shift {
@@ -4868,6 +4882,10 @@ impl ApplicationHandler<UserEvent> for App {
                                         },
                                     );
                                 }
+                            } else if let Some(_help) = runtime.app.help_panel(ActivePanel::Left) {
+                                let is_focused = runtime.app.active_panel == ActivePanel::Left;
+                                let theme = runtime.app.theme.clone();
+                                draw_help(ui, &theme, is_focused, rect.height());
                             } else {
                                 runtime.ui_cache.left_rows = draw_panel(
                                     ui,
@@ -4919,6 +4937,10 @@ impl ApplicationHandler<UserEvent> for App {
                                         },
                                     );
                                 }
+                            } else if let Some(_help) = runtime.app.help_panel(ActivePanel::Right) {
+                                let is_focused = runtime.app.active_panel == ActivePanel::Right;
+                                let theme = runtime.app.theme.clone();
+                                draw_help(ui, &theme, is_focused, rect.height());
                             } else {
                                 runtime.ui_cache.right_rows = draw_panel(
                                     ui,
@@ -5645,6 +5667,11 @@ fn draw_root_ui(render: UiRender<'_>) {
                         );
                     }
                     ui_cache.left_rows
+                } else if let Some(_help) = app.help_panel(ActivePanel::Left) {
+                    let is_focused = app.active_panel == ActivePanel::Left;
+                    let theme = app.theme.clone();
+                    draw_help(ui, &theme, is_focused, rect.height());
+                    ui_cache.left_rows
                 } else {
                     draw_panel(
                         ui,
@@ -5700,6 +5727,11 @@ fn draw_root_ui(render: UiRender<'_>) {
                         );
                     }
                     ui_cache.right_rows
+                } else if let Some(_help) = app.help_panel(ActivePanel::Right) {
+                    let is_focused = app.active_panel == ActivePanel::Right;
+                    let theme = app.theme.clone();
+                    draw_help(ui, &theme, is_focused, rect.height());
+                    ui_cache.right_rows
                 } else {
                     draw_panel(
                         ui,
@@ -5736,6 +5768,68 @@ fn draw_root_ui(render: UiRender<'_>) {
     if app.io_in_flight > 0 {
         draw_progress_modal(ctx, app);
     }
+}
+
+fn draw_help(ui: &mut egui::Ui, theme: &Theme, is_focused: bool, min_height: f32) {
+    let colors = theme.colors();
+    let version = env!("CARGO_PKG_VERSION");
+    let shortcuts = [
+        ("Enter", "Open"),
+        ("Shift+Enter", "Open with system default app"),
+        ("Tab / Ctrl+I", "Switch panels"),
+        ("Alt+Left / Alt+Right", "Back / forward"),
+        ("Backspace / Ctrl+PgUp", "Parent folder"),
+        ("Ctrl+PgDn", "Open selected"),
+        ("Ctrl+Left / Ctrl+Right", "Open selected dir in other panel"),
+        ("F3", "Preview"),
+        ("F4", "Edit"),
+        ("Shift+F4", "New file"),
+        ("Shift+F6", "Rename"),
+        ("F5", "Copy"),
+        ("F6", "Move"),
+        ("F8", "Delete"),
+        ("Space", "Compute folder size"),
+        ("Alt+F7", "Search"),
+        ("Alt+Enter", "Properties"),
+        ("Ctrl+R", "Refresh"),
+        ("F9", "Toggle theme"),
+        ("F10", "Theme picker"),
+        ("F1", "Help"),
+    ];
+    egui::Frame::NONE
+        .fill(color32(colors.preview_bg))
+        .stroke(egui::Stroke::new(
+            1.0,
+            color32(if is_focused {
+                colors.panel_border_active
+            } else {
+                colors.panel_border_inactive
+            }),
+        ))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::Vec2::new(ui.available_width(), min_height));
+            egui::Frame::NONE
+                .fill(color32(colors.preview_header_bg))
+                .show(ui, |ui| {
+                    ui.colored_label(color32(colors.preview_header_fg), "Help (Tab to return)");
+                });
+            ui.add_space(8.0);
+            ui.colored_label(color32(colors.preview_text), format!("Fileman {version}"));
+            ui.colored_label(color32(colors.row_fg_inactive), "Author: Dzmitry Malyshau");
+            ui.add_space(10.0);
+            ui.colored_label(color32(colors.preview_text), "Shortcuts");
+            ui.add_space(6.0);
+            for (keys, desc) in shortcuts {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.colored_label(
+                        color32(colors.row_fg_selected),
+                        egui::RichText::new(keys).monospace().strong(),
+                    );
+                    ui.colored_label(color32(colors.row_fg_inactive), desc);
+                });
+            }
+        });
 }
 
 fn resolve_case_path(base: &std::path::Path, path: &PathBuf) -> PathBuf {
