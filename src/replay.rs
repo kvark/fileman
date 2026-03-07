@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, Deserializer};
 
@@ -73,7 +72,7 @@ pub struct SnapshotAssert {
     pub max_pixel_fraction: f32,
 }
 
-pub fn load_replay_case(path: &PathBuf) -> Result<ReplayCase> {
+pub fn load_replay_case(path: &PathBuf) -> anyhow::Result<ReplayCase> {
     let text = std::fs::read_to_string(path)?;
     ron::from_str(&text).map_err(|err| anyhow::anyhow!("{err}"))
 }
@@ -86,7 +85,7 @@ fn default_max_pixel_fraction() -> f32 {
     0.001
 }
 
-fn deserialize_vec_or_option<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+fn deserialize_vec_or_option<'de, D, T>(deserializer: D) -> anyhow::Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: DeserializeOwned,

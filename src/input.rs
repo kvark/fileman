@@ -1,0 +1,736 @@
+use std::path::{Path, PathBuf};
+
+use fileman::{app_state, core};
+
+use crate::{
+    ContainerLoadMode, UiCache, active_window_rows, apply_panel_snapshot, cancel_search,
+    load_container_directory_async, load_fs_directory_async, open_props_dialog, open_search,
+    preview_find_next, refresh_active_panel, refresh_fs_panels, start_search,
+};
+
+pub(crate) fn open_selected(app: &mut app_state::AppState) {
+    let active = app.active_panel;
+    open_selected_from_to(app, active, active);
+}
+
+pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
+    if !app.allow_external_open {
+        return;
+    }
+    let entry = {
+        let panel = app.get_active_panel();
+        let browser = &panel.browser;
+        if browser.entries.is_empty() {
+            return;
+        }
+        browser.entries[browser.selected_index].clone()
+    };
+    if let core::EntryLocation::Fs(path) = entry.location
+        && let Err(err) = open_with_default_app(&path)
+    {
+        eprintln!("{err}");
+    }
+}
+
+fn open_with_default_app(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", path.to_string_lossy().as_ref()])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to open with default app: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to open with default app: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to open with default app: {e}"))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+fn open_selected_from_to(
+    app: &mut app_state::AppState,
+    source: core::ActivePanel,
+    target: core::ActivePanel,
+) {
+    let (selected_entry, current_path, container_cwd) = {
+        let panel = app.panel(source);
+        let browser = &panel.browser;
+        if browser.entries.is_empty() {
+            return;
+        }
+        let entry = browser.entries[browser.selected_index].clone();
+        let current_path = browser.current_path.clone();
+        let app_state::BrowserState {
+            browser_mode: ref mode,
+            ..
+        } = *browser;
+        let container_cwd = match mode {
+            core::BrowserMode::Container { cwd, .. } => Some(cwd.clone()),
+            _ => None,
+        };
+        (entry, current_path, container_cwd)
+    };
+
+    app.store_selection_memory_for(source);
+    app.push_history(target);
+
+    match selected_entry.location.clone() {
+        core::EntryLocation::Fs(path) => {
+            if selected_entry.is_dir {
+                let prefer_name = if selected_entry.name == ".." {
+                    current_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+                load_fs_directory_async(app, path.clone(), target, prefer_name);
+
+                if selected_entry.name != ".."
+                    && let Some(name) = app.fs_last_selected_name.get(&path).cloned()
+                {
+                    app.select_entry_by_name(target, &name);
+                }
+            } else if let Some(kind) = core::container_kind_from_path(&path) {
+                load_container_directory_async(
+                    app,
+                    kind,
+                    path.clone(),
+                    "".to_string(),
+                    target,
+                    None,
+                    ContainerLoadMode::UseCache,
+                );
+            }
+        }
+        core::EntryLocation::Container {
+            kind,
+            archive_path,
+            inner_path,
+        } => {
+            if selected_entry.is_dir {
+                let prefer_name = if selected_entry.name == ".." {
+                    container_cwd.as_ref().and_then(|cwd| {
+                        cwd.trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .map(|s| s.to_string())
+                    })
+                } else {
+                    None
+                };
+                load_container_directory_async(
+                    app,
+                    kind,
+                    archive_path.clone(),
+                    inner_path.clone(),
+                    target,
+                    prefer_name,
+                    ContainerLoadMode::UseCache,
+                );
+
+                if selected_entry.name != ".."
+                    && let Some(name) = app
+                        .container_last_selected_name
+                        .get(&(archive_path.clone(), inner_path.clone(), kind))
+                        .cloned()
+                {
+                    app.select_entry_by_name(target, &name);
+                }
+            }
+        }
+    }
+
+    while let Ok((path, size)) = app.dir_size_rx.try_recv() {
+        app.dir_size_pending.remove(&path);
+        app.dir_sizes.insert(path.clone(), size);
+        for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
+            let panel = app.panel_mut(side);
+            let browser = &mut panel.browser;
+            for entry in &mut browser.entries {
+                if entry.is_dir
+                    && let core::EntryLocation::Fs(p) = &entry.location
+                    && *p == path
+                {
+                    entry.size = Some(size);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn handle_keyboard(
+    ctx: &egui::Context,
+    input: &egui::InputState,
+    app: &mut app_state::AppState,
+    cache: &mut UiCache,
+) {
+    let io_tx = app.io_tx.clone();
+    let f1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1));
+    if f1 {
+        app.toggle_help();
+        ctx.request_repaint();
+        return;
+    }
+    if app.io_in_flight > 0 && input.key_pressed(egui::Key::Escape) {
+        app.request_io_cancel();
+        ctx.request_repaint();
+        return;
+    }
+    if app.props_dialog.is_some() {
+        if input.key_pressed(egui::Key::Escape) {
+            app.props_dialog = None;
+            ctx.request_repaint();
+        }
+        return;
+    }
+    if app.help_panel_side().is_some() {
+        if input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::Enter) {
+            app.toggle_help();
+            ctx.request_repaint();
+        }
+        return;
+    }
+    if app.pending_op.is_some() {
+        if input.key_pressed(egui::Key::Enter) {
+            confirm_pending_op(app);
+        }
+        if input.key_pressed(egui::Key::Escape) {
+            app.clear_pending_op();
+        }
+        ctx.request_repaint();
+        return;
+    }
+    if handle_inline_rename(app, input) {
+        ctx.request_repaint();
+        return;
+    }
+    if let app_state::PanelMode::Edit(ref mut edit) = app.panel_mut(app.active_panel).mode {
+        let enter = input.key_pressed(egui::Key::Enter);
+        let escape = input.key_pressed(egui::Key::Escape);
+        let ctrl_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
+        let mut refresh_after = false;
+        let mut save_payload: Option<(PathBuf, Vec<u8>)> = None;
+        let mut close_editor = false;
+        if edit.confirm_discard {
+            if enter {
+                close_editor = true;
+            } else if escape {
+                edit.confirm_discard = false;
+            }
+            ctx.request_repaint();
+            if close_editor {
+                let return_focus = edit.return_focus;
+                let panel = app.panel_mut(app.active_panel);
+                panel.mode = app_state::PanelMode::Browser;
+                app.active_panel = return_focus;
+            }
+            return;
+        }
+        if !input.events.is_empty() {
+            ctx.request_repaint();
+        }
+        if ctrl_s {
+            if let Some(path) = edit.path.clone() {
+                save_payload = Some((path, edit.text.as_bytes().to_vec()));
+                edit.dirty = false;
+                edit.confirm_discard = false;
+                refresh_after = true;
+                close_editor = true;
+            }
+            ctx.request_repaint();
+            if let Some((path, contents)) = save_payload {
+                let _ = io_tx.send(core::IOTask::WriteFile { path, contents });
+            }
+            if close_editor {
+                let return_focus = edit.return_focus;
+                let panel = app.panel_mut(app.active_panel);
+                panel.mode = app_state::PanelMode::Browser;
+                app.active_panel = return_focus;
+            }
+            if refresh_after {
+                refresh_active_panel(app);
+            }
+            return;
+        }
+        if escape {
+            if edit.dirty {
+                edit.confirm_discard = true;
+            } else {
+                close_editor = true;
+            }
+            ctx.request_repaint();
+            if close_editor {
+                let return_focus = edit.return_focus;
+                let panel = app.panel_mut(app.active_panel);
+                panel.mode = app_state::PanelMode::Browser;
+                app.active_panel = return_focus;
+            }
+            return;
+        }
+        return;
+    }
+    if app.search_ui == app_state::SearchUiState::Open {
+        if input.key_pressed(egui::Key::Escape) {
+            cancel_search(app);
+            app.search_ui = app_state::SearchUiState::Closed;
+            ctx.request_repaint();
+            return;
+        }
+        let ctrl_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
+        if ctrl_enter {
+            start_search(app);
+            ctx.request_repaint();
+        }
+    }
+    let alt_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter));
+    if alt_enter {
+        open_props_dialog(app);
+        ctx.request_repaint();
+        return;
+    }
+    let shift_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
+    if shift_enter {
+        open_selected_external(app);
+        ctx.request_repaint();
+        return;
+    }
+    if input.key_pressed(egui::Key::Escape) {
+        let panel = app.get_active_panel();
+        let browser = &panel.browser;
+        if matches!(browser.browser_mode, core::BrowserMode::Search { .. }) {
+            cancel_search(app);
+            if let Some(snapshot) = app.pop_history_back(app.active_panel) {
+                apply_panel_snapshot(app, app.active_panel, snapshot);
+            }
+            ctx.request_repaint();
+            return;
+        }
+    }
+    let window_rows = active_window_rows(app, cache);
+    let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+    let ctrl_tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
+    if tab_pressed || ctrl_tab_pressed {
+        if app.props_dialog.is_none() {
+            app.switch_panel();
+        }
+        ctx.request_repaint();
+    }
+    let ctrl_pgup = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
+    let backspace = input.key_pressed(egui::Key::Backspace);
+    let typing_in_ui = ctx.wants_keyboard_input();
+    if (ctrl_pgup || backspace)
+        && !(app.search_ui == app_state::SearchUiState::Open && typing_in_ui)
+    {
+        open_parent(app, window_rows);
+    }
+    let ctrl_pgdn = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
+    if ctrl_pgdn {
+        open_selected(app);
+    }
+    let ctrl_r = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R));
+    if ctrl_r {
+        refresh_active_panel(app);
+    }
+    let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+    if space {
+        let target_path = {
+            let panel = app.get_active_panel();
+            let browser = &panel.browser;
+            browser
+                .entries
+                .get(browser.selected_index)
+                .and_then(|entry| {
+                    if entry.is_dir
+                        && let core::EntryLocation::Fs(path) = &entry.location
+                    {
+                        return Some(path.clone());
+                    }
+                    None
+                })
+        };
+        if let Some(path) = target_path
+            && !app.dir_size_pending.contains(&path)
+        {
+            app.dir_size_pending.insert(path.clone());
+            let _ = app.dir_size_tx.send(path);
+        }
+    }
+    let ctrl_left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
+    if ctrl_left && app.active_panel == core::ActivePanel::Right {
+        open_selected_from_to(app, core::ActivePanel::Right, core::ActivePanel::Left);
+    }
+    let ctrl_right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
+    if ctrl_right && app.active_panel == core::ActivePanel::Left {
+        open_selected_from_to(app, core::ActivePanel::Left, core::ActivePanel::Right);
+    }
+    let alt_left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft));
+    if alt_left && let Some(snapshot) = app.pop_history_back(app.active_panel) {
+        apply_panel_snapshot(app, app.active_panel, snapshot);
+    }
+    let alt_right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight));
+    if alt_right && let Some(snapshot) = app.pop_history_forward(app.active_panel) {
+        apply_panel_snapshot(app, app.active_panel, snapshot);
+    }
+    let alt_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F7));
+    if alt_f7 {
+        open_search(app, core::SearchMode::Name);
+    }
+    let shift_alt_f7 = ctx
+        .input_mut(|i| i.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::F7));
+    if shift_alt_f7 {
+        open_search(app, core::SearchMode::Content);
+    }
+    if input.key_pressed(egui::Key::Enter) {
+        if app.search_ui == app_state::SearchUiState::Open {
+            if matches!(
+                app.get_active_panel().browser.browser_mode,
+                core::BrowserMode::Search { .. }
+            ) {
+                // Open selected result.
+            } else {
+                start_search(app);
+            }
+        }
+        if matches!(
+            app.get_active_panel().browser.browser_mode,
+            core::BrowserMode::Search { .. }
+        ) {
+            app.push_history(app.active_panel);
+            let panel = app.get_active_panel();
+            let browser = &panel.browser;
+            let entry = browser.entries.get(browser.selected_index).cloned();
+            if let Some(entry) = entry
+                && let core::EntryLocation::Fs(path) = entry.location
+            {
+                if entry.is_dir {
+                    load_fs_directory_async(app, path, app.active_panel, None);
+                } else if let Some(parent) = path.parent() {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string());
+                    load_fs_directory_async(app, parent.to_path_buf(), app.active_panel, name);
+                }
+            }
+            app.search_ui = app_state::SearchUiState::Closed;
+        } else if app.theme_picker_open {
+            app.apply_selected_theme();
+        } else {
+            open_selected(app);
+        }
+    }
+    if let app_state::PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode {
+        let line = preview.line_height.max(16.0);
+        let page = preview.page_height.max(200.0);
+        let mut consumed = false;
+        let can_scroll = preview.can_scroll;
+        if can_scroll && input.key_pressed(egui::Key::ArrowDown) {
+            preview.scroll += line;
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::ArrowUp) {
+            preview.scroll = (preview.scroll - line).max(0.0);
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::PageDown) {
+            preview.scroll += page;
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::PageUp) {
+            preview.scroll = (preview.scroll - page).max(0.0);
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::Home) {
+            preview.scroll = 0.0;
+            consumed = true;
+        }
+        if can_scroll && input.key_pressed(egui::Key::End) {
+            preview.scroll += page * 10.0;
+            consumed = true;
+        }
+        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        if enter && preview.find_open {
+            preview_find_next(app);
+            consumed = true;
+        }
+        if consumed {
+            ctx.request_repaint();
+            return;
+        }
+    }
+    let ctrl_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F));
+    if ctrl_f {
+        if let app_state::PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode
+        {
+            preview.find_open = true;
+            preview.find_focus = true;
+        }
+        ctx.request_repaint();
+    }
+    let app_state::PanelState {
+        mode: active_mode, ..
+    } = app.panel(app.active_panel);
+    let active_is_browser = matches!(active_mode, app_state::PanelMode::Browser);
+    if input.key_pressed(egui::Key::ArrowDown) && active_is_browser {
+        if app.theme_picker_open {
+            app.select_next_theme();
+        } else {
+            let browser = &app.get_active_panel().browser;
+            if browser.selected_index + 1 < browser.entries.len() {
+                app.select_entry(browser.selected_index + 1, window_rows);
+            }
+        }
+    }
+    if input.key_pressed(egui::Key::ArrowUp) && active_is_browser {
+        if app.theme_picker_open {
+            app.select_prev_theme();
+        } else {
+            let browser = &app.get_active_panel().browser;
+            if browser.selected_index > 0 {
+                app.select_entry(browser.selected_index - 1, window_rows);
+            }
+        }
+    }
+    if input.key_pressed(egui::Key::PageUp) && active_is_browser {
+        let browser = &app.get_active_panel().browser;
+        let new_index = browser.selected_index.saturating_sub(window_rows);
+        app.select_entry(new_index, window_rows);
+    }
+    if input.key_pressed(egui::Key::PageDown) && active_is_browser {
+        let browser = &app.get_active_panel().browser;
+        let len = browser.entries.len();
+        let mut new_index = browser.selected_index.saturating_add(window_rows);
+        if len > 0 && new_index >= len {
+            new_index = len - 1;
+        }
+        app.select_entry(new_index, window_rows);
+    }
+    if input.key_pressed(egui::Key::Home) && active_is_browser {
+        app.select_entry(0, window_rows);
+    }
+    if input.key_pressed(egui::Key::End) && active_is_browser {
+        let browser = &app.get_active_panel().browser;
+        if !browser.entries.is_empty() {
+            app.select_entry(browser.entries.len() - 1, window_rows);
+        }
+    }
+    if input.key_pressed(egui::Key::F3) {
+        app.toggle_preview();
+    }
+    if input.key_pressed(egui::Key::Escape) {
+        if app.theme_picker_open {
+            app.close_theme_picker();
+        } else {
+            app.clear_preview();
+        }
+    }
+    let other_panel_preview = app
+        .preview_panel_side()
+        .is_some_and(|side| side != app.active_panel);
+    if input.key_pressed(egui::Key::F5) && !other_panel_preview {
+        app.prepare_copy_selected();
+    }
+    if input.key_pressed(egui::Key::F6) && !other_panel_preview {
+        app.prepare_move_selected();
+    }
+    if input.key_pressed(egui::Key::F4) {
+        app.prepare_edit_selected();
+        ctx.request_repaint();
+    }
+    let shift_f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4));
+    if shift_f4 {
+        app.start_inline_new_file();
+        ctx.request_repaint();
+    }
+    let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
+    if shift_f6 {
+        app.prepare_rename_selected();
+    }
+    if input.key_pressed(egui::Key::F9) {
+        app.switch_theme();
+    }
+    if input.key_pressed(egui::Key::F10) {
+        app.open_theme_picker();
+    }
+    if input.key_pressed(egui::Key::F8) {
+        app.prepare_delete_selected();
+    }
+}
+
+fn open_parent(app: &mut app_state::AppState, window_rows: usize) {
+    let panel = app.get_active_panel();
+    let browser = &panel.browser;
+    let parent_index = browser.entries.iter().position(|e| e.name == "..");
+    let Some(idx) = parent_index else { return };
+    if browser.selected_index != idx {
+        app.select_entry(idx, window_rows);
+    }
+    open_selected(app);
+}
+
+pub(crate) fn confirm_pending_op(app: &mut app_state::AppState) {
+    if let Some(op) = app.take_pending_op() {
+        if let app_state::PendingOp::Delete { target } = &op {
+            let panel = app.get_active_panel();
+            let browser = &panel.browser;
+            let mut next_name: Option<String> = None;
+            if !browser.entries.is_empty() {
+                let mut next_idx = browser.selected_index.saturating_add(1);
+                while next_idx < browser.entries.len() {
+                    let candidate = &browser.entries[next_idx].name;
+                    if candidate != ".." {
+                        next_name = Some(candidate.clone());
+                        break;
+                    }
+                    next_idx += 1;
+                }
+                if next_name.is_none() {
+                    let mut prev_idx = browser.selected_index.saturating_sub(1);
+                    while prev_idx < browser.entries.len() {
+                        let candidate = &browser.entries[prev_idx].name;
+                        if candidate != ".." {
+                            next_name = Some(candidate.clone());
+                            break;
+                        }
+                        if prev_idx == 0 {
+                            break;
+                        }
+                        prev_idx -= 1;
+                    }
+                }
+            }
+            let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+            if let Some(next_name) = next_name {
+                app.fs_last_selected_name
+                    .insert(parent.to_path_buf(), next_name);
+            } else {
+                app.fs_last_selected_name.remove(parent);
+            }
+        }
+        if let app_state::PendingOp::Rename { src } = &op {
+            let name = app.rename_input.clone().unwrap_or_default();
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\\')
+            {
+                app.clear_pending_op();
+                return;
+            }
+            if let Some(current) = src.file_name().and_then(|n| n.to_str())
+                && current == name
+            {
+                app.clear_pending_op();
+                return;
+            }
+            app.store_selection_memory_for(app.active_panel);
+            app.fs_last_selected_name.insert(
+                src.parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf(),
+                name,
+            );
+        }
+        app.enqueue_pending_op(&op);
+        match op {
+            app_state::PendingOp::Copy { .. }
+            | app_state::PendingOp::Move { .. }
+            | app_state::PendingOp::Rename { .. } => refresh_fs_panels(app),
+            app_state::PendingOp::Delete { .. } => refresh_active_panel(app),
+        }
+    }
+}
+
+fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState) -> bool {
+    let enter = input.key_pressed(egui::Key::Enter);
+    let escape = input.key_pressed(egui::Key::Escape);
+    let (action, next_selection, handled) = {
+        let panel = app.get_active_panel_mut();
+        let browser = &mut panel.browser;
+        let Some(_rename) = browser.inline_rename.as_ref() else {
+            return false;
+        };
+        if !enter && !escape {
+            return true;
+        }
+        let rename = browser.inline_rename.take().unwrap();
+        if escape {
+            if rename.new_file && rename.index < browser.entries.len() {
+                browser.entries.remove(rename.index);
+                if browser.selected_index >= browser.entries.len() && !browser.entries.is_empty() {
+                    browser.selected_index = browser.entries.len() - 1;
+                }
+            }
+            return true;
+        }
+        let new_name = rename.text.trim();
+        if new_name.is_empty()
+            || new_name == "."
+            || new_name == ".."
+            || new_name.contains('/')
+            || new_name.contains('\\')
+        {
+            return true;
+        }
+        let mut action: Option<fileman::core::IOTask> = None;
+        let mut next_selection: Option<(PathBuf, String)> = None;
+        if rename.new_file {
+            let dir = browser.current_path.clone();
+            let path = dir.join(new_name);
+            action = Some(fileman::core::IOTask::WriteFile {
+                path,
+                contents: Vec::new(),
+            });
+            next_selection = Some((dir, new_name.to_string()));
+        } else if rename.index < browser.entries.len() {
+            let entry = &browser.entries[rename.index];
+            if let core::EntryLocation::Fs(path) = &entry.location {
+                let current = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if current != new_name {
+                    action = Some(fileman::core::IOTask::Rename {
+                        src: path.clone(),
+                        new_name: new_name.to_string(),
+                    });
+                    next_selection = Some((
+                        path.parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf(),
+                        new_name.to_string(),
+                    ));
+                }
+            }
+        }
+        (action, next_selection, true)
+    };
+    if !handled {
+        return false;
+    }
+    if let Some(task) = action {
+        let _ = app.io_tx.send(task);
+        app.io_in_flight = app.io_in_flight.saturating_add(1);
+        if let Some((dir, name)) = next_selection {
+            app.fs_last_selected_name.insert(dir, name);
+        }
+        refresh_active_panel(app);
+    }
+    true
+}
