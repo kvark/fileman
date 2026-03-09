@@ -7,6 +7,8 @@ use std::{
 
 use crate::core::{DirEntry, EntryLocation, format_mode, format_size};
 
+const ARCHIVE_READ_BUFFER: usize = 1024 * 1024;
+
 pub trait ContainerPlugin: Sync {
     fn kind(&self) -> ContainerKind;
     fn scheme(&self) -> &'static str;
@@ -139,7 +141,7 @@ fn copy_zip_entry(
     display_name: &str,
 ) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let mut zip = zip::ZipArchive::new(reader).map_err(io::Error::other)?;
     let normalized = inner_path.trim_start_matches('/');
     for i in 0..zip.len() {
@@ -166,7 +168,7 @@ fn copy_zip_entry(
 
 fn copy_zip_dir(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let mut zip = zip::ZipArchive::new(reader).map_err(io::Error::other)?;
     let normalized = inner_path.trim_start_matches('/');
     let prefix = if normalized.is_empty() {
@@ -206,7 +208,7 @@ fn copy_tar_entry_gz(
     display_name: &str,
 ) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let decoder = flate2::read::GzDecoder::new(reader);
     copy_tar_entry(decoder, inner_path, dst_dir, display_name)
 }
@@ -218,7 +220,7 @@ fn copy_tar_entry_plain(
     display_name: &str,
 ) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     copy_tar_entry(reader, inner_path, dst_dir, display_name)
 }
 
@@ -229,7 +231,7 @@ fn copy_tar_entry_bz2(
     display_name: &str,
 ) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let decoder = bzip2::read::BzDecoder::new(reader);
     copy_tar_entry(decoder, inner_path, dst_dir, display_name)
 }
@@ -268,20 +270,20 @@ fn copy_tar_entry<R: Read>(
 
 fn copy_tar_dir_gz(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let decoder = flate2::read::GzDecoder::new(reader);
     copy_tar_dir(decoder, inner_path, dst_root)
 }
 
 fn copy_tar_dir_plain(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     copy_tar_dir(reader, inner_path, dst_root)
 }
 
 fn copy_tar_dir_bz2(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let decoder = bzip2::read::BzDecoder::new(reader);
     copy_tar_dir(decoder, inner_path, dst_root)
 }
@@ -321,7 +323,7 @@ fn copy_tar_dir<R: Read>(reader: R, inner_path: &str, dst_root: &Path) -> io::Re
 
 fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let mut zip = zip::ZipArchive::new(reader)?;
     let mut dirs: Vec<String> = Vec::new();
     let mut seen_dirs: HashSet<String> = HashSet::new();
@@ -499,7 +501,7 @@ fn read_zip_bytes_prefix(
     max_bytes: usize,
 ) -> anyhow::Result<Vec<u8>> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let mut zip = zip::ZipArchive::new(reader)?;
     let normalized = inner_path.trim_start_matches('/');
     let mut data = Vec::new();
@@ -525,7 +527,7 @@ fn read_zip_bytes_prefix(
 
 fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let mut archive = tar::Archive::new(reader);
     let mut dirs: Vec<String> = Vec::new();
     let mut seen_dirs: HashSet<String> = HashSet::new();
@@ -637,7 +639,7 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
 
 fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let decoder = flate2::read::GzDecoder::new(reader);
     let mut archive = tar::Archive::new(decoder);
     let mut dirs: Vec<String> = Vec::new();
@@ -754,7 +756,7 @@ fn read_tar_bytes_prefix(
     max_bytes: usize,
 ) -> anyhow::Result<Vec<u8>> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let mut archive = tar::Archive::new(reader);
     let normalized = inner_path.trim_start_matches('/');
     for entry in archive.entries()? {
@@ -782,7 +784,7 @@ fn read_tar_gz_bytes_prefix(
     max_bytes: usize,
 ) -> anyhow::Result<Vec<u8>> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let decoder = flate2::read::GzDecoder::new(reader);
     let mut archive = tar::Archive::new(decoder);
     let normalized = inner_path.trim_start_matches('/');
@@ -819,7 +821,7 @@ fn read_tar_bz2_directory_with_progress(
     progress: &mut dyn FnMut(usize),
 ) -> anyhow::Result<Vec<DirEntry>> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let decoder = bzip2::read::BzDecoder::new(reader);
     let mut archive = tar::Archive::new(decoder);
     let mut dirs: Vec<String> = Vec::new();
@@ -954,7 +956,7 @@ fn read_tar_bz2_bytes_prefix(
     max_bytes: usize,
 ) -> anyhow::Result<Vec<u8>> {
     let file = fs::File::open(archive_path)?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
     let decoder = bzip2::read::BzDecoder::new(reader);
     let mut archive = tar::Archive::new(decoder);
     let normalized = inner_path.trim_start_matches('/');
@@ -1108,7 +1110,7 @@ impl ContainerPlugin for TarPlugin {
         inner_path: &str,
     ) -> anyhow::Result<Option<(u64, Option<u32>)>> {
         let file = fs::File::open(archive_path)?;
-        let reader = std::io::BufReader::new(file);
+        let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
         let mut archive = tar::Archive::new(reader);
         let normalized = inner_path.trim_start_matches('/');
         for entry in archive.entries()? {
@@ -1162,7 +1164,7 @@ impl ContainerPlugin for TarGzPlugin {
         inner_path: &str,
     ) -> anyhow::Result<Option<(u64, Option<u32>)>> {
         let file = fs::File::open(archive_path)?;
-        let reader = std::io::BufReader::new(file);
+        let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
         let decoder = flate2::read::GzDecoder::new(reader);
         let mut archive = tar::Archive::new(decoder);
         let normalized = inner_path.trim_start_matches('/');
@@ -1217,7 +1219,7 @@ impl ContainerPlugin for TarBz2Plugin {
         inner_path: &str,
     ) -> anyhow::Result<Option<(u64, Option<u32>)>> {
         let file = fs::File::open(archive_path)?;
-        let reader = std::io::BufReader::new(file);
+        let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
         let decoder = bzip2::read::BzDecoder::new(reader);
         let mut archive = tar::Archive::new(decoder);
         let normalized = inner_path.trim_start_matches('/');

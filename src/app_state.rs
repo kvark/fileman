@@ -59,6 +59,7 @@ pub struct BrowserState {
     pub top_index: usize,
     pub loading: bool,
     pub loading_progress: Option<(usize, Option<usize>)>,
+    pub container_root: Option<String>,
     pub dir_token: u64,
     pub history_back: Vec<PanelSnapshot>,
     pub history_forward: Vec<PanelSnapshot>,
@@ -81,6 +82,7 @@ pub struct ContainerDirCache {
     pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
     pub selected_index: usize,
     pub top_index: usize,
+    pub root: Option<String>,
 }
 
 pub struct PreviewState {
@@ -134,8 +136,9 @@ fn history_key(snapshot: &PanelSnapshot) -> String {
             kind,
             ref archive_path,
             ref cwd,
+            ref root,
         } => format!(
-            "container:{}:{}:{}",
+            "container:{}:{}:{}:{}",
             match kind {
                 ContainerKind::Zip => "zip",
                 ContainerKind::Tar => "tar",
@@ -143,7 +146,8 @@ fn history_key(snapshot: &PanelSnapshot) -> String {
                 ContainerKind::TarBz2 => "tar.bz2",
             },
             archive_path.to_string_lossy(),
-            cwd
+            cwd,
+            root.as_deref().unwrap_or_default()
         ),
         BrowserMode::Search {
             ref root,
@@ -417,6 +421,7 @@ impl AppState {
                     ref archive_path,
                     ref cwd,
                     kind,
+                    root: _,
                 } => (
                     None,
                     Some((archive_path.clone(), cwd.clone(), kind)),
@@ -443,6 +448,7 @@ impl AppState {
                 ref archive_path,
                 ref cwd,
                 kind,
+                root: _,
             } = browser.browser_mode
             else {
                 return;
@@ -455,6 +461,7 @@ impl AppState {
                 entries_rx: browser.entries_rx.take(),
                 selected_index: browser.selected_index,
                 top_index: browser.top_index,
+                root: browser.container_root.clone(),
             };
             (key, cache)
         };
