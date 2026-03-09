@@ -87,6 +87,7 @@ fn open_selected_from_to(
         };
         (entry, current_path, container_cwd)
     };
+    let container_root = app.panel(source).browser.container_root.clone();
 
     app.store_selection_memory_for(source);
     app.push_history(target);
@@ -114,6 +115,7 @@ fn open_selected_from_to(
                     kind,
                     path.clone(),
                     "".to_string(),
+                    None,
                     target,
                     None,
                     ContainerLoadMode::UseCache,
@@ -141,6 +143,7 @@ fn open_selected_from_to(
                     kind,
                     archive_path.clone(),
                     inner_path.clone(),
+                    container_root.clone(),
                     target,
                     prefer_name,
                     ContainerLoadMode::UseCache,

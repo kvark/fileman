@@ -30,7 +30,7 @@ pub fn draw_panel(
         header_text,
         mut selected_label,
         mut loading,
-        mut loading_progress,
+        _loading_progress,
         top_index,
     ) = {
         let panel = app.panel(panel_side);
@@ -114,11 +114,14 @@ pub fn draw_panel(
                                         egui::Vec2::new(left_width, ui.available_height()),
                                         egui::Sense::hover(),
                                     );
-                                    let header_display = if is_active {
+                                    let mut header_display = if is_active {
                                         format!("● {header_text}")
                                     } else {
                                         header_text.clone()
                                     };
+                                    if loading {
+                                        header_display = format!("⟳ {header_display}");
+                                    }
                                     let header_font = egui::TextStyle::Body.resolve(ui.style());
                                     ui.painter().with_clip_rect(left_rect).text(
                                         left_rect.left_center(),
@@ -209,34 +212,6 @@ pub fn draw_panel(
                         .map(|e| e.name.clone())
                         .unwrap_or_else(|| "-".to_string());
                     loading = browser.loading;
-                    loading_progress = browser.loading_progress;
-                }
-
-                if loading {
-                    let progress = loading_progress.unwrap_or((0, None));
-                    let ratio = match progress.1 {
-                        Some(total) if total > 0 => progress.0 as f32 / total as f32,
-                        _ => 0.0,
-                    };
-                    ui.add_space(4.0);
-                    let loading_label = matches!(
-                        app.panel(panel_side).browser.browser_mode,
-                        core::BrowserMode::Search { .. }
-                    );
-                    let prefix = if loading_label {
-                        "Searching…"
-                    } else {
-                        "Loading…"
-                    };
-                    let label = match progress.1 {
-                        Some(total) => format!("{prefix} {}/{}", progress.0, total),
-                        None => format!("{prefix} {}", progress.0),
-                    };
-                    let mut bar = egui::ProgressBar::new(ratio).text(label);
-                    if progress.1.is_some() {
-                        bar = bar.show_percentage();
-                    }
-                    ui.add(bar);
                 }
 
                 let list_height = (ui.available_height() - footer_height - spacing).max(0.0);
@@ -250,10 +225,8 @@ pub fn draw_panel(
                         (row_height * entries_len as f32 - ui.spacing().item_spacing.y).max(0.0);
                     let ensure_visible = selected_index < top_index
                         || selected_index >= top_index.saturating_add(rows);
-                    let mut target = if ensure_visible {
-                        top_index as f32 * row_height
-                    } else if scroll_mode == ScrollMode::ForceActive {
-                        let center_offset = (list_height - row_height) * 0.5;
+                    let center_offset = (list_height - row_height) * 0.5;
+                    let mut target = if ensure_visible || scroll_mode == ScrollMode::ForceActive {
                         selected_index as f32 * row_height - center_offset
                     } else {
                         0.0

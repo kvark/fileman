@@ -16,6 +16,7 @@ use crate::snapshot_render::render_snapshot;
 use crate::{
     HighlightRequest, HighlightResult, ImageCache, ImageRequest, SNAPSHOT_HEIGHT, SNAPSHOT_WIDTH,
     ScrollMode, UiCache, UiRender, draw_root_ui, load_fs_directory_async, pump_async,
+    refresh_fs_panels,
 };
 
 fn parse_modifiers(raw: &[String]) -> egui::Modifiers {
@@ -172,9 +173,22 @@ fn is_app_pending(app: &app_state::AppState) -> bool {
         || !app.dir_size_pending.is_empty()
 }
 
+fn pump_io(app: &mut app_state::AppState) -> bool {
+    let mut completed = 0usize;
+    while app.io_rx.try_recv().is_ok() {
+        completed += 1;
+    }
+    if completed > 0 {
+        app.on_io_completed(completed);
+        refresh_fs_panels(app);
+        return true;
+    }
+    false
+}
+
 fn drain_async(app: &mut app_state::AppState, max_iters: usize) {
     for _ in 0..max_iters {
-        let changed = pump_async(app);
+        let changed = pump_async(app) || pump_io(app);
         let pending = is_app_pending(app);
         if !changed && !pending {
             break;
@@ -190,7 +204,7 @@ fn wait_for_idle(
     max_iters: usize,
 ) {
     for _ in 0..max_iters {
-        let changed = pump_async(app);
+        let changed = pump_async(app) || pump_io(app);
         headless.run_frame(app, ui_cache, Vec::new());
         if !changed && !is_app_pending(app) && headless.highlight_pending.is_empty() {
             break;
@@ -207,7 +221,7 @@ fn wait_for_duration(
 ) {
     let start = std::time::Instant::now();
     while start.elapsed() < duration {
-        let _ = pump_async(app);
+        let _ = pump_async(app) || pump_io(app);
         headless.run_frame(app, ui_cache, Vec::new());
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
@@ -254,6 +268,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 top_index: 0,
                 loading: false,
                 loading_progress: None,
+                container_root: None,
                 dir_token: 0,
                 history_back: Vec::new(),
                 history_forward: Vec::new(),
@@ -274,6 +289,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 top_index: 0,
                 loading: false,
                 loading_progress: None,
+                container_root: None,
                 dir_token: 0,
                 history_back: Vec::new(),
                 history_forward: Vec::new(),

@@ -52,6 +52,7 @@ pub struct DirEntry {
 pub enum DirBatch {
     Append(Vec<DirEntry>),
     Replace(Vec<DirEntry>),
+    ContainerRoot(Option<String>),
     Loading,
     Progress { loaded: usize, total: Option<usize> },
     Error(String),
@@ -70,6 +71,7 @@ pub enum BrowserMode {
         kind: ContainerKind,
         archive_path: path::PathBuf,
         cwd: String,
+        root: Option<String>,
     },
     Search {
         root: path::PathBuf,
