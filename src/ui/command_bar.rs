@@ -20,6 +20,7 @@ pub fn draw_command_bar(
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        draw_refresh_indicator(ui, app, colors);
                         draw_key_cap(ui, "F1", "Help", colors);
                         let (mut f3, f4, mut f5, mut f6, f7, f8) = if modifiers.alt {
                             ("", "", "Pack", "Unpack", "Search", "Command")
@@ -51,6 +52,24 @@ pub fn draw_command_bar(
                     });
                 });
         });
+}
+
+fn draw_refresh_indicator(
+    ui: &mut egui::Ui,
+    app: &app_state::AppState,
+    colors: &theme::ThemeColors,
+) {
+    let frames = ["|", "/", "-", "\\"];
+    let symbol = frames[(app.refresh_tick as usize) % frames.len()];
+    let text = egui::RichText::new(symbol).color(color32(colors.footer_fg));
+    egui::Frame::NONE
+        .fill(color32(colors.preview_header_bg))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(text);
+        });
+    ui.add_space(10.0);
 }
 
 fn draw_key_cap(ui: &mut egui::Ui, key: &str, label: &str, colors: &theme::ThemeColors) {

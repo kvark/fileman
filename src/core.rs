@@ -84,6 +84,8 @@ pub enum BrowserMode {
 pub enum PreviewContent {
     Text(String),
     Binary(Vec<u8>),
+    TextChunk { text: String, done: bool },
+    BinaryChunk { data: Vec<u8>, done: bool },
     Image(ImageLocation),
 }
 
@@ -101,7 +103,7 @@ pub enum PreviewRequest {
     Read {
         id: u64,
         location: EntryLocation,
-        max_bytes: usize,
+        max_bytes: Option<usize>,
     },
     ListContainer {
         id: u64,

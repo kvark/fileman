@@ -670,7 +670,28 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         && let Some(preview) = app.preview_panel_mut()
         && id == preview.request_id
     {
-        preview.content = Some(content);
+        match content {
+            core::PreviewContent::TextChunk { text, .. } => match preview.content {
+                Some(core::PreviewContent::Text(ref mut existing)) => {
+                    existing.push_str(&text);
+                }
+                _ => preview.content = Some(core::PreviewContent::Text(text)),
+            },
+            core::PreviewContent::BinaryChunk { data, .. } => match preview.content {
+                Some(core::PreviewContent::Binary(ref mut existing)) => {
+                    existing.extend_from_slice(&data);
+                }
+                _ => preview.content = Some(core::PreviewContent::Binary(data)),
+            },
+            other => preview.content = Some(other),
+        }
+        preview.loading_since = None;
+        changed = true;
+    }
+    if let Some(preview) = app.preview_panel()
+        && let Some(started) = preview.loading_since
+        && started.elapsed() > std::time::Duration::from_millis(300)
+    {
         changed = true;
     }
 
@@ -1096,7 +1117,7 @@ fn load_container_directory_async(
                 const DECIDE_LIMIT: usize = 64;
                 let mut decided = false;
                 let mut implicit_root: Option<String> = None;
-                let mut buffered: Vec<String> = Vec::new();
+                let mut buffered: Vec<(String, bool)> = Vec::new();
                 let mut root_candidate: Option<String> = None;
                 let mut seen_root_file = false;
                 let mut seen_other_root = false;
@@ -1124,7 +1145,7 @@ fn load_container_directory_async(
                     loaded: &'a mut usize,
                 }
 
-                fn emit_name(name: &str, ctx: &mut TarEmitContext<'_>) {
+                fn emit_name(name: &str, is_dir_hint: bool, ctx: &mut TarEmitContext<'_>) {
                     let rem = if let Some(prefix) = ctx.implicit_prefix {
                         if !name.starts_with(prefix) {
                             return;
@@ -1140,6 +1161,28 @@ fn load_container_directory_async(
 
                     if let Some(slash) = rem.find('/') {
                         let dir = rem[..slash].to_string();
+                        if ctx.seen_dirs.insert(dir.clone()) {
+                            ctx.pending.push(core::DirEntry {
+                                name: dir.clone(),
+                                is_dir: true,
+                                location: core::EntryLocation::Container {
+                                    kind: ctx.kind,
+                                    archive_path: ctx.archive_path.to_path_buf(),
+                                    inner_path: if let Some(prefix) = ctx.implicit_prefix {
+                                        format!("{}{}", prefix, dir)
+                                    } else if ctx.cwd.is_empty() {
+                                        dir
+                                    } else {
+                                        format!("{}/{}", ctx.cwd.trim_end_matches('/'), dir)
+                                    },
+                                },
+                                size: None,
+                                modified: None,
+                            });
+                            *ctx.loaded += 1;
+                        }
+                    } else if is_dir_hint {
+                        let dir = rem.to_string();
                         if ctx.seen_dirs.insert(dir.clone()) {
                             ctx.pending.push(core::DirEntry {
                                 name: dir.clone(),
@@ -1215,6 +1258,7 @@ fn load_container_directory_async(
                             Ok(entry) => entry,
                             Err(_) => continue,
                         };
+                        let entry_is_dir = entry.is_dir();
                         let name = core::normalize_archive_path(Path::new(entry.name()));
                         if name.is_empty() || !name.starts_with(&prefix) {
                             continue;
@@ -1224,12 +1268,18 @@ fn load_container_directory_async(
                             continue;
                         }
                         if !decided && cwd_clone.is_empty() {
-                            buffered.push(name.clone());
+                            buffered.push((name.clone(), entry_is_dir));
                             if let Some(slash) = rem.find('/') {
                                 let root = rem[..slash].to_string();
                                 match root_candidate.as_ref() {
                                     None => root_candidate = Some(root),
                                     Some(existing) if existing != &root => seen_other_root = true,
+                                    _ => {}
+                                }
+                            } else if entry_is_dir {
+                                match root_candidate.as_ref() {
+                                    None => root_candidate = Some(rem.to_string()),
+                                    Some(existing) if existing != rem => seen_other_root = true,
                                     _ => {}
                                 }
                             } else {
@@ -1245,7 +1295,7 @@ fn load_container_directory_async(
                                 let root_ref = implicit_root
                                     .as_ref()
                                     .map(|root| format!("{}/", root.trim_end_matches('/')));
-                                for buffered_name in buffered.drain(..) {
+                                for (buffered_name, buffered_is_dir) in buffered.drain(..) {
                                     let mut ctx = TarEmitContext {
                                         implicit_prefix: root_ref.as_deref(),
                                         cwd: &cwd_clone,
@@ -1256,7 +1306,7 @@ fn load_container_directory_async(
                                         seen_files: &mut seen_files,
                                         loaded: &mut loaded,
                                     };
-                                    emit_name(&buffered_name, &mut ctx);
+                                    emit_name(&buffered_name, buffered_is_dir, &mut ctx);
                                 }
                             } else {
                                 continue;
@@ -1280,7 +1330,7 @@ fn load_container_directory_async(
                                 seen_files: &mut seen_files,
                                 loaded: &mut loaded,
                             };
-                            emit_name(emit_name_raw, &mut ctx);
+                            emit_name(emit_name_raw, entry_is_dir, &mut ctx);
                         }
 
                         if pending.len() >= BATCH || (!sent_first && !pending.is_empty()) {
@@ -1327,6 +1377,7 @@ fn load_container_directory_async(
                             Ok(path) => path,
                             Err(_) => continue,
                         };
+                        let entry_is_dir = entry.header().entry_type().is_dir();
                         let name = fileman::core::normalize_archive_path(&path);
                         if name.is_empty() || !name.starts_with(&prefix) {
                             continue;
@@ -1336,12 +1387,18 @@ fn load_container_directory_async(
                             continue;
                         }
                         if !decided && cwd_clone.is_empty() {
-                            buffered.push(name.clone());
+                            buffered.push((name.clone(), entry_is_dir));
                             if let Some(slash) = rem.find('/') {
                                 let root = rem[..slash].to_string();
                                 match root_candidate.as_ref() {
                                     None => root_candidate = Some(root),
                                     Some(existing) if existing != &root => seen_other_root = true,
+                                    _ => {}
+                                }
+                            } else if entry_is_dir {
+                                match root_candidate.as_ref() {
+                                    None => root_candidate = Some(rem.to_string()),
+                                    Some(existing) if existing != rem => seen_other_root = true,
                                     _ => {}
                                 }
                             } else {
@@ -1357,7 +1414,7 @@ fn load_container_directory_async(
                                 let root_ref = implicit_root
                                     .as_ref()
                                     .map(|root| format!("{}/", root.trim_end_matches('/')));
-                                for buffered_name in buffered.drain(..) {
+                                for (buffered_name, buffered_is_dir) in buffered.drain(..) {
                                     let mut ctx = TarEmitContext {
                                         implicit_prefix: root_ref.as_deref(),
                                         cwd: &cwd_clone,
@@ -1368,7 +1425,7 @@ fn load_container_directory_async(
                                         seen_files: &mut seen_files,
                                         loaded: &mut loaded,
                                     };
-                                    emit_name(&buffered_name, &mut ctx);
+                                    emit_name(&buffered_name, buffered_is_dir, &mut ctx);
                                 }
                             } else {
                                 continue;
@@ -1392,7 +1449,7 @@ fn load_container_directory_async(
                                 seen_files: &mut seen_files,
                                 loaded: &mut loaded,
                             };
-                            emit_name(emit_name_raw, &mut ctx);
+                            emit_name(emit_name_raw, entry_is_dir, &mut ctx);
                         }
 
                         if pending.len() >= BATCH || (!sent_first && !pending.is_empty()) {
@@ -1417,7 +1474,7 @@ fn load_container_directory_async(
                     let root_ref = implicit_root
                         .as_ref()
                         .map(|root| format!("{}/", root.trim_end_matches('/')));
-                    for buffered_name in buffered.drain(..) {
+                    for (buffered_name, buffered_is_dir) in buffered.drain(..) {
                         let mut ctx = TarEmitContext {
                             implicit_prefix: root_ref.as_deref(),
                             cwd: &cwd_clone,
@@ -1428,7 +1485,7 @@ fn load_container_directory_async(
                             seen_files: &mut seen_files,
                             loaded: &mut loaded,
                         };
-                        emit_name(&buffered_name, &mut ctx);
+                        emit_name(&buffered_name, buffered_is_dir, &mut ctx);
                     }
                 }
 
@@ -2037,7 +2094,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
         let cur_dir = std::env::current_dir().expect("current_dir");
         let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker();
-        let (preview_tx, preview_rx) = workers::start_preview_worker();
+        let (preview_tx, preview_rx) = workers::start_preview_worker(Some(Arc::new({
+            let proxy = self.proxy.clone();
+            move || {
+                let _ = proxy.send_event(UserEvent::Wake);
+            }
+        })));
         let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker();
         let (search_tx, search_rx) = workers::start_search_worker();
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
@@ -2202,6 +2264,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             search_ui: app_state::SearchUiState::Closed,
             search_tx,
             search_rx,
+            refresh_tick: 0,
         };
 
         app.theme
@@ -2351,6 +2414,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         runtime.needs_redraw = true;
                     }
 
+                    runtime.app.refresh_tick = runtime.app.refresh_tick.wrapping_add(1);
                     ui::command_bar::draw_command_bar(
                         ctx,
                         &runtime.app,
@@ -2581,12 +2645,21 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 }
             }
             other => {
+                let is_key_release = matches!(
+                    other,
+                    winit::event::WindowEvent::KeyboardInput { ref event, .. }
+                        if event.state == winit::event::ElementState::Released
+                );
                 let event_response = runtime.egui_state.on_window_event(&runtime.window, &other);
                 if event_response.repaint {
-                    runtime.needs_redraw = true;
+                    if !is_key_release {
+                        runtime.needs_redraw = true;
+                    }
                 }
                 if event_response.consumed {
-                    runtime.window.request_redraw();
+                    if !is_key_release {
+                        runtime.window.request_redraw();
+                    }
                     return;
                 }
 
@@ -2604,9 +2677,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             .reconfigure_surface(&mut runtime.surface, runtime.surface_config);
                         runtime.needs_redraw = true;
                     }
-                    _ => {
-                        runtime.needs_redraw = true;
-                    }
+                    _ => {}
                 }
             }
         }
@@ -2730,6 +2801,7 @@ fn draw_root_ui(render: UiRender<'_>) {
         highlight_pending,
         highlight_req_tx,
     } = render;
+    app.refresh_tick = app.refresh_tick.wrapping_add(1);
     apply_theme(ctx, &app.theme.colors());
     ui::command_bar::draw_command_bar(ctx, app, &app.theme.colors());
     egui::CentralPanel::default().show(ctx, |ui| {

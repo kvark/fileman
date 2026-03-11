@@ -233,7 +233,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         None => std::env::current_dir().expect("current_dir"),
     };
     let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker();
-    let (preview_tx, preview_rx) = workers::start_preview_worker();
+    let (preview_tx, preview_rx) = workers::start_preview_worker(None);
     let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker();
     let (search_tx, search_rx) = workers::start_search_worker();
     let (edit_tx, edit_rx) = mpsc::channel::<core::EditLoadRequest>();
@@ -339,6 +339,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         search_ui: app_state::SearchUiState::Closed,
         search_tx,
         search_rx,
+        refresh_tick: 0,
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));
