@@ -13,8 +13,10 @@ use crate::core::{
     EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
     SearchMode, SearchProgress, SearchRequest, SearchResult, copy_container_dir,
     copy_container_entry, copy_recursively, format_container_listing, is_probably_text,
-    is_text_name, read_bytes_prefix, read_container_bytes_prefix, read_container_directory,
+    is_text_name, is_text_path, read_container_directory,
 };
+
+const PREVIEW_CHUNK_BYTES: usize = 16 * 1024;
 
 pub fn start_io_worker() -> (
     mpsc::Sender<IOTask>,
@@ -166,59 +168,83 @@ fn apply_props_recursive(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io:
     Ok(())
 }
 
-pub fn start_preview_worker() -> (
+pub fn start_preview_worker(
+    wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> (
     mpsc::Sender<PreviewRequest>,
     mpsc::Receiver<(u64, PreviewContent)>,
 ) {
     let (tx, rx) = mpsc::channel::<PreviewRequest>();
     let (result_tx, result_rx) = mpsc::channel::<(u64, PreviewContent)>();
+    let current_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     thread::spawn(move || {
-        while let Ok(mut request) = rx.recv() {
-            while let Ok(next) = rx.try_recv() {
-                request = next;
-            }
+        while let Ok(request) = rx.recv() {
+            current_id.store(
+                preview_request_id(&request),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let current_id = std::sync::Arc::clone(&current_id);
+            let wake = wake.clone();
             match request {
                 PreviewRequest::Read {
                     id,
                     location,
                     max_bytes,
                 } => {
-                    let content = match location {
-                        EntryLocation::Fs(path) => match read_bytes_prefix(&path, max_bytes) {
-                            Ok(bytes) => {
-                                if is_probably_text(&bytes) {
-                                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                                    PreviewContent::Text(text)
-                                } else {
-                                    PreviewContent::Binary(bytes)
+                    let result_tx = result_tx.clone();
+                    thread::spawn(move || match location {
+                        EntryLocation::Fs(path) => {
+                            let force_text = is_text_path(&path);
+                            let file = File::open(&path);
+                            if let Ok(file) = file {
+                                let reader = std::io::BufReader::new(file);
+                                if let Err(err) = send_streaming_preview(
+                                    &result_tx,
+                                    &current_id,
+                                    id,
+                                    reader,
+                                    max_bytes,
+                                    force_text,
+                                    wake.as_ref(),
+                                ) {
+                                    let _ = result_tx.send((
+                                        id,
+                                        PreviewContent::Text(format!("Failed to read file: {err}")),
+                                    ));
                                 }
+                            } else if let Err(err) = file {
+                                let _ = result_tx.send((
+                                    id,
+                                    PreviewContent::Text(format!("Failed to read file: {err}")),
+                                ));
                             }
-                            Err(e) => PreviewContent::Text(format!("Failed to read file: {e}")),
-                        },
+                        }
                         EntryLocation::Container {
                             kind,
                             archive_path,
                             inner_path,
-                        } => match read_container_bytes_prefix(
-                            kind,
-                            &archive_path,
-                            &inner_path,
-                            max_bytes,
-                        ) {
-                            Ok(bytes) => {
-                                if is_text_name(&inner_path) || is_probably_text(&bytes) {
-                                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                                    PreviewContent::Text(text)
-                                } else {
-                                    PreviewContent::Binary(bytes)
-                                }
+                        } => {
+                            let force_text = is_text_name(&inner_path);
+                            if let Err(err) = stream_container_preview(
+                                &result_tx,
+                                &current_id,
+                                id,
+                                kind,
+                                &archive_path,
+                                &inner_path,
+                                max_bytes,
+                                force_text,
+                                wake.as_ref(),
+                            ) {
+                                let _ = result_tx.send((
+                                    id,
+                                    PreviewContent::Text(format!(
+                                        "Failed to read archive entry: {err}"
+                                    )),
+                                ));
                             }
-                            Err(e) => {
-                                PreviewContent::Text(format!("Failed to read zip entry: {e}"))
-                            }
-                        },
-                    };
-                    let _ = result_tx.send((id, content));
+                        }
+                    });
                 }
                 PreviewRequest::ListContainer {
                     id,
@@ -245,6 +271,13 @@ pub fn start_preview_worker() -> (
     (tx, result_rx)
 }
 
+fn preview_request_id(request: &PreviewRequest) -> u64 {
+    match request {
+        PreviewRequest::Read { id, .. } => *id,
+        PreviewRequest::ListContainer { id, .. } => *id,
+    }
+}
+
 pub fn start_dir_size_worker() -> (mpsc::Sender<PathBuf>, mpsc::Receiver<(PathBuf, u64)>) {
     let (tx, rx) = mpsc::channel::<PathBuf>();
     let (result_tx, result_rx) = mpsc::channel::<(PathBuf, u64)>();
@@ -255,6 +288,154 @@ pub fn start_dir_size_worker() -> (mpsc::Sender<PathBuf>, mpsc::Receiver<(PathBu
         }
     });
     (tx, result_rx)
+}
+
+fn is_preview_current(current_id: &std::sync::atomic::AtomicU64, id: u64) -> bool {
+    current_id.load(std::sync::atomic::Ordering::Relaxed) == id
+}
+
+fn send_streaming_preview<R: Read>(
+    tx: &mpsc::Sender<(u64, PreviewContent)>,
+    current_id: &std::sync::atomic::AtomicU64,
+    id: u64,
+    mut reader: R,
+    max_bytes: Option<usize>,
+    force_text: bool,
+    wake: Option<&std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> Result<(), std::io::Error> {
+    let mut remaining = max_bytes.unwrap_or(usize::MAX);
+    let mut buf = vec![0u8; PREVIEW_CHUNK_BYTES];
+    let mut decided = force_text;
+    let mut is_text = force_text;
+
+    while remaining > 0 {
+        if !is_preview_current(current_id, id) {
+            return Ok(());
+        }
+        let to_read = buf.len().min(remaining);
+        let read = reader.read(&mut buf[..to_read])?;
+        if read == 0 {
+            break;
+        }
+        remaining = remaining.saturating_sub(read);
+        let chunk = &buf[..read];
+        if !decided {
+            is_text = is_probably_text(chunk);
+            decided = true;
+        }
+        if is_text {
+            let text = String::from_utf8_lossy(chunk).into_owned();
+            let _ = tx.send((
+                id,
+                PreviewContent::TextChunk {
+                    text,
+                    done: remaining == 0,
+                },
+            ));
+        } else {
+            let _ = tx.send((
+                id,
+                PreviewContent::BinaryChunk {
+                    data: chunk.to_vec(),
+                    done: remaining == 0,
+                },
+            ));
+        }
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+    Ok(())
+}
+
+fn stream_container_preview(
+    tx: &mpsc::Sender<(u64, PreviewContent)>,
+    current_id: &std::sync::atomic::AtomicU64,
+    id: u64,
+    kind: crate::core::ContainerKind,
+    archive_path: &Path,
+    inner_path: &str,
+    max_bytes: Option<usize>,
+    force_text: bool,
+    wake: Option<&std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> Result<(), String> {
+    let normalized = inner_path.trim_start_matches('/');
+    let file = File::open(archive_path).map_err(|e| e.to_string())?;
+    match kind {
+        crate::core::ContainerKind::Zip => {
+            let reader = std::io::BufReader::new(file);
+            let mut zip = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+            for i in 0..zip.len() {
+                if !is_preview_current(current_id, id) {
+                    return Ok(());
+                }
+                let entry = zip.by_index(i).map_err(|e| e.to_string())?;
+                if entry.name() == normalized {
+                    return send_streaming_preview(
+                        tx, current_id, id, entry, max_bytes, force_text, wake,
+                    )
+                    .map_err(|e| e.to_string());
+                }
+            }
+        }
+        crate::core::ContainerKind::Tar => {
+            let reader = std::io::BufReader::new(file);
+            let mut archive = tar::Archive::new(reader);
+            for entry in archive.entries().map_err(|e| e.to_string())? {
+                if !is_preview_current(current_id, id) {
+                    return Ok(());
+                }
+                let mut entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path().map_err(|e| e.to_string())?;
+                let name = crate::core::normalize_archive_path(&path);
+                if name == normalized {
+                    return send_streaming_preview(
+                        tx, current_id, id, &mut entry, max_bytes, force_text, wake,
+                    )
+                    .map_err(|e| e.to_string());
+                }
+            }
+        }
+        crate::core::ContainerKind::TarGz => {
+            let reader = std::io::BufReader::new(file);
+            let decoder = flate2::read::GzDecoder::new(reader);
+            let mut archive = tar::Archive::new(decoder);
+            for entry in archive.entries().map_err(|e| e.to_string())? {
+                if !is_preview_current(current_id, id) {
+                    return Ok(());
+                }
+                let mut entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path().map_err(|e| e.to_string())?;
+                let name = crate::core::normalize_archive_path(&path);
+                if name == normalized {
+                    return send_streaming_preview(
+                        tx, current_id, id, &mut entry, max_bytes, force_text, wake,
+                    )
+                    .map_err(|e| e.to_string());
+                }
+            }
+        }
+        crate::core::ContainerKind::TarBz2 => {
+            let reader = std::io::BufReader::new(file);
+            let decoder = bzip2::read::BzDecoder::new(reader);
+            let mut archive = tar::Archive::new(decoder);
+            for entry in archive.entries().map_err(|e| e.to_string())? {
+                if !is_preview_current(current_id, id) {
+                    return Ok(());
+                }
+                let mut entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path().map_err(|e| e.to_string())?;
+                let name = crate::core::normalize_archive_path(&path);
+                if name == normalized {
+                    return send_streaming_preview(
+                        tx, current_id, id, &mut entry, max_bytes, force_text, wake,
+                    )
+                    .map_err(|e| e.to_string());
+                }
+            }
+        }
+    }
+    Err(format!("Entry not found in archive: {inner_path}"))
 }
 
 pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<SearchEvent>) {

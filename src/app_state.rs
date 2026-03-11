@@ -1,8 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path,
-    sync::Arc,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::Instant,
 };
 
@@ -102,6 +101,7 @@ pub struct PreviewState {
     pub show_whitespace: bool,
     pub bytes_per_row: usize,
     pub bytes_per_row_auto: bool,
+    pub loading_since: Option<Instant>,
 }
 
 pub struct EditState {
@@ -213,6 +213,7 @@ pub struct AppState {
     pub search_ui: SearchUiState,
     pub search_tx: mpsc::Sender<crate::core::SearchRequest>,
     pub search_rx: mpsc::Receiver<crate::core::SearchEvent>,
+    pub refresh_tick: u64,
 }
 
 #[derive(Clone)]
@@ -742,6 +743,7 @@ impl AppState {
         self.preview_return_focus = Some(self.active_panel);
         let mut request_id = self.preview_request_id.wrapping_add(1);
         self.preview_request_id = request_id;
+        // no capture
         let mut list_request: Option<(ContainerKind, path::PathBuf, u64)> = None;
         if let EntryLocation::Fs(path) = location.clone()
             && let Some(kind) = container_kind_from_path(&path)
@@ -770,19 +772,19 @@ impl AppState {
                 show_whitespace: false,
                 bytes_per_row: 16,
                 bytes_per_row_auto: true,
+                loading_since: Some(Instant::now()),
             };
             panel.mode = PanelMode::Preview(preview);
         }
         let Some(preview) = self.preview_panel_mut() else {
             return;
         };
-        const MAX_BYTES_TEXT: usize = 64 * 1024;
-        const MAX_BYTES_BINARY: usize = 4 * 1024;
         if is_dir {
             preview.content = Some(PreviewContent::Text(format_preview_info(
                 "Directory",
                 &location,
             )));
+            preview.loading_since = None;
             return;
         }
         match location {
@@ -791,6 +793,7 @@ impl AppState {
                     preview.content = Some(PreviewContent::Image(ImageLocation::Fs(
                         std::sync::Arc::from(path),
                     )));
+                    preview.loading_since = None;
                     return;
                 }
                 if let Some((kind, archive_path, list_id)) = list_request {
@@ -804,6 +807,7 @@ impl AppState {
                             inner_path: String::new(),
                         },
                     )));
+                    preview.loading_since = None;
                     let _ = self.preview_tx.send(PreviewRequest::ListContainer {
                         id: request_id,
                         kind,
@@ -812,16 +816,10 @@ impl AppState {
                     });
                     return;
                 }
-                if preview.content.is_none() {
-                    preview.content = Some(PreviewContent::Text(format_preview_info(
-                        "File",
-                        &EntryLocation::Fs(path.clone()),
-                    )));
-                }
                 let max_bytes = if is_text_path(&path) {
-                    MAX_BYTES_TEXT
+                    Some(64 * 1024)
                 } else {
-                    MAX_BYTES_BINARY
+                    Some(8 * 1024)
                 };
                 let _ = self.preview_tx.send(PreviewRequest::Read {
                     id: request_id,
@@ -840,22 +838,13 @@ impl AppState {
                         archive_path: archive_path.clone(),
                         inner_path: inner_path.clone(),
                     }));
+                    preview.loading_since = None;
                     return;
                 }
-                if preview.content.is_none() {
-                    preview.content = Some(PreviewContent::Text(format_preview_info(
-                        "File",
-                        &EntryLocation::Container {
-                            kind,
-                            archive_path: archive_path.clone(),
-                            inner_path: inner_path.clone(),
-                        },
-                    )));
-                }
                 let max_bytes = if is_text_name(&inner_path) {
-                    MAX_BYTES_TEXT
+                    Some(64 * 1024)
                 } else {
-                    MAX_BYTES_BINARY
+                    Some(8 * 1024)
                 };
                 let _ = self.preview_tx.send(PreviewRequest::Read {
                     id: request_id,

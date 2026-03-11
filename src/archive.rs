@@ -808,11 +808,23 @@ fn read_tar_gz_bytes_prefix(
 }
 
 pub fn normalize_archive_path(path: &Path) -> String {
-    let mut s = path.to_string_lossy().replace('\\', "/");
-    while s.starts_with("./") {
-        s = s[2..].to_string();
+    use std::path::Component;
+    let mut parts: Vec<String> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::Normal(seg) => {
+                let s = seg.to_string_lossy();
+                if !s.is_empty() {
+                    parts.push(s.into_owned());
+                }
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+        }
     }
-    s.trim_start_matches('/').to_string()
+    parts.join("/")
 }
 
 fn read_tar_bz2_directory_with_progress(

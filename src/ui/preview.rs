@@ -110,7 +110,8 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                             )
                             .vertical_scroll_offset(preview.scroll)
                             .show(ui, |ui| match preview.content.as_ref() {
-                                Some(core::PreviewContent::Text(text)) => {
+                                Some(core::PreviewContent::Text(text))
+                                | Some(core::PreviewContent::TextChunk { text, .. }) => {
                                     let display_text = if preview.show_whitespace {
                                         make_whitespace_visible(text)
                                     } else {
@@ -171,7 +172,8 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                         ui.add(label);
                                     }
                                 }
-                                Some(core::PreviewContent::Binary(bytes)) => {
+                                Some(core::PreviewContent::Binary(bytes))
+                                | Some(core::PreviewContent::BinaryChunk { data: bytes, .. }) => {
                                     let width = if preview.bytes_per_row_auto {
                                         let mut best = 4usize;
                                         let options = [4usize, 8, 12, 16, 20, 24, 28, 32];
@@ -296,7 +298,11 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                     }
                                 }
                                 None => {
-                                    ui.colored_label(text_color, "No preview");
+                                    if preview.loading_since.is_some() {
+                                        ui.colored_label(text_color, "Loading preview...");
+                                    } else {
+                                        ui.colored_label(text_color, "No preview");
+                                    }
                                 }
                             })
                     },

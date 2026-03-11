@@ -62,7 +62,7 @@ pub(crate) fn render_snapshot(
     );
 
     let (preview_tx, _preview_req_rx) = mpsc::channel::<core::PreviewRequest>();
-    let (_preview_res_tx, preview_rx) = mpsc::channel::<(u64, core::PreviewContent)>();
+    let (_preview_content_tx, preview_rx) = mpsc::channel::<(u64, core::PreviewContent)>();
     let (io_tx, _io_rx_unused) = mpsc::channel::<core::IOTask>();
     let (_io_res_tx, io_rx) = mpsc::channel::<core::IOResult>();
     let (io_cancel_tx, _io_cancel_rx) = mpsc::channel::<()>();
@@ -95,6 +95,7 @@ pub(crate) fn render_snapshot(
     app.edit_rx = edit_res_rx;
     app.search_tx = search_tx;
     app.search_rx = search_rx;
+    app.refresh_tick = 0;
 
     let egui_ctx = egui::Context::default();
     let raw_input = egui::RawInput {
