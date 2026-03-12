@@ -148,6 +148,9 @@ pub enum IOTask {
         path: path::PathBuf,
         contents: Vec<u8>,
     },
+    Mkdir {
+        path: path::PathBuf,
+    },
     SetProps {
         path: path::PathBuf,
         mode: u32,

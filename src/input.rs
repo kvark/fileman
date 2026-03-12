@@ -578,6 +578,10 @@ pub(crate) fn handle_keyboard(
         app.start_inline_new_file();
         ctx.request_repaint();
     }
+    if input.key_pressed(egui::Key::F7) {
+        app.start_inline_new_dir();
+        ctx.request_repaint();
+    }
     let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
     if shift_f6 {
         app.prepare_rename_selected();
@@ -692,7 +696,9 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
         }
         let rename = browser.inline_rename.take().unwrap();
         if escape {
-            if rename.new_file && rename.index < browser.entries.len() {
+            if !matches!(rename.kind, app_state::InlineEditKind::Rename)
+                && rename.index < browser.entries.len()
+            {
                 browser.entries.remove(rename.index);
                 if browser.selected_index >= browser.entries.len() && !browser.entries.is_empty() {
                     browser.selected_index = browser.entries.len() - 1;
@@ -711,29 +717,40 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
         }
         let mut action: Option<fileman::core::IOTask> = None;
         let mut next_selection: Option<(PathBuf, String)> = None;
-        if rename.new_file {
-            let dir = browser.current_path.clone();
-            let path = dir.join(new_name);
-            action = Some(fileman::core::IOTask::WriteFile {
-                path,
-                contents: Vec::new(),
-            });
-            next_selection = Some((dir, new_name.to_string()));
-        } else if rename.index < browser.entries.len() {
-            let entry = &browser.entries[rename.index];
-            if let core::EntryLocation::Fs(path) = &entry.location {
-                let current = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if current != new_name {
-                    action = Some(fileman::core::IOTask::Rename {
-                        src: path.clone(),
-                        new_name: new_name.to_string(),
-                    });
-                    next_selection = Some((
-                        path.parent()
-                            .unwrap_or_else(|| std::path::Path::new("."))
-                            .to_path_buf(),
-                        new_name.to_string(),
-                    ));
+        match rename.kind {
+            app_state::InlineEditKind::NewFile => {
+                let dir = browser.current_path.clone();
+                let path = dir.join(new_name);
+                action = Some(fileman::core::IOTask::WriteFile {
+                    path,
+                    contents: Vec::new(),
+                });
+                next_selection = Some((dir, new_name.to_string()));
+            }
+            app_state::InlineEditKind::NewDir => {
+                let dir = browser.current_path.clone();
+                let path = dir.join(new_name);
+                action = Some(fileman::core::IOTask::Mkdir { path });
+                next_selection = Some((dir, new_name.to_string()));
+            }
+            app_state::InlineEditKind::Rename => {
+                if rename.index < browser.entries.len() {
+                    let entry = &browser.entries[rename.index];
+                    if let core::EntryLocation::Fs(path) = &entry.location {
+                        let current = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        if current != new_name {
+                            action = Some(fileman::core::IOTask::Rename {
+                                src: path.clone(),
+                                new_name: new_name.to_string(),
+                            });
+                            next_selection = Some((
+                                path.parent()
+                                    .unwrap_or_else(|| std::path::Path::new("."))
+                                    .to_path_buf(),
+                                new_name.to_string(),
+                            ));
+                        }
+                    }
                 }
             }
         }
