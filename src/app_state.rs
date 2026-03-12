@@ -69,10 +69,16 @@ pub struct BrowserState {
     pub index_last_seen: usize,
 }
 
+pub enum InlineEditKind {
+    Rename,
+    NewFile,
+    NewDir,
+}
+
 pub struct InlineRename {
     pub index: usize,
     pub text: String,
-    pub new_file: bool,
+    pub kind: InlineEditKind,
     pub focus: bool,
 }
 
@@ -595,7 +601,7 @@ impl AppState {
             browser.inline_rename = Some(InlineRename {
                 index: browser.selected_index,
                 text: name,
-                new_file: false,
+                kind: InlineEditKind::Rename,
                 focus: true,
             });
             self.rename_input = None;
@@ -643,7 +649,52 @@ impl AppState {
         browser.inline_rename = Some(InlineRename {
             index: insert_at,
             text: candidate,
-            new_file: true,
+            kind: InlineEditKind::NewFile,
+            focus: true,
+        });
+    }
+
+    pub fn start_inline_new_dir(&mut self) {
+        let target_dir = {
+            let panel = self.get_active_panel();
+            let browser = &panel.browser;
+            if !matches!(browser.browser_mode, BrowserMode::Fs) {
+                return;
+            }
+            browser.current_path.clone()
+        };
+        let panel = self.get_active_panel_mut();
+        let browser = &mut panel.browser;
+        let base = "new_dir".to_string();
+        let mut candidate = base.clone();
+        let mut counter = 1;
+        while browser.entries.iter().any(|e| e.name == candidate) {
+            candidate = format!("{base}_{counter}");
+            counter += 1;
+        }
+        // Insert among directories, after ".." but before files
+        let insert_at = browser
+            .entries
+            .iter()
+            .position(|e| !e.is_dir)
+            .unwrap_or(browser.entries.len());
+        let new_path = target_dir.join(&candidate);
+        browser.entries.insert(
+            insert_at,
+            DirEntry {
+                name: candidate.clone(),
+                is_dir: true,
+                is_symlink: false,
+                location: EntryLocation::Fs(new_path),
+                size: None,
+                modified: None,
+            },
+        );
+        browser.selected_index = insert_at;
+        browser.inline_rename = Some(InlineRename {
+            index: insert_at,
+            text: candidate,
+            kind: InlineEditKind::NewDir,
             focus: true,
         });
     }

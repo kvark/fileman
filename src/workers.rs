@@ -120,6 +120,11 @@ pub fn start_io_worker() -> (
                         eprintln!("Write error: {e}");
                     }
                 }
+                IOTask::Mkdir { path } => {
+                    if let Err(e) = std::fs::create_dir(&path) {
+                        eprintln!("Mkdir error: {e}");
+                    }
+                }
                 IOTask::SetProps {
                     path,
                     mode,
