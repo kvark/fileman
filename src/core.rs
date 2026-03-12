@@ -44,6 +44,7 @@ impl EntryLocation {
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub location: EntryLocation,
     pub size: Option<u64>,
     pub modified: Option<u64>,
@@ -255,9 +256,18 @@ pub fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
         let file_name = file_name.to_string_lossy().to_string();
 
         let file_type = entry.file_type()?;
-        let is_dir = file_type.is_dir();
-
-        let metadata = entry.metadata().ok();
+        let is_symlink = file_type.is_symlink();
+        // DirEntry::metadata() uses lstat (no follow); fs::metadata follows symlinks
+        let metadata = if is_symlink {
+            fs::metadata(entry.path()).ok()
+        } else {
+            entry.metadata().ok()
+        };
+        let is_dir = if is_symlink {
+            metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)
+        } else {
+            file_type.is_dir()
+        };
         let size = if is_dir {
             None
         } else {
@@ -270,6 +280,7 @@ pub fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
         dir_entries.push(DirEntry {
             name: file_name,
             is_dir,
+            is_symlink,
             location: EntryLocation::Fs(entry.path()),
             size,
             modified,
@@ -282,6 +293,7 @@ pub fn read_fs_directory(path: &path::Path) -> anyhow::Result<Vec<DirEntry>> {
         entries.push(DirEntry {
             name: "..".to_string(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
             size: None,
             modified: None,

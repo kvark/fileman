@@ -366,6 +366,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::Zip,
                 archive_path: archive_path.to_path_buf(),
@@ -382,6 +383,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Fs(parent),
             size: None,
             modified: None,
@@ -393,6 +395,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         .map(|d| DirEntry {
             name: d.clone(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::Zip,
                 archive_path: archive_path.to_path_buf(),
@@ -412,6 +415,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         .map(|f| DirEntry {
             name: f.clone(),
             is_dir: false,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::Zip,
                 archive_path: archive_path.to_path_buf(),
@@ -572,6 +576,7 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::Tar,
                 archive_path: archive_path.to_path_buf(),
@@ -588,6 +593,7 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Fs(parent),
             size: None,
             modified: None,
@@ -599,6 +605,7 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         .map(|d| DirEntry {
             name: d.clone(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::Tar,
                 archive_path: archive_path.to_path_buf(),
@@ -618,6 +625,7 @@ fn read_tar_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
         .map(|f| DirEntry {
             name: f.clone(),
             is_dir: false,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::Tar,
                 archive_path: archive_path.to_path_buf(),
@@ -685,6 +693,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::TarGz,
                 archive_path: archive_path.to_path_buf(),
@@ -701,6 +710,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Fs(parent),
             size: None,
             modified: None,
@@ -712,6 +722,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
         .map(|d| DirEntry {
             name: d.clone(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::TarGz,
                 archive_path: archive_path.to_path_buf(),
@@ -731,6 +742,7 @@ fn read_tar_gz_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<D
         .map(|f| DirEntry {
             name: f.clone(),
             is_dir: false,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::TarGz,
                 archive_path: archive_path.to_path_buf(),
@@ -893,6 +905,7 @@ fn read_tar_bz2_directory_with_progress(
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::TarBz2,
                 archive_path: archive_path.to_path_buf(),
@@ -909,6 +922,7 @@ fn read_tar_bz2_directory_with_progress(
         entries.push(DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Fs(parent),
             size: None,
             modified: None,
@@ -920,6 +934,7 @@ fn read_tar_bz2_directory_with_progress(
         .map(|d| DirEntry {
             name: d.clone(),
             is_dir: true,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::TarBz2,
                 archive_path: archive_path.to_path_buf(),
@@ -939,6 +954,7 @@ fn read_tar_bz2_directory_with_progress(
         .map(|f| DirEntry {
             name: f.clone(),
             is_dir: false,
+            is_symlink: false,
             location: EntryLocation::Container {
                 kind: ContainerKind::TarBz2,
                 archive_path: archive_path.to_path_buf(),
