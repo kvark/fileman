@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path,
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::Instant,
 };
 
@@ -65,6 +65,8 @@ pub struct BrowserState {
     pub inline_rename: Option<InlineRename>,
     pub sort_mode: SortMode,
     pub sort_desc: bool,
+    pub watching_archive: Option<path::PathBuf>,
+    pub index_last_seen: usize,
 }
 
 pub struct InlineRename {
@@ -72,6 +74,12 @@ pub struct InlineRename {
     pub text: String,
     pub new_file: bool,
     pub focus: bool,
+}
+
+pub struct ArchiveFullIndex {
+    pub entries: Vec<(String, bool, Option<u64>)>,
+    pub root: Option<String>,
+    pub complete: bool,
 }
 
 pub struct ContainerDirCache {
@@ -192,6 +200,7 @@ pub struct AppState {
     pub fs_last_selected_name: HashMap<path::PathBuf, String>,
     pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
     pub container_dir_cache: HashMap<(path::PathBuf, String, ContainerKind), ContainerDirCache>,
+    pub archive_index: HashMap<path::PathBuf, Arc<Mutex<ArchiveFullIndex>>>,
     pub props_dialog: Option<PropsDialog>,
     pub theme: Theme,
     pub theme_picker_open: bool,

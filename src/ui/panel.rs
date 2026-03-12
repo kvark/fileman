@@ -30,7 +30,7 @@ pub fn draw_panel(
         header_text,
         mut selected_label,
         mut loading,
-        _loading_progress,
+        loading_progress,
         top_index,
     ) = {
         let panel = app.panel(panel_side);
@@ -120,7 +120,22 @@ pub fn draw_panel(
                                         header_text.clone()
                                     };
                                     if loading {
-                                        header_display = format!("⟳ {header_display}");
+                                        let t = ui.ctx().input(|i| i.time);
+                                        let spinner =
+                                            ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
+                                        if let Some((loaded, total)) = loading_progress {
+                                            if let Some(total) = total {
+                                                header_display = format!(
+                                                    "{spinner} {header_display} ({loaded}/{total})"
+                                                );
+                                            } else {
+                                                header_display = format!(
+                                                    "{spinner} {header_display} ({loaded})"
+                                                );
+                                            }
+                                        } else {
+                                            header_display = format!("{spinner} {header_display}");
+                                        }
                                     }
                                     let header_font = egui::TextStyle::Body.resolve(ui.style());
                                     ui.painter().with_clip_rect(left_rect).text(

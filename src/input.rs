@@ -138,12 +138,27 @@ fn open_selected_from_to(
                 } else {
                     None
                 };
+                let inferred_root = if container_root.is_none() {
+                    inner_path.split_once('/').map(|(root, _)| root.to_string())
+                } else {
+                    None
+                };
+                let root_hint = container_root.clone().or(inferred_root);
+                let mut effective_cwd = inner_path.clone();
+                if let Some(ref root) = root_hint {
+                    let root_prefix = format!("{}/", root.trim_end_matches('/'));
+                    if effective_cwd == *root {
+                        effective_cwd.clear();
+                    } else if effective_cwd.starts_with(&root_prefix) {
+                        effective_cwd = effective_cwd[root_prefix.len()..].to_string();
+                    }
+                }
                 load_container_directory_async(
                     app,
                     kind,
                     archive_path.clone(),
-                    inner_path.clone(),
-                    container_root.clone(),
+                    effective_cwd,
+                    root_hint,
                     target,
                     prefer_name,
                     ContainerLoadMode::UseCache,
