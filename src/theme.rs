@@ -30,6 +30,7 @@ pub struct Theme {
 #[derive(Clone)]
 pub struct ThemeColors {
     pub divider: Color,
+    pub row_bg_stripe: Color,
     pub row_bg_selected_active: Color,
     pub row_bg_selected_inactive: Color,
     pub row_fg_selected: Color,
@@ -95,6 +96,7 @@ impl Theme {
         match self.kind {
             ThemeKind::Dark => ThemeColors {
                 divider: Color::rgba(0.18, 0.2, 0.24, 1.0),
+                row_bg_stripe: Color::rgba(1.0, 1.0, 1.0, 0.04),
                 row_bg_selected_active: Color::rgba(0.16, 0.38, 0.78, 1.0),
                 row_bg_selected_inactive: Color::rgba(0.12, 0.27, 0.52, 1.0),
                 row_fg_selected: Color::rgba(1.0, 1.0, 1.0, 1.0),
@@ -113,6 +115,7 @@ impl Theme {
             },
             ThemeKind::Light => ThemeColors {
                 divider: Color::rgba(0.82, 0.84, 0.88, 1.0),
+                row_bg_stripe: Color::rgba(0.0, 0.0, 0.0, 0.04),
                 row_bg_selected_active: Color::rgba(0.45, 0.68, 0.98, 1.0),
                 row_bg_selected_inactive: Color::rgba(0.7, 0.82, 0.98, 1.0),
                 row_fg_selected: Color::rgba(0.02, 0.04, 0.08, 1.0),
@@ -151,6 +154,7 @@ struct SerializableColor {
 #[derive(Deserialize, Default)]
 struct ThemeFileColors {
     divider: Option<SerializableColor>,
+    row_bg_stripe: Option<SerializableColor>,
     row_bg_selected_active: Option<SerializableColor>,
     row_bg_selected_inactive: Option<SerializableColor>,
     row_fg_selected: Option<SerializableColor>,
@@ -185,6 +189,11 @@ fn merge_colors(base: &ThemeColors, patch: &ThemeFileColors) -> ThemeColors {
             .as_ref()
             .map(rgba_from)
             .unwrap_or(base.divider),
+        row_bg_stripe: patch
+            .row_bg_stripe
+            .as_ref()
+            .map(rgba_from)
+            .unwrap_or(base.row_bg_stripe),
         row_bg_selected_active: patch
             .row_bg_selected_active
             .as_ref()
