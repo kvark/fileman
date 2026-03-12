@@ -666,6 +666,78 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         }
     }
 
+    // Poll shared archive indexes for incremental updates
+    for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
+        let watching = app.panel(side).browser.watching_archive.clone();
+        if let Some(ref archive_path) = watching
+            && let Some(shared) = app.archive_index.get(archive_path).cloned()
+        {
+            let (entry_count, complete, root) = {
+                let idx = shared.lock().unwrap();
+                (idx.entries.len(), idx.complete, idx.root.clone())
+            };
+            let panel = app.panel_mut(side);
+            let browser = &mut panel.browser;
+            let last_seen = browser.index_last_seen;
+            if entry_count > last_seen || complete {
+                if let core::BrowserMode::Container {
+                    kind,
+                    ref archive_path,
+                    ref cwd,
+                    ..
+                } = browser.browser_mode
+                {
+                    let cwd = cwd.clone();
+                    let archive_path = archive_path.clone();
+                    let idx = shared.lock().unwrap();
+                    let mut listing =
+                        build_listing_from_index(&idx, &archive_path, kind, &cwd);
+                    drop(idx);
+                    sort_entries(&mut listing, browser.sort_mode, browser.sort_desc);
+                    // Only replace entries if the filtered listing actually changed.
+                    // The raw index grows with entries from all directories, but
+                    // the listing for this cwd may be unchanged. Skipping avoids
+                    // disrupting the user's cursor position.
+                    let listing_changed = listing.len() != browser.entries.len();
+                    if listing_changed {
+                        let prior_name = browser
+                            .entries
+                            .get(browser.selected_index)
+                            .map(|e| e.name.clone());
+                        let restore_name =
+                            browser.prefer_select_name.take().or(prior_name);
+                        browser.entries = listing;
+                        if let Some(ref pref) = restore_name
+                            && let Some(pos) =
+                                browser.entries.iter().position(|e| e.name == *pref)
+                        {
+                            browser.selected_index = pos;
+                        }
+                        changed = true;
+                    }
+                    browser.index_last_seen = entry_count;
+                    browser.loading_progress = Some((entry_count, None));
+                    if let Some(ref root) = root {
+                        browser.container_root = Some(root.clone());
+                        browser.browser_mode = core::BrowserMode::Container {
+                            kind,
+                            archive_path: archive_path.clone(),
+                            cwd,
+                            root: Some(root.clone()),
+                        };
+                    }
+                }
+                if complete {
+                    let browser = &mut app.panel_mut(side).browser;
+                    browser.watching_archive = None;
+                    browser.loading = false;
+                    browser.loading_progress = None;
+                    changed = true;
+                }
+            }
+        }
+    }
+
     if let Ok((id, content)) = app.preview_rx.try_recv()
         && let Some(preview) = app.preview_panel_mut()
         && id == preview.request_id
@@ -1019,6 +1091,154 @@ fn load_fs_directory_async(
     browser.prefer_select_name = remembered;
     browser.loading = initial_loading;
     browser.loading_progress = None;
+    browser.watching_archive = None;
+    browser.index_last_seen = 0;
+}
+
+fn build_listing_from_index(
+    index: &app_state::ArchiveFullIndex,
+    archive_path: &Path,
+    kind: core::ContainerKind,
+    cwd: &str,
+) -> Vec<core::DirEntry> {
+    let root = index.root.as_deref();
+    let mut prefix = String::new();
+    if let Some(r) = root {
+        prefix.push_str(r.trim_end_matches('/'));
+        prefix.push('/');
+    }
+    if !cwd.is_empty() {
+        prefix.push_str(cwd.trim_end_matches('/'));
+        prefix.push('/');
+    }
+
+    let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dir_list: Vec<String> = Vec::new();
+    let mut file_list: Vec<(String, Option<u64>)> = Vec::new();
+    let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (name, is_dir, size) in &index.entries {
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let rem = &name[prefix.len()..];
+        if rem.is_empty() {
+            continue;
+        }
+        if let Some(slash) = rem.find('/') {
+            let dir = &rem[..slash];
+            if seen_dirs.insert(dir.to_string()) {
+                dir_list.push(dir.to_string());
+            }
+        } else if *is_dir {
+            if seen_dirs.insert(rem.to_string()) {
+                dir_list.push(rem.to_string());
+            }
+        } else if !seen_dirs.contains(rem) && seen_files.insert(rem.to_string()) {
+            file_list.push((rem.to_string(), *size));
+        }
+    }
+
+    let mut entries = Vec::new();
+
+    // ".." entry
+    if !cwd.is_empty() {
+        let mut parent = cwd
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        if let Some(r) = root
+            && parent == *r
+        {
+            parent.clear();
+        }
+        entries.push(core::DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            location: core::EntryLocation::Container {
+                kind,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: parent,
+            },
+            size: None,
+            modified: None,
+        });
+    } else {
+        let parent = archive_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        entries.push(core::DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            location: core::EntryLocation::Fs(parent),
+            size: None,
+            modified: None,
+        });
+    }
+
+    for d in dir_list {
+        let inner = if let Some(r) = root {
+            if cwd.is_empty() {
+                format!("{}/{}", r.trim_end_matches('/'), d)
+            } else {
+                format!(
+                    "{}/{}/{}",
+                    r.trim_end_matches('/'),
+                    cwd.trim_end_matches('/'),
+                    d
+                )
+            }
+        } else if cwd.is_empty() {
+            d.clone()
+        } else {
+            format!("{}/{}", cwd.trim_end_matches('/'), d)
+        };
+        entries.push(core::DirEntry {
+            name: d,
+            is_dir: true,
+            location: core::EntryLocation::Container {
+                kind,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: inner,
+            },
+            size: None,
+            modified: None,
+        });
+    }
+
+    for (f, size) in file_list {
+        let inner = if let Some(r) = root {
+            if cwd.is_empty() {
+                format!("{}/{}", r.trim_end_matches('/'), f)
+            } else {
+                format!(
+                    "{}/{}/{}",
+                    r.trim_end_matches('/'),
+                    cwd.trim_end_matches('/'),
+                    f
+                )
+            }
+        } else if cwd.is_empty() {
+            f.clone()
+        } else {
+            format!("{}/{}", cwd.trim_end_matches('/'), f)
+        };
+        entries.push(core::DirEntry {
+            name: f,
+            is_dir: false,
+            location: core::EntryLocation::Container {
+                kind,
+                archive_path: archive_path.to_path_buf(),
+                inner_path: inner,
+            },
+            size,
+            modified: None,
+        });
+    }
+
+    entries
 }
 
 fn load_container_directory_async(
@@ -1036,8 +1256,9 @@ fn load_container_directory_async(
     let mut cached = app.container_dir_cache.remove(&cache_key);
     if cache_mode == ContainerLoadMode::ForceReload {
         cached = None;
+        app.archive_index.remove(&archive_path);
     }
-    let root_hint = root_hint.or_else(|| cached.as_ref().and_then(|cache| cache.root.clone()));
+    let mut root_hint = root_hint.or_else(|| cached.as_ref().and_then(|cache| cache.root.clone()));
     let mut initial: Vec<core::DirEntry> = if let Some(ref cache) = cached {
         cache.entries.clone()
     } else {
@@ -1086,483 +1307,261 @@ fn load_container_directory_async(
 
     let resume_rx = cached.as_mut().and_then(|cache| cache.entries_rx.take());
     let skip_loading = resume_rx.is_some() || cached.as_ref().is_some_and(|c| !c.loading);
-    let (tx, rx) = mpsc::channel::<core::DirBatch>();
-    let archive_clone = archive_path.clone();
-    let cwd_clone = cwd.clone();
-    let kind_clone = kind;
     let wake = app.wake.clone();
 
-    if !skip_loading {
-        if matches!(
-            kind,
-            core::ContainerKind::TarBz2
-                | core::ContainerKind::Tar
-                | core::ContainerKind::TarGz
-                | core::ContainerKind::Zip
-        ) {
-            thread::spawn(move || {
-                let prefix = if cwd_clone.is_empty() {
-                    "".to_string()
-                } else {
-                    format!("{}/", cwd_clone.trim_end_matches('/'))
-                };
-                let mut seen_dirs: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                let mut seen_files: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                let mut pending: Vec<core::DirEntry> = Vec::new();
-                let mut loaded = 0usize;
-                let mut sent_first = false;
-                const BATCH: usize = 200;
-                const DECIDE_LIMIT: usize = 64;
-                let mut decided = false;
-                let mut implicit_root: Option<String> = None;
-                let mut buffered: Vec<(String, bool)> = Vec::new();
-                let mut root_candidate: Option<String> = None;
-                let mut seen_root_file = false;
-                let mut seen_other_root = false;
-                let mut root_sent = false;
+    // Check if a shared index already exists (even incomplete)
+    let mut used_index = false;
+    let mut watching = false;
+    if !skip_loading
+        && let Some(shared) = app.archive_index.get(&archive_path).cloned()
+    {
+        let idx = shared.lock().unwrap();
+        let mut listing = build_listing_from_index(&idx, &archive_path, kind, &cwd);
+        let browser = &app.panel(target_panel).browser;
+        sort_entries(&mut listing, browser.sort_mode, browser.sort_desc);
+        root_hint = idx.root.clone();
+        let entry_count = idx.entries.len();
+        let complete = idx.complete;
+        drop(idx);
+        initial = listing;
+        used_index = true;
+        if !complete {
+            watching = true;
+        }
+        let _ = entry_count; // used below for index_last_seen
+    }
 
-                let mut send_root = |root: &Option<String>| {
-                    if root_sent {
-                        return;
-                    }
-                    let _ = tx.send(core::DirBatch::ContainerRoot(root.clone()));
+    // Need to spawn a new loader thread
+    if !skip_loading && !used_index {
+        // Create the shared index
+        let shared = Arc::new(std::sync::Mutex::new(app_state::ArchiveFullIndex {
+            entries: Vec::new(),
+            root: root_hint.clone(),
+            complete: false,
+        }));
+        app.archive_index
+            .insert(archive_path.clone(), shared.clone());
+        watching = true;
+
+        let archive_clone = archive_path.clone();
+        let kind_clone = kind;
+        let wake = wake.clone();
+
+        thread::spawn(move || {
+            let mut implicit_root: Option<String> = None;
+            let mut decided = false;
+            const BATCH: usize = 200;
+            const DECIDE_LIMIT: usize = 64;
+            let mut buffered: Vec<(String, bool, Option<u64>)> = Vec::new();
+            let mut root_candidate: Option<String> = None;
+            let mut seen_root_file = false;
+            let mut seen_other_root = false;
+            let mut batch_buf: Vec<(String, bool, Option<u64>)> = Vec::new();
+
+            let file = match std::fs::File::open(&archive_clone) {
+                Ok(file) => file,
+                Err(_e) => {
+                    let mut idx = shared.lock().unwrap();
+                    idx.complete = true;
                     if let Some(ref wake) = wake {
                         wake();
                     }
-                    root_sent = true;
-                };
-
-                struct TarEmitContext<'a> {
-                    implicit_prefix: Option<&'a str>,
-                    cwd: &'a str,
-                    kind: core::ContainerKind,
-                    archive_path: &'a Path,
-                    pending: &'a mut Vec<core::DirEntry>,
-                    seen_dirs: &'a mut std::collections::HashSet<String>,
-                    seen_files: &'a mut std::collections::HashSet<String>,
-                    loaded: &'a mut usize,
+                    return;
                 }
+            };
 
-                fn emit_name(name: &str, is_dir_hint: bool, ctx: &mut TarEmitContext<'_>) {
-                    let rem = if let Some(prefix) = ctx.implicit_prefix {
-                        if !name.starts_with(prefix) {
-                            return;
-                        }
-                        let trimmed = name[prefix.len()..].trim_start_matches('/');
-                        if trimmed.is_empty() {
-                            return;
-                        }
-                        trimmed
-                    } else {
-                        name
-                    };
-
-                    if let Some(slash) = rem.find('/') {
-                        let dir = rem[..slash].to_string();
-                        if ctx.seen_dirs.insert(dir.clone()) {
-                            ctx.pending.push(core::DirEntry {
-                                name: dir.clone(),
-                                is_dir: true,
-                                location: core::EntryLocation::Container {
-                                    kind: ctx.kind,
-                                    archive_path: ctx.archive_path.to_path_buf(),
-                                    inner_path: if let Some(prefix) = ctx.implicit_prefix {
-                                        format!("{}{}", prefix, dir)
-                                    } else if ctx.cwd.is_empty() {
-                                        dir
-                                    } else {
-                                        format!("{}/{}", ctx.cwd.trim_end_matches('/'), dir)
-                                    },
-                                },
-                                size: None,
-                                modified: None,
-                            });
-                            *ctx.loaded += 1;
-                        }
-                    } else if is_dir_hint {
-                        let dir = rem.to_string();
-                        if ctx.seen_dirs.insert(dir.clone()) {
-                            ctx.pending.push(core::DirEntry {
-                                name: dir.clone(),
-                                is_dir: true,
-                                location: core::EntryLocation::Container {
-                                    kind: ctx.kind,
-                                    archive_path: ctx.archive_path.to_path_buf(),
-                                    inner_path: if let Some(prefix) = ctx.implicit_prefix {
-                                        format!("{}{}", prefix, dir)
-                                    } else if ctx.cwd.is_empty() {
-                                        dir
-                                    } else {
-                                        format!("{}/{}", ctx.cwd.trim_end_matches('/'), dir)
-                                    },
-                                },
-                                size: None,
-                                modified: None,
-                            });
-                            *ctx.loaded += 1;
-                        }
-                    } else if ctx.seen_files.insert(rem.to_string()) {
-                        let file_name = rem.to_string();
-                        ctx.pending.push(core::DirEntry {
-                            name: file_name.clone(),
-                            is_dir: false,
-                            location: core::EntryLocation::Container {
-                                kind: ctx.kind,
-                                archive_path: ctx.archive_path.to_path_buf(),
-                                inner_path: if let Some(prefix) = ctx.implicit_prefix {
-                                    format!("{}{}", prefix, file_name)
-                                } else if ctx.cwd.is_empty() {
-                                    file_name
-                                } else {
-                                    format!("{}/{}", ctx.cwd.trim_end_matches('/'), file_name)
-                                },
-                            },
-                            size: None,
-                            modified: None,
-                        });
-                        *ctx.loaded += 1;
-                    }
+            // Closure to decide implicit root from buffered entries
+            let decide_root = |root_candidate: &Option<String>,
+                               seen_root_file: bool,
+                               seen_other_root: bool|
+             -> Option<String> {
+                if !seen_root_file && !seen_other_root {
+                    root_candidate.clone()
+                } else {
+                    None
                 }
+            };
 
-                let file = match std::fs::File::open(&archive_clone) {
-                    Ok(file) => file,
-                    Err(e) => {
-                        let _ = tx.send(core::DirBatch::Error(format!(
-                            "Failed to read archive: {e}"
-                        )));
-                        if let Some(ref wake) = wake {
-                            wake();
-                        }
-                        return;
+            // Process a single entry name for root detection (pre-decide phase)
+            fn detect_root_from_entry(
+                name: &str,
+                is_dir: bool,
+                root_candidate: &mut Option<String>,
+                seen_root_file: &mut bool,
+                seen_other_root: &mut bool,
+            ) {
+                if let Some(slash) = name.find('/') {
+                    let root = &name[..slash];
+                    match root_candidate.as_ref() {
+                        None => *root_candidate = Some(root.to_string()),
+                        Some(existing) if existing != root => *seen_other_root = true,
+                        _ => {}
                     }
-                };
-
-                if kind_clone == core::ContainerKind::Zip {
-                    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
-                    let mut zip = match zip::ZipArchive::new(reader) {
-                        Ok(zip) => zip,
-                        Err(e) => {
-                            let _ = tx.send(core::DirBatch::Error(format!(
-                                "Failed to read archive: {e}"
-                            )));
-                            if let Some(ref wake) = wake {
-                                wake();
-                            }
-                            return;
-                        }
-                    };
-                    for i in 0..zip.len() {
-                        let entry = match zip.by_index(i) {
-                            Ok(entry) => entry,
-                            Err(_) => continue,
-                        };
-                        let entry_is_dir = entry.is_dir();
-                        let name = core::normalize_archive_path(Path::new(entry.name()));
-                        if name.is_empty() || !name.starts_with(&prefix) {
-                            continue;
-                        }
-                        let rem = &name[prefix.len()..];
-                        if rem.is_empty() {
-                            continue;
-                        }
-                        if !decided && cwd_clone.is_empty() {
-                            buffered.push((name.clone(), entry_is_dir));
-                            if let Some(slash) = rem.find('/') {
-                                let root = rem[..slash].to_string();
-                                match root_candidate.as_ref() {
-                                    None => root_candidate = Some(root),
-                                    Some(existing) if existing != &root => seen_other_root = true,
-                                    _ => {}
-                                }
-                            } else if entry_is_dir {
-                                match root_candidate.as_ref() {
-                                    None => root_candidate = Some(rem.to_string()),
-                                    Some(existing) if existing != rem => seen_other_root = true,
-                                    _ => {}
-                                }
-                            } else {
-                                seen_root_file = true;
-                            }
-
-                            if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
-                                decided = true;
-                                if !seen_root_file && !seen_other_root {
-                                    implicit_root = root_candidate.clone();
-                                }
-                                send_root(&implicit_root);
-                                let root_ref = implicit_root
-                                    .as_ref()
-                                    .map(|root| format!("{}/", root.trim_end_matches('/')));
-                                for (buffered_name, buffered_is_dir) in buffered.drain(..) {
-                                    let mut ctx = TarEmitContext {
-                                        implicit_prefix: root_ref.as_deref(),
-                                        cwd: &cwd_clone,
-                                        kind: kind_clone,
-                                        archive_path: archive_clone.as_path(),
-                                        pending: &mut pending,
-                                        seen_dirs: &mut seen_dirs,
-                                        seen_files: &mut seen_files,
-                                        loaded: &mut loaded,
-                                    };
-                                    emit_name(&buffered_name, buffered_is_dir, &mut ctx);
-                                }
-                            } else {
-                                continue;
-                            }
-                        } else {
-                            let root_ref = implicit_root
-                                .as_ref()
-                                .map(|root| format!("{}/", root.trim_end_matches('/')));
-                            let emit_name_raw = if cwd_clone.is_empty() {
-                                name.as_str()
-                            } else {
-                                rem
-                            };
-                            let mut ctx = TarEmitContext {
-                                implicit_prefix: root_ref.as_deref(),
-                                cwd: &cwd_clone,
-                                kind: kind_clone,
-                                archive_path: archive_clone.as_path(),
-                                pending: &mut pending,
-                                seen_dirs: &mut seen_dirs,
-                                seen_files: &mut seen_files,
-                                loaded: &mut loaded,
-                            };
-                            emit_name(emit_name_raw, entry_is_dir, &mut ctx);
-                        }
-
-                        if pending.len() >= BATCH || (!sent_first && !pending.is_empty()) {
-                            let _ = tx.send(core::DirBatch::Append(pending));
-                            pending = Vec::new();
-                            sent_first = true;
-                            let _ = tx.send(core::DirBatch::Progress {
-                                loaded,
-                                total: None,
-                            });
-                            if let Some(ref wake) = wake {
-                                wake();
-                            }
-                        }
+                } else if is_dir {
+                    match root_candidate.as_ref() {
+                        None => *root_candidate = Some(name.to_string()),
+                        Some(existing) if existing != name => *seen_other_root = true,
+                        _ => {}
                     }
                 } else {
-                    let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
-                    let reader: Box<dyn Read> = match kind_clone {
-                        core::ContainerKind::TarBz2 => {
-                            Box::new(bzip2::read::BzDecoder::new(reader))
-                        }
-                        core::ContainerKind::TarGz => {
-                            Box::new(flate2::read::GzDecoder::new(reader))
-                        }
-                        core::ContainerKind::Tar => Box::new(reader),
-                        _ => unreachable!(),
-                    };
-                    let mut archive = tar::Archive::new(reader);
-                    let entries = match archive.entries() {
-                        Ok(entries) => entries,
-                        Err(e) => {
-                            let _ = tx.send(core::DirBatch::Error(format!(
-                                "Failed to read archive: {e}"
-                            )));
-                            if let Some(ref wake) = wake {
-                                wake();
-                            }
-                            return;
-                        }
-                    };
-
-                    for entry in entries.flatten() {
-                        let path = match entry.path() {
-                            Ok(path) => path,
-                            Err(_) => continue,
-                        };
-                        let entry_is_dir = entry.header().entry_type().is_dir();
-                        let name = fileman::core::normalize_archive_path(&path);
-                        if name.is_empty() || !name.starts_with(&prefix) {
-                            continue;
-                        }
-                        let rem = &name[prefix.len()..];
-                        if rem.is_empty() {
-                            continue;
-                        }
-                        if !decided && cwd_clone.is_empty() {
-                            buffered.push((name.clone(), entry_is_dir));
-                            if let Some(slash) = rem.find('/') {
-                                let root = rem[..slash].to_string();
-                                match root_candidate.as_ref() {
-                                    None => root_candidate = Some(root),
-                                    Some(existing) if existing != &root => seen_other_root = true,
-                                    _ => {}
-                                }
-                            } else if entry_is_dir {
-                                match root_candidate.as_ref() {
-                                    None => root_candidate = Some(rem.to_string()),
-                                    Some(existing) if existing != rem => seen_other_root = true,
-                                    _ => {}
-                                }
-                            } else {
-                                seen_root_file = true;
-                            }
-
-                            if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
-                                decided = true;
-                                if !seen_root_file && !seen_other_root {
-                                    implicit_root = root_candidate.clone();
-                                }
-                                send_root(&implicit_root);
-                                let root_ref = implicit_root
-                                    .as_ref()
-                                    .map(|root| format!("{}/", root.trim_end_matches('/')));
-                                for (buffered_name, buffered_is_dir) in buffered.drain(..) {
-                                    let mut ctx = TarEmitContext {
-                                        implicit_prefix: root_ref.as_deref(),
-                                        cwd: &cwd_clone,
-                                        kind: kind_clone,
-                                        archive_path: archive_clone.as_path(),
-                                        pending: &mut pending,
-                                        seen_dirs: &mut seen_dirs,
-                                        seen_files: &mut seen_files,
-                                        loaded: &mut loaded,
-                                    };
-                                    emit_name(&buffered_name, buffered_is_dir, &mut ctx);
-                                }
-                            } else {
-                                continue;
-                            }
-                        } else {
-                            let root_ref = implicit_root
-                                .as_ref()
-                                .map(|root| format!("{}/", root.trim_end_matches('/')));
-                            let emit_name_raw = if cwd_clone.is_empty() {
-                                name.as_str()
-                            } else {
-                                rem
-                            };
-                            let mut ctx = TarEmitContext {
-                                implicit_prefix: root_ref.as_deref(),
-                                cwd: &cwd_clone,
-                                kind: kind_clone,
-                                archive_path: archive_clone.as_path(),
-                                pending: &mut pending,
-                                seen_dirs: &mut seen_dirs,
-                                seen_files: &mut seen_files,
-                                loaded: &mut loaded,
-                            };
-                            emit_name(emit_name_raw, entry_is_dir, &mut ctx);
-                        }
-
-                        if pending.len() >= BATCH || (!sent_first && !pending.is_empty()) {
-                            let _ = tx.send(core::DirBatch::Append(pending));
-                            pending = Vec::new();
-                            sent_first = true;
-                            let _ = tx.send(core::DirBatch::Progress {
-                                loaded,
-                                total: None,
-                            });
-                            if let Some(ref wake) = wake {
-                                wake();
-                            }
-                        }
-                    }
+                    *seen_root_file = true;
                 }
+            }
 
-                if !decided && cwd_clone.is_empty() {
-                    if !seen_root_file && !seen_other_root {
-                        implicit_root = root_candidate.clone();
-                    }
-                    let root_ref = implicit_root
-                        .as_ref()
-                        .map(|root| format!("{}/", root.trim_end_matches('/')));
-                    for (buffered_name, buffered_is_dir) in buffered.drain(..) {
-                        let mut ctx = TarEmitContext {
-                            implicit_prefix: root_ref.as_deref(),
-                            cwd: &cwd_clone,
-                            kind: kind_clone,
-                            archive_path: archive_clone.as_path(),
-                            pending: &mut pending,
-                            seen_dirs: &mut seen_dirs,
-                            seen_files: &mut seen_files,
-                            loaded: &mut loaded,
-                        };
-                        emit_name(&buffered_name, buffered_is_dir, &mut ctx);
-                    }
+            fn flush_batch(
+                shared: &std::sync::Mutex<app_state::ArchiveFullIndex>,
+                batch: &mut Vec<(String, bool, Option<u64>)>,
+                root: &Option<String>,
+                wake: &Option<Arc<dyn Fn() + Send + Sync>>,
+            ) {
+                if batch.is_empty() {
+                    return;
                 }
-
-                send_root(&implicit_root);
-                if !pending.is_empty() {
-                    let _ = tx.send(core::DirBatch::Append(pending));
-                    if let Some(ref wake) = wake {
-                        wake();
-                    }
+                let mut idx = shared.lock().unwrap();
+                idx.entries.append(batch);
+                if idx.root.is_none() && root.is_some() {
+                    idx.root = root.clone();
                 }
-                let _ = tx.send(core::DirBatch::Progress {
-                    loaded,
-                    total: Some(loaded),
-                });
-                if let Some(ref wake) = wake {
+                drop(idx);
+                if let Some(wake) = wake {
                     wake();
                 }
-            });
-        } else {
-            thread::spawn(move || {
-                let all = match core::read_container_directory_with_progress(
-                    kind_clone,
-                    &archive_clone,
-                    &cwd_clone,
-                    |loaded| {
-                        let _ = tx.send(core::DirBatch::Progress {
-                            loaded,
-                            total: None,
-                        });
-                        if let Some(ref wake) = wake {
-                            wake();
-                        }
-                    },
-                ) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        eprintln!("Failed to read container: {e}");
-                        let _ = tx.send(core::DirBatch::Error(format!(
-                            "Failed to read archive: {e}"
-                        )));
+            }
+
+            if kind_clone == core::ContainerKind::Zip {
+                let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
+                let mut zip = match zip::ZipArchive::new(reader) {
+                    Ok(zip) => zip,
+                    Err(_e) => {
+                        let mut idx = shared.lock().unwrap();
+                        idx.complete = true;
                         if let Some(ref wake) = wake {
                             wake();
                         }
                         return;
                     }
                 };
-                let total = all.len();
-                let initial = all.iter().take(128).cloned().collect::<Vec<_>>();
-                let loaded = initial.len().min(total);
-                if !initial.is_empty() {
-                    let _ = tx.send(core::DirBatch::Replace(initial));
-                    let _ = tx.send(core::DirBatch::Progress {
-                        loaded,
-                        total: Some(total),
-                    });
-                    if let Some(ref wake) = wake {
-                        wake();
+                for i in 0..zip.len() {
+                    let entry = match zip.by_index(i) {
+                        Ok(entry) => entry,
+                        Err(_) => continue,
+                    };
+                    let entry_is_dir = entry.is_dir();
+                    let entry_size = if entry_is_dir {
+                        None
+                    } else {
+                        Some(entry.size())
+                    };
+                    let name = core::normalize_archive_path(Path::new(entry.name()));
+                    if name.is_empty() {
+                        continue;
+                    }
+
+                    if !decided {
+                        buffered.push((name.clone(), entry_is_dir, entry_size));
+                        detect_root_from_entry(
+                            &name,
+                            entry_is_dir,
+                            &mut root_candidate,
+                            &mut seen_root_file,
+                            &mut seen_other_root,
+                        );
+                        if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
+                            decided = true;
+                            implicit_root =
+                                decide_root(&root_candidate, seen_root_file, seen_other_root);
+                            batch_buf.append(&mut buffered);
+                            flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
+                        }
+                    } else {
+                        batch_buf.push((name, entry_is_dir, entry_size));
+                        if batch_buf.len() >= BATCH {
+                            flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
+                        }
                     }
                 }
-                thread::spawn(move || {
-                    let chunk = 500usize;
-                    let mut start = 128.min(all.len());
-                    while start < all.len() {
-                        let end = (start + chunk).min(all.len());
-                        let _ = tx.send(core::DirBatch::Append(all[start..end].to_vec()));
-                        let _ = tx.send(core::DirBatch::Progress {
-                            loaded: end,
-                            total: Some(total),
-                        });
+            } else {
+                let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
+                let reader: Box<dyn Read> = match kind_clone {
+                    core::ContainerKind::TarBz2 => Box::new(bzip2::read::BzDecoder::new(reader)),
+                    core::ContainerKind::TarGz => Box::new(flate2::read::GzDecoder::new(reader)),
+                    core::ContainerKind::Tar => Box::new(reader),
+                    _ => unreachable!(),
+                };
+                let mut archive = tar::Archive::new(reader);
+                let entries = match archive.entries() {
+                    Ok(entries) => entries,
+                    Err(_e) => {
+                        let mut idx = shared.lock().unwrap();
+                        idx.complete = true;
                         if let Some(ref wake) = wake {
                             wake();
                         }
-                        start = end;
+                        return;
                     }
-                });
-            });
-        }
+                };
+
+                for entry in entries.flatten() {
+                    let path = match entry.path() {
+                        Ok(path) => path,
+                        Err(_) => continue,
+                    };
+                    let entry_is_dir = entry.header().entry_type().is_dir();
+                    let entry_size = if entry_is_dir {
+                        None
+                    } else {
+                        Some(entry.size())
+                    };
+                    let name = fileman::core::normalize_archive_path(&path);
+                    if name.is_empty() {
+                        continue;
+                    }
+
+                    if !decided {
+                        buffered.push((name.clone(), entry_is_dir, entry_size));
+                        detect_root_from_entry(
+                            &name,
+                            entry_is_dir,
+                            &mut root_candidate,
+                            &mut seen_root_file,
+                            &mut seen_other_root,
+                        );
+                        if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
+                            decided = true;
+                            implicit_root =
+                                decide_root(&root_candidate, seen_root_file, seen_other_root);
+                            batch_buf.append(&mut buffered);
+                            flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
+                        }
+                    } else {
+                        batch_buf.push((name, entry_is_dir, entry_size));
+                        if batch_buf.len() >= BATCH {
+                            flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
+                        }
+                    }
+                }
+            }
+
+            // Flush remaining buffered entries (pre-decide phase never triggered)
+            if !decided {
+                implicit_root = decide_root(&root_candidate, seen_root_file, seen_other_root);
+                batch_buf.append(&mut buffered);
+            }
+            // Flush remaining batch
+            flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
+
+            // Mark complete
+            {
+                let mut idx = shared.lock().unwrap();
+                if idx.root.is_none() && implicit_root.is_some() {
+                    idx.root = implicit_root;
+                }
+                idx.complete = true;
+            }
+            if let Some(ref wake) = wake {
+                wake();
+            }
+        });
     }
 
     let remembered = prefer_name.clone().or_else(|| {
@@ -1570,6 +1569,17 @@ fn load_container_directory_async(
             .get(&(archive_path.clone(), cwd.clone(), kind))
             .cloned()
     });
+
+    // Get current index entry count for index_last_seen
+    let index_entry_count = if used_index || watching {
+        app.archive_index
+            .get(&archive_path)
+            .map(|shared| shared.lock().unwrap().entries.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
     let panel_state = app.panel_mut(target_panel);
     let browser = &mut panel_state.browser;
     let initial_loading = cached
@@ -1595,10 +1605,24 @@ fn load_container_directory_async(
     }
     browser.inline_rename = None;
     browser.dir_token = browser.dir_token.wrapping_add(1);
-    browser.entries_rx = resume_rx.or(if skip_loading { None } else { Some(rx) });
+    browser.entries_rx = resume_rx.or(None);
     browser.prefer_select_name = remembered;
-    browser.loading = initial_loading;
-    browser.loading_progress = cached.and_then(|cache| cache.loading_progress);
+    browser.watching_archive = if watching {
+        Some(archive_path.clone())
+    } else {
+        None
+    };
+    browser.index_last_seen = index_entry_count;
+    browser.loading = if used_index && !watching {
+        false
+    } else {
+        initial_loading
+    };
+    browser.loading_progress = if used_index {
+        None
+    } else {
+        cached.and_then(|cache| cache.loading_progress)
+    };
 }
 
 fn should_show_preview(app: &app_state::AppState, panel_side: core::ActivePanel) -> bool {
@@ -2195,6 +2219,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     inline_rename: None,
                     sort_mode: core::SortMode::Name,
                     sort_desc: false,
+                    watching_archive: None,
+                    index_last_seen: 0,
                 },
                 mode: app_state::PanelMode::Browser,
             },
@@ -2216,6 +2242,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     inline_rename: None,
                     sort_mode: core::SortMode::Name,
                     sort_desc: false,
+                    watching_archive: None,
+                    index_last_seen: 0,
                 },
                 mode: app_state::PanelMode::Browser,
             },
@@ -2243,6 +2271,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             fs_last_selected_name: Default::default(),
             container_last_selected_name: Default::default(),
             container_dir_cache: Default::default(),
+            archive_index: Default::default(),
             props_dialog: None,
             theme: theme::Theme::dark(),
             theme_picker_open: false,
@@ -2651,12 +2680,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         if event.state == winit::event::ElementState::Released
                 );
                 let event_response = runtime.egui_state.on_window_event(&runtime.window, &other);
-                if event_response.repaint {
-                    if !is_key_release {
-                        runtime.needs_redraw = true;
-                    }
+                if event_response.repaint && !is_key_release {
+                    runtime.needs_redraw = true;
                 }
                 if event_response.consumed {
+                    runtime.needs_redraw = false;
                     if !is_key_release {
                         runtime.window.request_redraw();
                     }
@@ -2957,6 +2985,16 @@ fn draw_root_ui(render: UiRender<'_>) {
     }
     if app.io_in_flight > 0 {
         ui::modals::draw_progress_modal(ctx, app);
+    }
+
+    // Animate loading indicators at ~3fps
+    let any_loading = app.left_panel.browser.loading
+        || app.right_panel.browser.loading
+        || app
+            .preview_panel()
+            .is_some_and(|p| p.loading_since.is_some());
+    if any_loading {
+        ctx.request_repaint_after(std::time::Duration::from_millis(333));
     }
 }
 

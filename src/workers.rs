@@ -272,9 +272,9 @@ pub fn start_preview_worker(
 }
 
 fn preview_request_id(request: &PreviewRequest) -> u64 {
-    match request {
-        PreviewRequest::Read { id, .. } => *id,
-        PreviewRequest::ListContainer { id, .. } => *id,
+    match *request {
+        PreviewRequest::Read { id, .. } => id,
+        PreviewRequest::ListContainer { id, .. } => id,
     }
 }
 
@@ -348,6 +348,7 @@ fn send_streaming_preview<R: Read>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_container_preview(
     tx: &mpsc::Sender<(u64, PreviewContent)>,
     current_id: &std::sync::atomic::AtomicU64,

@@ -288,18 +288,27 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                         if image_cache.pending.insert(key.clone()) {
                                             let _ = image_req_tx.send(request);
                                         }
+                                        let t = ui.ctx().input(|i| i.time);
+                                        let spinner =
+                                            ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
                                         ui.colored_label(
                                             text_color,
-                                            format!("Loading image...\n{}", key),
+                                            format!("{spinner} Loading image...\n{}", key),
                                         );
                                         ui.ctx().request_repaint_after(
-                                            std::time::Duration::from_millis(120),
+                                            std::time::Duration::from_millis(333),
                                         );
                                     }
                                 }
                                 None => {
                                     if preview.loading_since.is_some() {
-                                        ui.colored_label(text_color, "Loading preview...");
+                                        let t = ui.ctx().input(|i| i.time);
+                                        let spinner =
+                                            ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
+                                        ui.colored_label(
+                                            text_color,
+                                            format!("{spinner} Loading preview..."),
+                                        );
                                     } else {
                                         ui.colored_label(text_color, "No preview");
                                     }

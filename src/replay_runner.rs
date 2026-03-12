@@ -168,6 +168,8 @@ fn is_app_pending(app: &app_state::AppState) -> bool {
         || right.loading
         || left.entries_rx.is_some()
         || right.entries_rx.is_some()
+        || left.watching_archive.is_some()
+        || right.watching_archive.is_some()
         || edit_loading
         || search_running
         || !app.dir_size_pending.is_empty()
@@ -275,6 +277,8 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 inline_rename: None,
                 sort_mode: core::SortMode::Name,
                 sort_desc: false,
+                watching_archive: None,
+                index_last_seen: 0,
             },
             mode: app_state::PanelMode::Browser,
         },
@@ -296,6 +300,8 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 inline_rename: None,
                 sort_mode: core::SortMode::Name,
                 sort_desc: false,
+                watching_archive: None,
+                index_last_seen: 0,
             },
             mode: app_state::PanelMode::Browser,
         },
@@ -318,6 +324,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         fs_last_selected_name: Default::default(),
         container_last_selected_name: Default::default(),
         container_dir_cache: Default::default(),
+        archive_index: Default::default(),
         props_dialog: None,
         theme: theme::Theme::dark(),
         theme_picker_open: false,
