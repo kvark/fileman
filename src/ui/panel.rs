@@ -389,7 +389,7 @@ pub fn draw_panel(
                                         colors.row_bg_selected_inactive
                                     }
                                 } else if stripe {
-                                    theme::Color::rgba(0.0, 0.0, 0.0, 0.06)
+                                    colors.row_bg_stripe
                                 } else {
                                     theme::Color::rgba(0.0, 0.0, 0.0, 0.0)
                                 };
