@@ -1,6 +1,6 @@
 use std::sync::mpsc;
 
-use fileman::{app_state, core, theme};
+use fileman::{app_state, archive, core, theme};
 
 use crate::input::open_selected;
 use crate::{
@@ -8,6 +8,100 @@ use crate::{
     fade_color, panel_path_display, reload_panel, resort_browser_entries, sort_mode_label,
     window_rows_for,
 };
+
+/// Draw a file-type icon at `center` using the painter.
+fn draw_file_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: egui::Color32,
+    entry: &core::DirEntry,
+) {
+    let s = 4.5_f32; // half-size of the icon
+    if entry.name == ".." {
+        // Up arrow: ↑
+        let tip = center + egui::Vec2::new(0.0, -s);
+        let bl = center + egui::Vec2::new(-s * 0.7, s * 0.4);
+        let br = center + egui::Vec2::new(s * 0.7, s * 0.4);
+        painter.add(egui::Shape::convex_polygon(
+            vec![tip, br, bl],
+            color,
+            egui::Stroke::NONE,
+        ));
+    } else if entry.is_dir {
+        // Folder: rectangle with a tab on top-left
+        let r = egui::Rect::from_center_size(
+            center + egui::Vec2::new(0.0, 1.0),
+            egui::Vec2::new(s * 2.0, s * 1.4),
+        );
+        painter.rect_filled(r, egui::CornerRadius::same(1), color);
+        // Tab
+        let tab = egui::Rect::from_min_size(
+            egui::pos2(r.left(), r.top() - 2.5),
+            egui::Vec2::new(s * 0.9, 2.5),
+        );
+        painter.rect_filled(tab, egui::CornerRadius::same(1), color);
+    } else if archive::is_container_path(std::path::Path::new(&entry.name)) {
+        // Archive: box with horizontal stripes
+        let r = egui::Rect::from_center_size(center, egui::Vec2::splat(s * 2.0));
+        painter.rect_stroke(r, egui::CornerRadius::same(1), egui::Stroke::new(1.2, color), egui::StrokeKind::Middle);
+        for dy in [-2.0_f32, 0.0, 2.0] {
+            let y = center.y + dy;
+            painter.line_segment(
+                [egui::pos2(r.left() + 1.5, y), egui::pos2(r.right() - 1.5, y)],
+                egui::Stroke::new(0.8, color),
+            );
+        }
+    } else if core::is_image_name(&entry.name) {
+        // Image: square frame with a small diamond inside
+        let r = egui::Rect::from_center_size(center, egui::Vec2::splat(s * 2.0));
+        painter.rect_stroke(r, egui::CornerRadius::same(1), egui::Stroke::new(1.2, color), egui::StrokeKind::Middle);
+        let d = s * 0.5;
+        let diamond = vec![
+            center + egui::Vec2::new(0.0, -d),
+            center + egui::Vec2::new(d, 0.0),
+            center + egui::Vec2::new(0.0, d),
+            center + egui::Vec2::new(-d, 0.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(diamond, color, egui::Stroke::NONE));
+    } else if core::is_audio_name(&entry.name) || core::is_video_name(&entry.name) {
+        // Media: play triangle
+        let left = center.x - s * 0.6;
+        let right = center.x + s * 0.8;
+        let top = center.y - s;
+        let bot = center.y + s;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(left, top),
+                egui::pos2(right, center.y),
+                egui::pos2(left, bot),
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+    } else if core::is_text_name(&entry.name) {
+        // Text: three horizontal lines
+        let w = s * 0.85;
+        for dy in [-2.5_f32, 0.0, 2.5] {
+            let y = center.y + dy;
+            painter.line_segment(
+                [egui::pos2(center.x - w, y), egui::pos2(center.x + w, y)],
+                egui::Stroke::new(1.2, color),
+            );
+        }
+    } else {
+        // Generic file: page with folded corner
+        let r = egui::Rect::from_center_size(center, egui::Vec2::new(s * 1.6, s * 2.0));
+        painter.rect_stroke(r, egui::CornerRadius::same(1), egui::Stroke::new(1.2, color), egui::StrokeKind::Middle);
+        // Folded corner
+        let fold = s * 0.5;
+        let corner = vec![
+            egui::pos2(r.right() - fold, r.top()),
+            egui::pos2(r.right(), r.top() + fold),
+            egui::pos2(r.right() - fold, r.top() + fold),
+        ];
+        painter.add(egui::Shape::convex_polygon(corner, color, egui::Stroke::NONE));
+    }
+}
 
 pub fn draw_panel(
     ui: &mut egui::Ui,
@@ -336,11 +430,7 @@ pub fn draw_panel(
                                     color32(bg),
                                 );
 
-                                let icon_size = egui::Vec2::splat(10.0);
-                                let icon_pos = rect.left_center()
-                                    - egui::Vec2::new(0.0, icon_size.y * 0.5)
-                                    + egui::Vec2::new(6.0, 0.0);
-                                let icon_rect = egui::Rect::from_min_size(icon_pos, icon_size);
+                                let font_id = egui::TextStyle::Body.resolve(ui.style());
                                 let icon_color = if entry.is_dir {
                                     colors.panel_border_active
                                 } else if is_selected {
@@ -355,13 +445,12 @@ pub fn draw_panel(
                                 } else {
                                     icon_color
                                 };
-                                ui.painter().rect_filled(
-                                    icon_rect,
-                                    egui::CornerRadius::same(2),
-                                    color32(icon_color),
-                                );
+                                let ic = color32(icon_color);
+                                let center =
+                                    egui::pos2(rect.left() + 12.0, rect.center().y);
+                                let painter = ui.painter();
+                                draw_file_icon(painter, center, ic, &entry);
 
-                                let font_id = egui::TextStyle::Body.resolve(ui.style());
                                 let mut size_text =
                                     entry.size.map(core::format_size).unwrap_or_default();
                                 if size_text.is_empty()
