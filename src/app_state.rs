@@ -633,6 +633,7 @@ impl AppState {
             DirEntry {
                 name: candidate.clone(),
                 is_dir: false,
+                is_symlink: false,
                 location: EntryLocation::Fs(new_path),
                 size: None,
                 modified: None,

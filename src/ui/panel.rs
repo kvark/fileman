@@ -43,18 +43,31 @@ fn draw_file_icon(
     } else if archive::is_container_path(std::path::Path::new(&entry.name)) {
         // Archive: box with horizontal stripes
         let r = egui::Rect::from_center_size(center, egui::Vec2::splat(s * 2.0));
-        painter.rect_stroke(r, egui::CornerRadius::same(1), egui::Stroke::new(1.2, color), egui::StrokeKind::Middle);
+        painter.rect_stroke(
+            r,
+            egui::CornerRadius::same(1),
+            egui::Stroke::new(1.2, color),
+            egui::StrokeKind::Middle,
+        );
         for dy in [-2.0_f32, 0.0, 2.0] {
             let y = center.y + dy;
             painter.line_segment(
-                [egui::pos2(r.left() + 1.5, y), egui::pos2(r.right() - 1.5, y)],
+                [
+                    egui::pos2(r.left() + 1.5, y),
+                    egui::pos2(r.right() - 1.5, y),
+                ],
                 egui::Stroke::new(0.8, color),
             );
         }
     } else if core::is_image_name(&entry.name) {
         // Image: square frame with a small diamond inside
         let r = egui::Rect::from_center_size(center, egui::Vec2::splat(s * 2.0));
-        painter.rect_stroke(r, egui::CornerRadius::same(1), egui::Stroke::new(1.2, color), egui::StrokeKind::Middle);
+        painter.rect_stroke(
+            r,
+            egui::CornerRadius::same(1),
+            egui::Stroke::new(1.2, color),
+            egui::StrokeKind::Middle,
+        );
         let d = s * 0.5;
         let diamond = vec![
             center + egui::Vec2::new(0.0, -d),
@@ -62,7 +75,11 @@ fn draw_file_icon(
             center + egui::Vec2::new(0.0, d),
             center + egui::Vec2::new(-d, 0.0),
         ];
-        painter.add(egui::Shape::convex_polygon(diamond, color, egui::Stroke::NONE));
+        painter.add(egui::Shape::convex_polygon(
+            diamond,
+            color,
+            egui::Stroke::NONE,
+        ));
     } else if core::is_audio_name(&entry.name) || core::is_video_name(&entry.name) {
         // Media: play triangle
         let left = center.x - s * 0.6;
@@ -91,7 +108,12 @@ fn draw_file_icon(
     } else {
         // Generic file: page with folded corner
         let r = egui::Rect::from_center_size(center, egui::Vec2::new(s * 1.6, s * 2.0));
-        painter.rect_stroke(r, egui::CornerRadius::same(1), egui::Stroke::new(1.2, color), egui::StrokeKind::Middle);
+        painter.rect_stroke(
+            r,
+            egui::CornerRadius::same(1),
+            egui::Stroke::new(1.2, color),
+            egui::StrokeKind::Middle,
+        );
         // Folded corner
         let fold = s * 0.5;
         let corner = vec![
@@ -99,7 +121,11 @@ fn draw_file_icon(
             egui::pos2(r.right(), r.top() + fold),
             egui::pos2(r.right() - fold, r.top() + fold),
         ];
-        painter.add(egui::Shape::convex_polygon(corner, color, egui::Stroke::NONE));
+        painter.add(egui::Shape::convex_polygon(
+            corner,
+            color,
+            egui::Stroke::NONE,
+        ));
     }
 }
 
@@ -446,8 +472,7 @@ pub fn draw_panel(
                                     icon_color
                                 };
                                 let ic = color32(icon_color);
-                                let center =
-                                    egui::pos2(rect.left() + 12.0, rect.center().y);
+                                let center = egui::pos2(rect.left() + 12.0, rect.center().y);
                                 let painter = ui.painter();
                                 draw_file_icon(painter, center, ic, &entry);
 
@@ -505,10 +530,15 @@ pub fn draw_panel(
                                         },
                                     );
                                 } else {
+                                    let display_name = if entry.is_symlink {
+                                        format!("{} ->", entry.name)
+                                    } else {
+                                        entry.name.clone()
+                                    };
                                     ui.painter().with_clip_rect(name_rect).text(
                                         name_min,
                                         egui::Align2::LEFT_CENTER,
-                                        entry.name.as_str(),
+                                        display_name,
                                         font_id,
                                         color32(fg),
                                     );

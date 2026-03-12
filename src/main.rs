@@ -492,6 +492,7 @@ fn rebuild_search_entries(browser: &mut app_state::BrowserState, results: &[core
             core::DirEntry {
                 name: display_name,
                 is_dir: result.is_dir,
+                is_symlink: false,
                 location: core::EntryLocation::Fs(result.path.clone()),
                 size: result.size,
                 modified: result.modified,
@@ -603,6 +604,7 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
             browser.entries = vec![core::DirEntry {
                 name: message,
                 is_dir: false,
+                is_symlink: false,
                 location: core::EntryLocation::Fs(browser.current_path.clone()),
                 size: None,
                 modified: None,
@@ -690,8 +692,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                     let cwd = cwd.clone();
                     let archive_path = archive_path.clone();
                     let idx = shared.lock().unwrap();
-                    let mut listing =
-                        build_listing_from_index(&idx, &archive_path, kind, &cwd);
+                    let mut listing = build_listing_from_index(&idx, &archive_path, kind, &cwd);
                     drop(idx);
                     sort_entries(&mut listing, browser.sort_mode, browser.sort_desc);
                     // Only replace entries if the filtered listing actually changed.
@@ -704,12 +705,10 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                             .entries
                             .get(browser.selected_index)
                             .map(|e| e.name.clone());
-                        let restore_name =
-                            browser.prefer_select_name.take().or(prior_name);
+                        let restore_name = browser.prefer_select_name.take().or(prior_name);
                         browser.entries = listing;
                         if let Some(ref pref) = restore_name
-                            && let Some(pos) =
-                                browser.entries.iter().position(|e| e.name == *pref)
+                            && let Some(pos) = browser.entries.iter().position(|e| e.name == *pref)
                         {
                             browser.selected_index = pos;
                         }
@@ -856,6 +855,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                     browser.entries.push(core::DirEntry {
                         name: display_name,
                         is_dir: result.is_dir,
+                        is_symlink: false,
                         location: core::EntryLocation::Fs(result.path),
                         size: result.size,
                         modified: result.modified,
@@ -916,6 +916,7 @@ fn load_fs_directory_async(
         initial.push(core::DirEntry {
             name: "..".to_string(),
             is_dir: true,
+            is_symlink: false,
             location: core::EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
             size: None,
             modified: None,
@@ -936,8 +937,18 @@ fn load_fs_directory_async(
             match rd.next() {
                 Some(Ok(entry)) => {
                     let file_name = entry.file_name().to_string_lossy().to_string();
-                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                    let metadata = entry.metadata().ok();
+                    let ft = entry.file_type().ok();
+                    let is_symlink = ft.as_ref().map(|f| f.is_symlink()).unwrap_or(false);
+                    let metadata = if is_symlink {
+                        fs::metadata(entry.path()).ok()
+                    } else {
+                        entry.metadata().ok()
+                    };
+                    let is_dir = if is_symlink {
+                        metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)
+                    } else {
+                        ft.map(|f| f.is_dir()).unwrap_or(false)
+                    };
                     let size = if is_dir {
                         dir_sizes_snapshot.get(&entry.path()).copied()
                     } else {
@@ -950,6 +961,7 @@ fn load_fs_directory_async(
                     snapshot.push(core::DirEntry {
                         name: file_name,
                         is_dir,
+                        is_symlink,
                         location: core::EntryLocation::Fs(entry.path()),
                         size,
                         modified,
@@ -967,8 +979,17 @@ fn load_fs_directory_async(
             for entry in rd.flatten() {
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if let Ok(file_type) = entry.file_type() {
-                    let is_dir = file_type.is_dir();
-                    let metadata = entry.metadata().ok();
+                    let is_symlink = file_type.is_symlink();
+                    let metadata = if is_symlink {
+                        fs::metadata(entry.path()).ok()
+                    } else {
+                        entry.metadata().ok()
+                    };
+                    let is_dir = if is_symlink {
+                        metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)
+                    } else {
+                        file_type.is_dir()
+                    };
                     let size = if is_dir {
                         dir_sizes_snapshot.get(&entry.path()).copied()
                     } else {
@@ -981,6 +1002,7 @@ fn load_fs_directory_async(
                     all.push(core::DirEntry {
                         name: file_name,
                         is_dir,
+                        is_symlink,
                         location: core::EntryLocation::Fs(entry.path()),
                         size,
                         modified,
@@ -992,6 +1014,7 @@ fn load_fs_directory_async(
                 sorted.push(core::DirEntry {
                     name: "..".to_string(),
                     is_dir: true,
+                    is_symlink: false,
                     location: core::EntryLocation::Fs(parent.to_path_buf()),
                     size: None,
                     modified: None,
@@ -1022,8 +1045,17 @@ fn load_fs_directory_async(
                 for entry in read_dir.flatten() {
                     let file_name = entry.file_name().to_string_lossy().to_string();
                     if let Ok(file_type) = entry.file_type() {
-                        let is_dir = file_type.is_dir();
-                        let metadata = entry.metadata().ok();
+                        let is_symlink = file_type.is_symlink();
+                        let metadata = if is_symlink {
+                            fs::metadata(entry.path()).ok()
+                        } else {
+                            entry.metadata().ok()
+                        };
+                        let is_dir = if is_symlink {
+                            metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)
+                        } else {
+                            file_type.is_dir()
+                        };
                         let size = if is_dir {
                             dir_sizes_fallback.get(&entry.path()).copied()
                         } else {
@@ -1036,6 +1068,7 @@ fn load_fs_directory_async(
                         all.push(core::DirEntry {
                             name: file_name,
                             is_dir,
+                            is_symlink,
                             location: core::EntryLocation::Fs(entry.path()),
                             size,
                             modified,
@@ -1048,6 +1081,7 @@ fn load_fs_directory_async(
                 sorted.push(core::DirEntry {
                     name: "..".to_string(),
                     is_dir: true,
+                    is_symlink: false,
                     location: core::EntryLocation::Fs(parent.to_path_buf()),
                     size: None,
                     modified: None,
@@ -1156,6 +1190,7 @@ fn build_listing_from_index(
         entries.push(core::DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: core::EntryLocation::Container {
                 kind,
                 archive_path: archive_path.to_path_buf(),
@@ -1172,6 +1207,7 @@ fn build_listing_from_index(
         entries.push(core::DirEntry {
             name: "..".into(),
             is_dir: true,
+            is_symlink: false,
             location: core::EntryLocation::Fs(parent),
             size: None,
             modified: None,
@@ -1198,6 +1234,7 @@ fn build_listing_from_index(
         entries.push(core::DirEntry {
             name: d,
             is_dir: true,
+            is_symlink: false,
             location: core::EntryLocation::Container {
                 kind,
                 archive_path: archive_path.to_path_buf(),
@@ -1228,6 +1265,7 @@ fn build_listing_from_index(
         entries.push(core::DirEntry {
             name: f,
             is_dir: false,
+            is_symlink: false,
             location: core::EntryLocation::Container {
                 kind,
                 archive_path: archive_path.to_path_buf(),
@@ -1282,6 +1320,7 @@ fn load_container_directory_async(
             initial.push(core::DirEntry {
                 name: "..".into(),
                 is_dir: true,
+                is_symlink: false,
                 location: core::EntryLocation::Container {
                     kind,
                     archive_path: archive_path.clone(),
@@ -1298,6 +1337,7 @@ fn load_container_directory_async(
             initial.push(core::DirEntry {
                 name: "..".into(),
                 is_dir: true,
+                is_symlink: false,
                 location: core::EntryLocation::Fs(parent),
                 size: None,
                 modified: None,
@@ -1312,9 +1352,7 @@ fn load_container_directory_async(
     // Check if a shared index already exists (even incomplete)
     let mut used_index = false;
     let mut watching = false;
-    if !skip_loading
-        && let Some(shared) = app.archive_index.get(&archive_path).cloned()
-    {
+    if !skip_loading && let Some(shared) = app.archive_index.get(&archive_path).cloned() {
         let idx = shared.lock().unwrap();
         let mut listing = build_listing_from_index(&idx, &archive_path, kind, &cwd);
         let browser = &app.panel(target_panel).browser;
@@ -1745,6 +1783,7 @@ fn apply_panel_snapshot(
                 core::DirEntry {
                     name: display_name,
                     is_dir: result.is_dir,
+                    is_symlink: false,
                     location: core::EntryLocation::Fs(result.path.clone()),
                     size: result.size,
                     modified: result.modified,
