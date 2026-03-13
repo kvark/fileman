@@ -610,7 +610,19 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
             return;
         }
         core::DirBatch::Error(message) => {
-            browser.entries = vec![core::DirEntry {
+            let mut entries = Vec::new();
+            if let Some(parent) = browser.current_path.parent() {
+                entries.push(core::DirEntry {
+                    name: "..".to_string(),
+                    is_dir: true,
+                    is_symlink: false,
+                    link_target: None,
+                    location: core::EntryLocation::Fs(parent.to_path_buf()),
+                    size: None,
+                    modified: None,
+                });
+            }
+            entries.push(core::DirEntry {
                 name: message,
                 is_dir: false,
                 is_symlink: false,
@@ -618,7 +630,8 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
                 location: core::EntryLocation::Fs(browser.current_path.clone()),
                 size: None,
                 modified: None,
-            }];
+            });
+            browser.entries = entries;
             browser.selected_index = 0;
             browser.top_index = 0;
             browser.loading = false;
@@ -1076,46 +1089,55 @@ fn load_fs_directory_async(
         thread::spawn(move || {
             let chunk = 500usize;
             let mut all: Vec<core::DirEntry> = Vec::new();
-            if let Ok(read_dir) = fs::read_dir(&path_clone) {
-                for entry in read_dir.flatten() {
-                    let file_name = entry.file_name().to_string_lossy().to_string();
-                    if let Ok(file_type) = entry.file_type() {
-                        let is_symlink = file_type.is_symlink();
-                        let metadata = if is_symlink {
-                            fs::metadata(entry.path()).ok()
-                        } else {
-                            entry.metadata().ok()
-                        };
-                        let is_dir = if is_symlink {
-                            metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)
-                        } else {
-                            file_type.is_dir()
-                        };
-                        let size = if is_dir {
-                            dir_sizes_fallback.get(&entry.path()).copied()
-                        } else {
-                            metadata.as_ref().map(|m| m.len())
-                        };
-                        let modified = metadata
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs());
-                        let link_target = if is_symlink {
-                            fs::read_link(entry.path())
-                                .ok()
-                                .map(|t| t.to_string_lossy().into_owned())
-                        } else {
-                            None
-                        };
-                        all.push(core::DirEntry {
-                            name: file_name,
-                            is_dir,
-                            is_symlink,
-                            link_target,
-                            location: core::EntryLocation::Fs(entry.path()),
-                            size,
-                            modified,
-                        });
+            match fs::read_dir(&path_clone) {
+                Err(e) => {
+                    let _ = tx.send(core::DirBatch::Error(format!("Cannot read directory: {e}")));
+                    if let Some(ref wake) = wake {
+                        wake();
+                    }
+                    return;
+                }
+                Ok(read_dir) => {
+                    for entry in read_dir.flatten() {
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        if let Ok(file_type) = entry.file_type() {
+                            let is_symlink = file_type.is_symlink();
+                            let metadata = if is_symlink {
+                                fs::metadata(entry.path()).ok()
+                            } else {
+                                entry.metadata().ok()
+                            };
+                            let is_dir = if is_symlink {
+                                metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false)
+                            } else {
+                                file_type.is_dir()
+                            };
+                            let size = if is_dir {
+                                dir_sizes_fallback.get(&entry.path()).copied()
+                            } else {
+                                metadata.as_ref().map(|m| m.len())
+                            };
+                            let modified = metadata
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs());
+                            let link_target = if is_symlink {
+                                fs::read_link(entry.path())
+                                    .ok()
+                                    .map(|t| t.to_string_lossy().into_owned())
+                            } else {
+                                None
+                            };
+                            all.push(core::DirEntry {
+                                name: file_name,
+                                is_dir,
+                                is_symlink,
+                                link_target,
+                                location: core::EntryLocation::Fs(entry.path()),
+                                size,
+                                modified,
+                            });
+                        }
                     }
                 }
             }
