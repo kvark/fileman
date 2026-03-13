@@ -255,10 +255,33 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                             text_color,
                                             format!("Failed to decode image\n{message}"),
                                         );
-                                    } else if let Some(handle) =
+                                    } else if let Some(mut handle) =
                                         image_cache.textures.get(&key).cloned()
                                     {
                                         touch_image(image_cache, &key);
+                                        // Animate GIF: update texture to current frame
+                                        if let Some(anim) = image_cache.animations.get(&key) {
+                                            let time_ms =
+                                                (ui.ctx().input(|i| i.time) * 1000.0) as u64;
+                                            let loop_pos = time_ms % anim.total_duration_ms;
+                                            let mut acc = 0u64;
+                                            let mut frame_idx = 0;
+                                            for (i, delay) in anim.delays.iter().enumerate() {
+                                                acc += *delay as u64;
+                                                if loop_pos < acc {
+                                                    frame_idx = i;
+                                                    break;
+                                                }
+                                            }
+                                            handle.set(
+                                                anim.frames[frame_idx].clone(),
+                                                egui::TextureOptions::LINEAR,
+                                            );
+                                            let remaining = acc.saturating_sub(loop_pos).max(10);
+                                            ui.ctx().request_repaint_after(
+                                                std::time::Duration::from_millis(remaining),
+                                            );
+                                        }
                                         if let Some(meta) = image_cache.meta.get(&key) {
                                             let depth_bits = match meta.depth {
                                                 zune_core::bit_depth::BitDepth::Eight => "8-bit",
@@ -266,11 +289,18 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                                 zune_core::bit_depth::BitDepth::Float32 => "32-bit",
                                                 _ => "unknown",
                                             };
+                                            let anim_info = if let Some(anim) =
+                                                image_cache.animations.get(&key)
+                                            {
+                                                format!(" · {} frames", anim.frames.len())
+                                            } else {
+                                                String::new()
+                                            };
                                             ui.colored_label(
                                                 text_color,
                                                 format!(
-                                                    "{}×{} · {}",
-                                                    meta.width, meta.height, depth_bits
+                                                    "{}×{} · {}{}",
+                                                    meta.width, meta.height, depth_bits, anim_info
                                                 ),
                                             );
                                             ui.add_space(6.0);

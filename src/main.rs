@@ -92,7 +92,7 @@ struct ImageRequest {
 
 struct ImageResult {
     key: String,
-    image: egui::ColorImage,
+    image: image_decode::DecodedImage,
     meta: image_decode::ImageMeta,
 }
 
@@ -122,9 +122,16 @@ struct HighlightResult {
     job: egui::text::LayoutJob,
 }
 
+struct AnimationData {
+    frames: Vec<egui::ColorImage>,
+    delays: Vec<u32>,
+    total_duration_ms: u64,
+}
+
 #[derive(Default)]
 struct ImageCache {
     textures: HashMap<String, egui::TextureHandle>,
+    animations: HashMap<String, AnimationData>,
     meta: HashMap<String, image_decode::ImageMeta>,
     failures: HashMap<String, String>,
     pending: HashSet<String>,
@@ -2194,34 +2201,66 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let proxy = self.proxy.clone();
         thread::spawn(move || {
             while let Ok(req) = image_req_rx.recv() {
-                let image = match req.source {
-                    ImageSource::Fs(path) => std::fs::read(path)
-                        .ok()
-                        .and_then(|data| image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)),
+                let raw_bytes: Option<Vec<u8>> = match req.source {
+                    ImageSource::Fs(ref path) => std::fs::read(path).ok(),
                     ImageSource::Container {
+                        kind,
+                        ref archive_path,
+                        ref inner_path,
+                    } => fileman::core::read_container_bytes_prefix(
                         kind,
                         archive_path,
                         inner_path,
-                    } => {
-                        let bytes = fileman::core::read_container_bytes_prefix(
-                            kind,
-                            &archive_path,
-                            &inner_path,
-                            usize::MAX,
-                        )
-                        .ok();
-                        bytes.and_then(|data| {
-                            image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)
-                        })
-                    }
+                        usize::MAX,
+                    )
+                    .ok(),
                 };
-                if let Some((image, meta)) = image {
-                    let result = ImageResult {
+                let Some(data) = raw_bytes else {
+                    let _ = image_res_tx.send(ImageResponse::Err {
                         key: req.key,
-                        image,
+                        message: "Failed to read image data".to_string(),
+                    });
+                    let _ = proxy.send_event(UserEvent::Wake);
+                    continue;
+                };
+
+                // For animated GIFs: send the first frame immediately, then
+                // decode all frames and send the full animation as a follow-up.
+                if image_decode::is_gif(&data) {
+                    if let Some((first, meta)) =
+                        image_decode::decode_gif_first_frame(&data, MAX_TEXTURE_SIDE)
+                    {
+                        let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                            key: req.key.clone(),
+                            image: image_decode::DecodedImage::Static(first),
+                            meta,
+                        }));
+                        let _ = proxy.send_event(UserEvent::Wake);
+                    }
+                    // Now decode all frames (may take a while for large GIFs)
+                    if let Some((decoded, meta)) =
+                        image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)
+                    {
+                        if matches!(decoded, image_decode::DecodedImage::Animated(_)) {
+                            let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                                key: req.key,
+                                image: decoded,
+                                meta,
+                            }));
+                        }
+                    }
+                    let _ = proxy.send_event(UserEvent::Wake);
+                    continue;
+                }
+
+                if let Some((decoded, meta)) =
+                    image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)
+                {
+                    let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                        key: req.key,
+                        image: decoded,
                         meta,
-                    };
-                    let _ = image_res_tx.send(ImageResponse::Ok(result));
+                    }));
                 } else {
                     let _ = image_res_tx.send(ImageResponse::Err {
                         key: req.key,
@@ -2373,6 +2412,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         };
         let image_cache = ImageCache {
             textures: HashMap::new(),
+            animations: HashMap::new(),
             meta: HashMap::new(),
             failures: HashMap::new(),
             pending: HashSet::new(),
@@ -2481,9 +2521,32 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     for decoded in decoded_images.drain(..) {
                         match decoded {
                             ImageResponse::Ok(decoded) => {
+                                let first_frame = match decoded.image {
+                                    image_decode::DecodedImage::Static(image) => {
+                                        runtime.image_cache.animations.remove(&decoded.key);
+                                        image
+                                    }
+                                    image_decode::DecodedImage::Animated(gif_frames) => {
+                                        let delays: Vec<u32> =
+                                            gif_frames.iter().map(|f| f.delay_ms).collect();
+                                        let total: u64 = delays.iter().map(|d| *d as u64).sum();
+                                        let frames: Vec<egui::ColorImage> =
+                                            gif_frames.into_iter().map(|f| f.image).collect();
+                                        let first = frames[0].clone();
+                                        runtime.image_cache.animations.insert(
+                                            decoded.key.clone(),
+                                            AnimationData {
+                                                frames,
+                                                delays,
+                                                total_duration_ms: total.max(1),
+                                            },
+                                        );
+                                        first
+                                    }
+                                };
                                 let handle = ctx.load_texture(
                                     format!("preview:{}", decoded.key),
-                                    decoded.image,
+                                    first_frame,
                                     egui::TextureOptions::LINEAR,
                                 );
                                 if !runtime.image_cache.textures.contains_key(&decoded.key) {
@@ -2506,6 +2569,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                         runtime.image_cache.textures.remove(&old);
                                         runtime.image_cache.meta.remove(&old);
                                         runtime.image_cache.failures.remove(&old);
+                                        runtime.image_cache.animations.remove(&old);
                                     }
                                 }
                             }

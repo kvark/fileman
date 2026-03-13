@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use fileman::{app_state, core};
+use fileman::{app_state, archive, core};
 
 use crate::{
     ContainerLoadMode, UiCache, active_window_rows, apply_panel_snapshot, cancel_search,
@@ -25,10 +25,46 @@ pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
         }
         browser.entries[browser.selected_index].clone()
     };
-    if let core::EntryLocation::Fs(path) = entry.location
-        && let Err(err) = open_with_default_app(&path)
-    {
-        eprintln!("{err}");
+    match entry.location {
+        core::EntryLocation::Fs(path) => {
+            if let Err(err) = open_with_default_app(&path) {
+                eprintln!("{err}");
+            }
+        }
+        core::EntryLocation::Container {
+            kind,
+            archive_path,
+            inner_path,
+        } => {
+            if entry.is_dir || entry.name == ".." {
+                return;
+            }
+            let display_name = Path::new(&inner_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&entry.name)
+                .to_string();
+            let tmp_dir = std::env::temp_dir().join("fileman_extract");
+            if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+                eprintln!("Failed to create temp dir: {e}");
+                return;
+            }
+            match archive::copy_container_entry(
+                kind,
+                &archive_path,
+                &inner_path,
+                &tmp_dir,
+                &display_name,
+            ) {
+                Ok(()) => {
+                    let extracted = tmp_dir.join(&display_name);
+                    if let Err(err) = open_with_default_app(&extracted) {
+                        eprintln!("{err}");
+                    }
+                }
+                Err(e) => eprintln!("Failed to extract from archive: {e}"),
+            }
+        }
     }
 }
 
