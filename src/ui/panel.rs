@@ -558,16 +558,41 @@ pub fn draw_panel(
                                             }
                                         },
                                     );
-                                } else {
-                                    let display_name = if entry.is_symlink {
-                                        format!("{} ->", entry.name)
+                                } else if entry.is_symlink {
+                                    let arrow_text = format!("{} -> ", entry.name);
+                                    let target_text = entry.link_target.as_deref().unwrap_or("?");
+                                    let is_broken = entry.size.is_none() && !entry.is_dir;
+                                    let target_color = if is_broken {
+                                        color32(theme::Color::rgba(0.9, 0.3, 0.3, 1.0))
                                     } else {
-                                        entry.name.clone()
+                                        color32(fade_color(fg, 0.65))
                                     };
+                                    let galley = ui.painter().layout_no_wrap(
+                                        arrow_text.clone(),
+                                        font_id.clone(),
+                                        color32(fg),
+                                    );
+                                    let arrow_w = galley.size().x;
                                     ui.painter().with_clip_rect(name_rect).text(
                                         name_min,
                                         egui::Align2::LEFT_CENTER,
-                                        display_name,
+                                        arrow_text,
+                                        font_id.clone(),
+                                        color32(fg),
+                                    );
+                                    let target_pos = name_min + egui::Vec2::new(arrow_w, 0.0);
+                                    ui.painter().with_clip_rect(name_rect).text(
+                                        target_pos,
+                                        egui::Align2::LEFT_CENTER,
+                                        target_text,
+                                        font_id,
+                                        target_color,
+                                    );
+                                } else {
+                                    ui.painter().with_clip_rect(name_rect).text(
+                                        name_min,
+                                        egui::Align2::LEFT_CENTER,
+                                        &entry.name,
                                         font_id,
                                         color32(fg),
                                     );
