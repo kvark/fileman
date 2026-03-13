@@ -4,5 +4,6 @@ pub mod help;
 pub mod modals;
 pub mod panel;
 pub mod preview;
+#[cfg(unix)]
 pub mod props_dialog;
 pub mod theme_picker;

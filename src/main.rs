@@ -11,12 +11,13 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     io::Read,
-    os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
     time::UNIX_EPOCH,
 };
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 mod image_decode;
 mod input;
@@ -2021,6 +2022,7 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
     }
 }
 
+#[cfg(unix)]
 fn open_props_dialog(app: &mut app_state::AppState) {
     let panel = app.get_active_panel();
     let browser = &panel.browser;
@@ -2076,6 +2078,7 @@ fn open_props_dialog(app: &mut app_state::AppState) {
     });
 }
 
+#[cfg(unix)]
 fn file_type_label(meta: &std::fs::Metadata) -> String {
     let file_type = meta.file_type();
     if file_type.is_dir() {
@@ -2808,6 +2811,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     {
                         ui::modals::draw_discard_modal(ctx, &mut runtime.app);
                     }
+                    #[cfg(unix)]
                     if runtime.app.props_dialog.is_some() {
                         ui::props_dialog::draw_props_modal(ctx, &mut runtime.app);
                     }
@@ -3212,6 +3216,7 @@ fn draw_root_ui(render: UiRender<'_>) {
     {
         ui::modals::draw_discard_modal(ctx, app);
     }
+    #[cfg(unix)]
     if app.props_dialog.is_some() {
         ui::props_dialog::draw_props_modal(ctx, app);
     }
