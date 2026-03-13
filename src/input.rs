@@ -505,8 +505,9 @@ pub(crate) fn handle_keyboard(
         let page = preview.page_height.max(200.0);
         let mut consumed = false;
         let can_scroll = preview.can_scroll;
+        let max = preview.max_scroll;
         if can_scroll && input.key_pressed(egui::Key::ArrowDown) {
-            preview.scroll += line;
+            preview.scroll = (preview.scroll + line).min(max);
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::ArrowUp) {
@@ -514,7 +515,7 @@ pub(crate) fn handle_keyboard(
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::PageDown) {
-            preview.scroll += page;
+            preview.scroll = (preview.scroll + page).min(max);
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::PageUp) {
@@ -526,7 +527,7 @@ pub(crate) fn handle_keyboard(
             consumed = true;
         }
         if can_scroll && input.key_pressed(egui::Key::End) {
-            preview.scroll += page * 10.0;
+            preview.scroll = max;
             consumed = true;
         }
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));

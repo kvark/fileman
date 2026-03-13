@@ -321,10 +321,14 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                         let t = ui.ctx().input(|i| i.time);
                                         let spinner =
                                             ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
-                                        ui.colored_label(
-                                            text_color,
-                                            format!("{spinner} Loading image...\n{}", key),
-                                        );
+                                        let mono = egui::TextStyle::Monospace.resolve(ui.style());
+                                        let body = egui::TextStyle::Body.resolve(ui.style());
+                                        let mut job = egui::text::LayoutJob::default();
+                                        let fmt_mono = egui::text::TextFormat { font_id: mono, color: text_color, ..Default::default() };
+                                        let fmt_body = egui::text::TextFormat { font_id: body, color: text_color, ..Default::default() };
+                                        job.append(spinner, 0.0, fmt_mono);
+                                        job.append(&format!(" Loading image...\n{}", key), 0.0, fmt_body);
+                                        ui.label(job);
                                         ui.ctx().request_repaint_after(
                                             std::time::Duration::from_millis(333),
                                         );
@@ -335,10 +339,14 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                         let t = ui.ctx().input(|i| i.time);
                                         let spinner =
                                             ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
-                                        ui.colored_label(
-                                            text_color,
-                                            format!("{spinner} Loading preview..."),
-                                        );
+                                        let mono = egui::TextStyle::Monospace.resolve(ui.style());
+                                        let body = egui::TextStyle::Body.resolve(ui.style());
+                                        let mut job = egui::text::LayoutJob::default();
+                                        let fmt_mono = egui::text::TextFormat { font_id: mono, color: text_color, ..Default::default() };
+                                        let fmt_body = egui::text::TextFormat { font_id: body, color: text_color, ..Default::default() };
+                                        job.append(spinner, 0.0, fmt_mono);
+                                        job.append(" Loading preview...", 0.0, fmt_body);
+                                        ui.label(job);
                                     } else {
                                         ui.colored_label(text_color, "No preview");
                                     }
@@ -350,6 +358,7 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
             preview.scroll = output.state.offset.y;
             preview.page_height = page_height;
             preview.line_height = ui.text_style_height(&egui::TextStyle::Body);
+            preview.max_scroll = (output.content_size.y - output.inner_rect.height()).max(0.0);
             preview.can_scroll = output.content_size.y > output.inner_rect.height();
         });
 }
