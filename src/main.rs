@@ -66,9 +66,10 @@ impl UiCache {
         let active = app.active_panel;
         let left_dir = app.left_panel.browser.dir_token;
         let right_dir = app.right_panel.browser.dir_token;
+        // Don't trigger ForceActive on Tab alone — ensure_visible handles
+        // bringing the selection into view without unnecessary re-centering.
         let selection_changed = left_selected != self.last_left_selected
             || right_selected != self.last_right_selected
-            || active != self.last_active_panel
             || left_dir != self.last_left_dir_token
             || right_dir != self.last_right_dir_token;
         self.scroll_mode = if selection_changed {
@@ -627,17 +628,20 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
         core::DirBatch::Replace(new_entries) => {
             browser.entries = new_entries;
             browser.selected_index = 0;
-            browser.top_index = 0;
             browser.loading = false;
         }
     }
 
-    let restore_name = browser.prefer_select_name.take().or(prior_selection);
+    let restore_name = browser.prefer_select_name.clone().or(prior_selection);
     sort_entries(&mut browser.entries, browser.sort_mode, browser.sort_desc);
-    if let Some(pref) = restore_name
-        && let Some(idx) = browser.entries.iter().position(|e| e.name == pref)
+    if let Some(ref pref) = restore_name
+        && let Some(idx) = browser.entries.iter().position(|e| e.name == *pref)
     {
         browser.selected_index = idx;
+        // Only consume the preference once the entry is found
+        if browser.prefer_select_name.as_deref() == Some(pref.as_str()) {
+            browser.prefer_select_name = None;
+        }
     }
     if browser.selected_index < browser.top_index {
         browser.top_index = browser.selected_index;
@@ -910,6 +914,7 @@ fn load_fs_directory_async(
     target_panel: core::ActivePanel,
     prefer_name: Option<String>,
 ) {
+    let same_dir = app.panel(target_panel).browser.current_path == path;
     let mut initial: Vec<core::DirEntry> = Vec::new();
     let mut has_parent_entry = false;
     if path.parent().is_some() {
@@ -970,7 +975,9 @@ fn load_fs_directory_async(
                 Some(Err(_)) | None => break,
             }
         }
-        if !snapshot.is_empty() {
+        // For same-dir reloads, skip the initial Append to avoid transient
+        // duplicates (old entries + appended snapshot) that corrupt ScrollArea state.
+        if !snapshot.is_empty() && !same_dir {
             let _ = tx.send(core::DirBatch::Append(snapshot.clone()));
         }
         thread::spawn(move || {
@@ -1114,11 +1121,14 @@ fn load_fs_directory_async(
     let panel_state = app.panel_mut(target_panel);
     let browser = &mut panel_state.browser;
     let initial_loading = initial.is_empty() || has_parent_entry;
+    if !same_dir {
+        browser.marked.clear();
+        browser.top_index = 0;
+        browser.entries = initial;
+        browser.selected_index = 0;
+    }
     browser.current_path = path.clone();
     browser.browser_mode = core::BrowserMode::Fs;
-    browser.entries = initial;
-    browser.selected_index = 0;
-    browser.top_index = 0;
     browser.inline_rename = None;
     browser.dir_token = browser.dir_token.wrapping_add(1);
     browser.entries_rx = Some(rx);
@@ -1625,6 +1635,11 @@ fn load_container_directory_async(
         .map(|cache| cache.loading)
         .unwrap_or(!skip_loading);
 
+    let same_dir = browser.current_path == archive_path
+        && matches!(&browser.browser_mode, core::BrowserMode::Container { cwd: old_cwd, .. } if *old_cwd == cwd);
+    if !same_dir {
+        browser.marked.clear();
+    }
     browser.current_path = archive_path.clone();
     browser.browser_mode = core::BrowserMode::Container {
         kind,
@@ -1885,7 +1900,11 @@ fn refresh_fs_panels(app: &mut app_state::AppState) {
             continue;
         }
         let path = browser.current_path.clone();
-        load_fs_directory_async(app, path, which, None);
+        let current_name = browser
+            .entries
+            .get(browser.selected_index)
+            .map(|e| e.name.clone());
+        load_fs_directory_async(app, path, which, current_name);
     }
 }
 
@@ -2260,6 +2279,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     sort_desc: false,
                     watching_archive: None,
                     index_last_seen: 0,
+                    marked: std::collections::HashSet::new(),
                 },
                 mode: app_state::PanelMode::Browser,
             },
@@ -2283,6 +2303,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     sort_desc: false,
                     watching_archive: None,
                     index_last_seen: 0,
+                    marked: std::collections::HashSet::new(),
                 },
                 mode: app_state::PanelMode::Browser,
             },
@@ -2436,8 +2457,22 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     highlight_updated = true;
                 }
 
-                let raw_input = runtime.egui_state.take_egui_input(&runtime.window);
+                let mut raw_input = runtime.egui_state.take_egui_input(&runtime.window);
+                // Save key events before stripping them from raw_input.
+                // We handle all keyboard input ourselves; stripping prevents
+                // egui's focus system from moving focus to sort controls etc.
+                let key_events: Vec<egui::Event> = raw_input
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, egui::Event::Key { .. }))
+                    .cloned()
+                    .collect();
+                raw_input
+                    .events
+                    .retain(|e| !matches!(e, egui::Event::Key { .. }));
                 let output = runtime.egui_ctx.run(raw_input, |ctx| {
+                    // Inject key events back into InputState so our handler can read them
+                    ctx.input_mut(|i| i.events.extend(key_events.iter().cloned()));
                     apply_theme(ctx, &runtime.app.theme.colors());
                     let input = ctx.input(|i| i.clone());
                     input::handle_keyboard(ctx, &input, &mut runtime.app, &mut runtime.ui_cache);
@@ -2653,6 +2688,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 runtime
                     .egui_state
                     .handle_platform_output(&runtime.window, output.platform_output);
+                for vo in output.viewport_output.values() {
+                    if vo.repaint_delay.is_zero() {
+                        runtime.needs_redraw = true;
+                    }
+                }
 
                 let paint_jobs = runtime
                     .egui_ctx
