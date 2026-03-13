@@ -527,6 +527,19 @@ pub(crate) fn handle_keyboard(
             }
         }
     }
+    if input.key_pressed(egui::Key::Insert) && active_is_browser {
+        let browser = &mut app.get_active_panel_mut().browser;
+        let idx = browser.selected_index;
+        if idx < browser.entries.len() && browser.entries[idx].name != ".." {
+            let name = browser.entries[idx].name.clone();
+            if !browser.marked.remove(&name) {
+                browser.marked.insert(name);
+            }
+            if idx + 1 < browser.entries.len() {
+                browser.selected_index = idx + 1;
+            }
+        }
+    }
     if input.key_pressed(egui::Key::PageUp) && active_is_browser {
         let browser = &app.get_active_panel().browser;
         let new_index = browser.selected_index.saturating_sub(window_rows);
@@ -565,9 +578,11 @@ pub(crate) fn handle_keyboard(
         .is_some_and(|side| side != app.active_panel);
     if input.key_pressed(egui::Key::F5) && !other_panel_preview {
         app.prepare_copy_selected();
+        ctx.request_repaint();
     }
     if input.key_pressed(egui::Key::F6) && !other_panel_preview {
         app.prepare_move_selected();
+        ctx.request_repaint();
     }
     if input.key_pressed(egui::Key::F4) {
         app.prepare_edit_selected();
@@ -585,15 +600,19 @@ pub(crate) fn handle_keyboard(
     let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
     if shift_f6 {
         app.prepare_rename_selected();
+        ctx.request_repaint();
     }
     if input.key_pressed(egui::Key::F9) {
         app.switch_theme();
+        ctx.request_repaint();
     }
     if input.key_pressed(egui::Key::F10) {
         app.open_theme_picker();
+        ctx.request_repaint();
     }
     if input.key_pressed(egui::Key::F8) {
         app.prepare_delete_selected();
+        ctx.request_repaint();
     }
 }
 
@@ -610,7 +629,9 @@ fn open_parent(app: &mut app_state::AppState, window_rows: usize) {
 
 pub(crate) fn confirm_pending_op(app: &mut app_state::AppState) {
     if let Some(op) = app.take_pending_op() {
-        if let app_state::PendingOp::Delete { target } = &op {
+        if let app_state::PendingOp::Delete { targets } = &op
+            && let Some(first) = targets.first()
+        {
             let panel = app.get_active_panel();
             let browser = &panel.browser;
             let mut next_name: Option<String> = None;
@@ -639,7 +660,7 @@ pub(crate) fn confirm_pending_op(app: &mut app_state::AppState) {
                     }
                 }
             }
-            let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let parent = first.parent().unwrap_or_else(|| std::path::Path::new("."));
             if let Some(next_name) = next_name {
                 app.fs_last_selected_name
                     .insert(parent.to_path_buf(), next_name);
@@ -722,16 +743,24 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
                 let dir = browser.current_path.clone();
                 let path = dir.join(new_name);
                 action = Some(fileman::core::IOTask::WriteFile {
-                    path,
+                    path: path.clone(),
                     contents: Vec::new(),
                 });
                 next_selection = Some((dir, new_name.to_string()));
+                if rename.index < browser.entries.len() {
+                    browser.entries[rename.index].name = new_name.to_string();
+                    browser.entries[rename.index].location = core::EntryLocation::Fs(path);
+                }
             }
             app_state::InlineEditKind::NewDir => {
                 let dir = browser.current_path.clone();
                 let path = dir.join(new_name);
-                action = Some(fileman::core::IOTask::Mkdir { path });
+                action = Some(fileman::core::IOTask::Mkdir { path: path.clone() });
                 next_selection = Some((dir, new_name.to_string()));
+                if rename.index < browser.entries.len() {
+                    browser.entries[rename.index].name = new_name.to_string();
+                    browser.entries[rename.index].location = core::EntryLocation::Fs(path);
+                }
             }
             app_state::InlineEditKind::Rename => {
                 if rename.index < browser.entries.len() {
@@ -765,7 +794,6 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
         if let Some((dir, name)) = next_selection {
             app.fs_last_selected_name.insert(dir, name);
         }
-        refresh_active_panel(app);
     }
     true
 }

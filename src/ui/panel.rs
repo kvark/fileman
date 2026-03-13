@@ -397,14 +397,15 @@ pub fn draw_panel(
                         scroll.show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
                             visible_range = row_range.clone();
                             for idx in row_range {
-                                let (entry, rename_active) = {
+                                let (entry, rename_active, is_marked) = {
                                     let browser = &app.panel(panel_side_for_closure).browser;
                                     let entry = browser.entries[idx].clone();
                                     let rename_active = browser
                                         .inline_rename
                                         .as_ref()
                                         .is_some_and(|rename| rename.index == idx);
-                                    (entry, rename_active)
+                                    let is_marked = browser.marked.contains(&entry.name);
+                                    (entry, rename_active, is_marked)
                                 };
                                 let is_selected = selected_index == idx;
                                 let stripe = idx % 2 == 0;
@@ -419,7 +420,7 @@ pub fn draw_panel(
                                 } else {
                                     theme::Color::rgba(0.0, 0.0, 0.0, 0.0)
                                 };
-                                let fg = if is_selected {
+                                let fg = if is_selected && is_active {
                                     colors.row_fg_selected
                                 } else if is_active {
                                     colors.row_fg_active
@@ -445,6 +446,12 @@ pub fn draw_panel(
                                 if is_hidden && !is_selected {
                                     fg = fade_color(fg, 0.55);
                                 }
+                                // Invert colors for marked entries
+                                let (bg, fg) = if is_marked {
+                                    (fg, colors.preview_bg)
+                                } else {
+                                    (bg, fg)
+                                };
 
                                 let (rect, response) = ui.allocate_exact_size(
                                     egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
@@ -457,7 +464,9 @@ pub fn draw_panel(
                                 );
 
                                 let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                let icon_color = if entry.is_dir {
+                                let icon_color = if is_marked {
+                                    fg
+                                } else if entry.is_dir {
                                     colors.panel_border_active
                                 } else if is_selected {
                                     fg
@@ -466,7 +475,7 @@ pub fn draw_panel(
                                 } else {
                                     fg
                                 };
-                                let icon_color = if is_hidden && !is_selected {
+                                let icon_color = if is_hidden && !is_selected && !is_marked {
                                     fade_color(icon_color, 0.55)
                                 } else {
                                     icon_color
@@ -525,6 +534,26 @@ pub fn draw_panel(
                                             );
                                             if rename.focus {
                                                 response.request_focus();
+                                                if matches!(
+                                                    rename.kind,
+                                                    app_state::InlineEditKind::NewFile
+                                                        | app_state::InlineEditKind::NewDir
+                                                ) && let Some(mut state) =
+                                                    egui::TextEdit::load_state(
+                                                        ui.ctx(),
+                                                        response.id,
+                                                    )
+                                                {
+                                                    state.cursor.set_char_range(Some(
+                                                        egui::text::CCursorRange::two(
+                                                            egui::text::CCursor::new(0),
+                                                            egui::text::CCursor::new(
+                                                                rename.text.len(),
+                                                            ),
+                                                        ),
+                                                    ));
+                                                    state.store(ui.ctx(), response.id);
+                                                }
                                                 rename.focus = false;
                                             }
                                         },

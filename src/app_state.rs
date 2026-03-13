@@ -67,6 +67,7 @@ pub struct BrowserState {
     pub sort_desc: bool,
     pub watching_archive: Option<path::PathBuf>,
     pub index_last_seen: usize,
+    pub marked: std::collections::HashSet<String>,
 }
 
 pub enum InlineEditKind {
@@ -232,18 +233,23 @@ pub struct AppState {
 }
 
 #[derive(Clone)]
+pub struct CopyItem {
+    pub src: EntryLocation,
+    pub kind: CopyKind,
+}
+
+#[derive(Clone)]
 pub enum PendingOp {
     Copy {
-        src: EntryLocation,
+        items: Vec<CopyItem>,
         dst_dir: path::PathBuf,
-        kind: CopyKind,
     },
     Move {
-        src: path::PathBuf,
+        sources: Vec<path::PathBuf>,
         dst_dir: path::PathBuf,
     },
     Delete {
-        target: path::PathBuf,
+        targets: Vec<path::PathBuf>,
     },
     Rename {
         src: path::PathBuf,
@@ -986,87 +992,79 @@ impl AppState {
         self.rename_focus = false;
     }
 
+    fn enqueue_io(&mut self, task: IOTask) {
+        if let Err(e) = self.io_tx.send(task) {
+            eprintln!("Failed to enqueue IO: {e}");
+        } else {
+            self.io_in_flight = self.io_in_flight.saturating_add(1);
+        }
+    }
+
     pub fn enqueue_pending_op(&mut self, op: &PendingOp) {
         match *op {
             PendingOp::Copy {
-                ref src,
+                ref items,
                 ref dst_dir,
-                kind,
             } => {
-                let task = match *src {
-                    EntryLocation::Fs(ref path) => IOTask::Copy {
-                        src: path.clone(),
-                        dst_dir: dst_dir.clone(),
-                    },
-                    EntryLocation::Container {
-                        kind: container_kind,
-                        ref archive_path,
-                        ref inner_path,
-                    } => match kind {
-                        CopyKind::File => IOTask::CopyContainer {
-                            kind: container_kind,
-                            archive_path: archive_path.clone(),
-                            inner_path: inner_path.clone(),
+                for item in items {
+                    let task = match item.src {
+                        EntryLocation::Fs(ref path) => IOTask::Copy {
+                            src: path.clone(),
                             dst_dir: dst_dir.clone(),
-                            display_name: src.display_name(),
                         },
-                        CopyKind::Directory => IOTask::CopyContainerDir {
+                        EntryLocation::Container {
                             kind: container_kind,
-                            archive_path: archive_path.clone(),
-                            inner_path: inner_path.clone(),
-                            dst_dir: dst_dir.clone(),
-                            display_name: src.display_name(),
+                            ref archive_path,
+                            ref inner_path,
+                        } => match item.kind {
+                            CopyKind::File => IOTask::CopyContainer {
+                                kind: container_kind,
+                                archive_path: archive_path.clone(),
+                                inner_path: inner_path.clone(),
+                                dst_dir: dst_dir.clone(),
+                                display_name: item.src.display_name(),
+                            },
+                            CopyKind::Directory => IOTask::CopyContainerDir {
+                                kind: container_kind,
+                                archive_path: archive_path.clone(),
+                                inner_path: inner_path.clone(),
+                                dst_dir: dst_dir.clone(),
+                                display_name: item.src.display_name(),
+                            },
                         },
-                    },
-                };
-                if let Err(e) = self.io_tx.send(task) {
-                    eprintln!("Failed to enqueue copy: {e}");
-                } else {
-                    self.io_in_flight = self.io_in_flight.saturating_add(1);
+                    };
+                    self.enqueue_io(task);
                 }
             }
             PendingOp::Move {
-                ref src,
+                ref sources,
                 ref dst_dir,
             } => {
-                if let Err(e) = self.io_tx.send(IOTask::Move {
-                    src: src.clone(),
-                    dst_dir: dst_dir.clone(),
-                }) {
-                    eprintln!("Failed to enqueue move: {e}");
-                } else {
-                    self.io_in_flight = self.io_in_flight.saturating_add(1);
-                    log::info!(
-                        "Enqueued move: {} -> {}",
-                        src.to_string_lossy(),
-                        dst_dir.to_string_lossy()
-                    );
+                for src in sources {
+                    self.enqueue_io(IOTask::Move {
+                        src: src.clone(),
+                        dst_dir: dst_dir.clone(),
+                    });
                 }
             }
-            PendingOp::Delete { ref target } => {
-                if let Err(e) = self.io_tx.send(IOTask::Delete {
-                    target: target.clone(),
-                }) {
-                    eprintln!("Failed to enqueue delete: {e}");
-                } else {
-                    self.io_in_flight = self.io_in_flight.saturating_add(1);
-                    log::info!("Enqueued delete: {}", target.to_string_lossy());
+            PendingOp::Delete { ref targets } => {
+                for target in targets {
+                    self.enqueue_io(IOTask::Delete {
+                        target: target.clone(),
+                    });
                 }
             }
             PendingOp::Rename { ref src } => {
                 if let Some(new_name) = self.rename_input.clone() {
-                    if let Err(e) = self.io_tx.send(IOTask::Rename {
+                    self.enqueue_io(IOTask::Rename {
                         src: src.clone(),
                         new_name,
-                    }) {
-                        eprintln!("Failed to enqueue rename: {e}");
-                    } else {
-                        self.io_in_flight = self.io_in_flight.saturating_add(1);
-                        log::info!("Enqueued rename: {}", src.to_string_lossy());
-                    }
+                    });
                 }
             }
         }
+        // Clear marks after operation is enqueued
+        self.get_active_panel_mut().browser.marked.clear();
     }
 
     pub fn on_io_completed(&mut self, count: usize) {
@@ -1084,97 +1082,100 @@ impl AppState {
         let _ = self.io_cancel_tx.send(());
     }
 
+    /// Returns indices of marked entries, or just the cursor entry if nothing is marked.
+    /// Excludes ".." entries.
+    fn effective_selection(&self) -> Vec<usize> {
+        let browser = &self.get_active_panel().browser;
+        if browser.entries.is_empty() {
+            return Vec::new();
+        }
+        if !browser.marked.is_empty() {
+            let mut indices: Vec<usize> = (0..browser.entries.len())
+                .filter(|i| browser.marked.contains(&browser.entries[*i].name))
+                .collect();
+            indices.sort();
+            return indices;
+        }
+        let idx = browser.selected_index;
+        if idx < browser.entries.len() && browser.entries[idx].name != ".." {
+            vec![idx]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn other_panel_fs_dir(&self) -> Option<path::PathBuf> {
+        let other = match self.active_panel {
+            ActivePanel::Left => &self.right_panel,
+            ActivePanel::Right => &self.left_panel,
+        };
+        match other.browser.browser_mode {
+            BrowserMode::Fs => Some(other.browser.current_path.clone()),
+            _ => None,
+        }
+    }
+
     fn build_copy_op(&self) -> Option<PendingOp> {
-        let (src, kind) = {
-            let p = self.get_active_panel();
-            let browser = &p.browser;
-            if browser.entries.is_empty() {
-                return None;
-            }
-            let entry = &browser.entries[browser.selected_index];
-            let kind = if entry.is_dir {
-                CopyKind::Directory
-            } else {
-                CopyKind::File
-            };
-            (entry.location.clone(), kind)
-        };
-
-        let dst_dir = {
-            let other_panel = match self.active_panel {
-                ActivePanel::Left => &self.right_panel,
-                ActivePanel::Right => &self.left_panel,
-            };
-            let browser = &other_panel.browser;
-            match browser.browser_mode {
-                BrowserMode::Fs => browser.current_path.clone(),
-                BrowserMode::Container { .. } => {
-                    return None;
+        let indices = self.effective_selection();
+        if indices.is_empty() {
+            return None;
+        }
+        let dst_dir = self.other_panel_fs_dir()?;
+        let browser = &self.get_active_panel().browser;
+        let items: Vec<CopyItem> = indices
+            .iter()
+            .map(|&i| {
+                let entry = &browser.entries[i];
+                CopyItem {
+                    src: entry.location.clone(),
+                    kind: if entry.is_dir {
+                        CopyKind::Directory
+                    } else {
+                        CopyKind::File
+                    },
                 }
-                BrowserMode::Search { .. } => {
-                    return None;
-                }
-            }
-        };
-
-        Some(PendingOp::Copy { src, dst_dir, kind })
+            })
+            .collect();
+        Some(PendingOp::Copy { items, dst_dir })
     }
 
     fn build_move_op(&self) -> Option<PendingOp> {
-        let src = {
-            let p = self.get_active_panel();
-            let browser = &p.browser;
-            if browser.entries.is_empty() {
-                return None;
-            }
-            match browser.entries[browser.selected_index].location {
-                EntryLocation::Fs(ref path) => path.clone(),
-                EntryLocation::Container { .. } => {
-                    return None;
-                }
-            }
-        };
-
-        let dst_dir = {
-            let other_panel = match self.active_panel {
-                ActivePanel::Left => &self.right_panel,
-                ActivePanel::Right => &self.left_panel,
-            };
-            let browser = &other_panel.browser;
-            match browser.browser_mode {
-                BrowserMode::Fs => browser.current_path.clone(),
-                BrowserMode::Container { .. } => {
-                    return None;
-                }
-                BrowserMode::Search { .. } => {
-                    return None;
-                }
-            }
-        };
-
-        Some(PendingOp::Move { src, dst_dir })
+        let indices = self.effective_selection();
+        if indices.is_empty() {
+            return None;
+        }
+        let dst_dir = self.other_panel_fs_dir()?;
+        let browser = &self.get_active_panel().browser;
+        let sources: Vec<path::PathBuf> = indices
+            .iter()
+            .filter_map(|&i| match browser.entries[i].location {
+                EntryLocation::Fs(ref path) => Some(path.clone()),
+                EntryLocation::Container { .. } => None,
+            })
+            .collect();
+        if sources.is_empty() {
+            return None;
+        }
+        Some(PendingOp::Move { sources, dst_dir })
     }
 
     fn build_delete_op(&self) -> Option<PendingOp> {
-        let target = {
-            let p = self.get_active_panel();
-            let browser = &p.browser;
-            if browser.entries.is_empty() {
-                return None;
-            }
-            let entry = &browser.entries[browser.selected_index];
-            if entry.name == ".." {
-                return None;
-            }
-            match entry.location {
-                EntryLocation::Fs(ref path) => path.clone(),
-                EntryLocation::Container { .. } => {
-                    return None;
-                }
-            }
-        };
-
-        Some(PendingOp::Delete { target })
+        let indices = self.effective_selection();
+        if indices.is_empty() {
+            return None;
+        }
+        let browser = &self.get_active_panel().browser;
+        let targets: Vec<path::PathBuf> = indices
+            .iter()
+            .filter_map(|&i| match browser.entries[i].location {
+                EntryLocation::Fs(ref path) => Some(path.clone()),
+                EntryLocation::Container { .. } => None,
+            })
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        Some(PendingOp::Delete { targets })
     }
 
     pub fn switch_theme(&mut self) {

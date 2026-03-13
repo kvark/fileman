@@ -17,6 +17,7 @@ pub fn draw_help(ui: &mut egui::Ui, theme: &theme::Theme, is_focused: bool, min_
         ("F4", "Edit"),
         ("Shift+F4", "New file"),
         ("F7", "New directory"),
+        ("Insert", "Mark / unmark"),
         ("Shift+F6", "Rename"),
         ("F5", "Copy"),
         ("F6", "Move"),

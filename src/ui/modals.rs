@@ -180,34 +180,55 @@ pub fn draw_discard_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
 
 fn pending_op_text(op: &app_state::PendingOp) -> (&'static str, String) {
     match op {
-        app_state::PendingOp::Copy { src, dst_dir, .. } => (
-            "Confirm Copy",
-            format!(
-                "Copy \"{}\" to\n{}?",
-                src.display_name(),
-                dst_dir.to_string_lossy()
-            ),
-        ),
-        app_state::PendingOp::Move { src, dst_dir } => (
-            "Confirm Move",
-            format!(
-                "Move \"{}\" to\n{}?",
-                src.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("<unknown>"),
-                dst_dir.to_string_lossy()
-            ),
-        ),
-        app_state::PendingOp::Delete { target } => (
-            "Confirm Delete",
-            format!(
-                "Delete \"{}\"?",
-                target
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("<unknown>")
-            ),
-        ),
+        app_state::PendingOp::Copy { items, dst_dir } => {
+            let body = if items.len() == 1 {
+                format!(
+                    "Copy \"{}\" to\n{}?",
+                    items[0].src.display_name(),
+                    dst_dir.to_string_lossy()
+                )
+            } else {
+                format!(
+                    "Copy {} items to\n{}?",
+                    items.len(),
+                    dst_dir.to_string_lossy()
+                )
+            };
+            ("Confirm Copy", body)
+        }
+        app_state::PendingOp::Move { sources, dst_dir } => {
+            let body = if sources.len() == 1 {
+                format!(
+                    "Move \"{}\" to\n{}?",
+                    sources[0]
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<unknown>"),
+                    dst_dir.to_string_lossy()
+                )
+            } else {
+                format!(
+                    "Move {} items to\n{}?",
+                    sources.len(),
+                    dst_dir.to_string_lossy()
+                )
+            };
+            ("Confirm Move", body)
+        }
+        app_state::PendingOp::Delete { targets } => {
+            let body = if targets.len() == 1 {
+                format!(
+                    "Delete \"{}\"?",
+                    targets[0]
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<unknown>")
+                )
+            } else {
+                format!("Delete {} items?", targets.len())
+            };
+            ("Confirm Delete", body)
+        }
         app_state::PendingOp::Rename { src } => (
             "Rename",
             format!(
