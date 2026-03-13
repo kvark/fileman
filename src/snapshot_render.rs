@@ -76,6 +76,7 @@ pub(crate) fn render_snapshot(
     let (highlight_req_tx, _highlight_req_rx) = mpsc::channel::<crate::HighlightRequest>();
     let mut image_cache = ImageCache {
         textures: HashMap::new(),
+        animations: HashMap::new(),
         meta: HashMap::new(),
         failures: HashMap::new(),
         pending: HashSet::new(),
