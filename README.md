@@ -1,71 +1,65 @@
 # Fileman
 
-Fileman is a fast, responsive two-panel file manager built with egui via blade-egui. The goal is to keep navigation snappy even in large directories by doing I/O off the UI thread and streaming results into the view.
+Fileman is a fast, responsive two-panel file manager built with Rust, egui, and blade-egui. Navigation stays snappy even in large directories by doing all I/O off the UI thread and streaming results into the view.
 
-## Highlights
-- Dual-panel layout with independent navigation.
-- Non-blocking directory loading and virtualized list rendering.
-- Optional previews for text and images.
-- External themes in `themes/` (JSON, YAML, or TOML).
+![Fileman screenshot](etc/snapshots/tests/preview.png)
 
-## Features (Current)
-- Two-panel file browser with independent navigation and history (Alt+Left/Right).
-- Async directory listing with streaming batches.
-- Search (Alt+F7) with results as a virtual folder.
-- Preview mode (F3) for text and images, including archives.
-- Inline editor (F4) with syntax highlighting for text files.
-- Copy/Move/Delete operations with confirmation dialogs (F5/F6/F8).
-- Rename (Shift+F6) and directory size calculation (Space).
-- Archive navigation for zip, tar.gz, tar.bz2 (copy out supported).
-- Snapshot rendering via `--snapshot` for CI.
-- Replay runner for tests via `--replay` (RON format).
+## Features
+- **Dual-panel layout** with independent navigation, history (Alt+Left/Right), and panel swap (Ctrl+U).
+- **Async directory loading** with streaming batches and virtualized list rendering.
+- **Archive navigation** for zip, tar, tar.gz, and tar.bz2 — browse like regular folders, copy files out, or open with system apps. Shared streaming index means only one decompression pass per archive.
+- **Preview** (F3) for text files with syntax highlighting, images (including animated GIF), and archive content listings.
+- **Inline editor** (F4) with syntax highlighting.
+- **File operations**: copy (F5), move (F6), delete (F8), rename (Shift+F6), new file (Shift+F4), new directory (F7).
+- **Multi-file selection**: Insert to mark/unmark, operations work on marked set.
+- **Search** (Alt+F7) with results displayed as a virtual folder.
+- **Symlink display**: shows link targets, broken symlinks highlighted in red.
+- **File properties** (Alt+Enter): permissions, ownership, size, timestamps.
+- **Theming**: external theme files in `themes/` (JSON, YAML, or TOML), toggle with F9, pick with F10.
+- **CLI**: optional start directory argument, `--help` for usage.
 
 ## Keyboard Shortcuts
-- Navigation: Enter (open), Tab/Ctrl+I (switch panels), Alt+Left/Right (back/forward).
-- Parent/child: Backspace/Ctrl+PgUp (parent), Ctrl+PgDn (open selected).
-- Panels: Ctrl+Left/Right (open selected dir in the other panel).
-- Preview: F3 (toggle), Shift+Enter (open with system default app).
-- Edit: F4 (edit), Shift+F4 (new file + inline rename), Shift+F6 (rename).
-- Ops: F5 copy, F6 move, F8 delete, Space computes folder size.
-- Search: Alt+F7 (name search).
-- Properties: Alt+Enter (file properties).
-- Refresh: Ctrl+R.
-- Theme: F9 (toggle), F10 (picker).
-
-## Screenshot
-![Fileman screenshot](etc/snapshots/tests/preview.png)
+| Key | Action |
+|-----|--------|
+| Enter | Open |
+| Shift+Enter | Open with system default app |
+| Tab / Ctrl+I | Switch panels |
+| Ctrl+U | Swap panels |
+| Alt+Left / Alt+Right | Back / forward |
+| Backspace / Ctrl+PgUp | Parent folder |
+| Ctrl+PgDn | Open selected |
+| Ctrl+Left / Ctrl+Right | Open selected dir in other panel |
+| F1 | Help |
+| F3 | Preview |
+| F4 | Edit |
+| Shift+F4 | New file |
+| F7 | New directory |
+| Insert | Mark / unmark |
+| Shift+F6 | Rename |
+| F5 | Copy |
+| F6 | Move |
+| F8 | Delete |
+| Space | Compute folder size |
+| Alt+F7 | Search |
+| Alt+Enter | Properties |
+| Ctrl+R | Refresh |
+| F9 | Toggle theme |
+| F10 | Theme picker |
 
 ## Build and Run
 ```bash
-cargo build
-cargo run
+cargo build --release
+cargo run --release
+```
+
+Open in a specific directory:
+```bash
+cargo run --release -- /path/to/dir
+```
+
+Enable verbose logging:
+```bash
 RUST_LOG=info cargo run
-```
-
-## macOS App Bundle
-This project uses `cargo-bundle` for macOS bundling. Install it once:
-```bash
-cargo install cargo-bundle
-```
-Then build the bundle:
-```bash
-cargo bundle --release
-```
-The icon is set via `package.metadata.bundle.icon` in `Cargo.toml` and uses
-`etc/macos/icon.png`.
-
-### Test Replays
-Replay cases live in `tests/cases/` and use the RON format. To run a case and emit a snapshot:
-```bash
-cargo run -- --replay tests/cases/preview.ron --snapshot /tmp/replay.png
-```
-To run all replay cases:
-```bash
-scripts/replay_runner.sh
-```
-To update the reference images for replay tests:
-```bash
-cp target/test-artifacts/*.png etc/snapshots/tests/
 ```
 
 ### GPU Backend Notes
@@ -76,11 +70,45 @@ drivers or use the GLES fallback:
 RUSTFLAGS="--cfg gles" cargo run
 ```
 
-## Project Notes
-- Rendering uses winit + blade-egui.
-- UI responsiveness is a primary requirement; avoid long-running work on the main thread.
+## macOS App Bundle
+Install `cargo-bundle` once:
+```bash
+cargo install cargo-bundle
+```
+Then build the bundle:
+```bash
+cargo bundle --release
+```
+The icon is configured in `Cargo.toml` via `package.metadata.bundle.icon` and uses `etc/macos/icon.png`.
+
+## Linux Desktop Integration
+Copy the desktop entry and icon to the standard locations:
+```bash
+cp etc/fileman.desktop ~/.local/share/applications/
+cp etc/fileman.svg ~/.local/share/icons/hicolor/scalable/apps/fileman.svg
+```
+
+## Test Replays
+Replay cases live in `tests/cases/` and use the RON format. To run a case and emit a snapshot:
+```bash
+cargo run -- --replay tests/cases/preview.ron --snapshot /tmp/replay.png
+```
+To run all replay cases:
+```bash
+scripts/replay_runner.sh
+```
+To update the reference images:
+```bash
+cp target/test-artifacts/*.png etc/snapshots/tests/
+```
 
 ## Repository Layout
-- `src/main.rs` contains the egui app entry point.
-- `src/replay.rs` contains test replay case parsing.
-- `themes/` stores theme files.
+- `src/main.rs` — app entry point, event loop, directory loading
+- `src/archive.rs` — container plugins (zip, tar, tar.gz, tar.bz2)
+- `src/core.rs` — shared types and utilities
+- `src/app_state.rs` — application state
+- `src/input.rs` — keyboard handling
+- `src/ui/` — UI components (panel, preview, help)
+- `src/image_decode.rs` — image decoding (including animated GIF)
+- `themes/` — external theme files
+- `etc/` — desktop entry, icon, test snapshots
