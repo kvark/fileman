@@ -501,6 +501,7 @@ fn rebuild_search_entries(browser: &mut app_state::BrowserState, results: &[core
                 name: display_name,
                 is_dir: result.is_dir,
                 is_symlink: false,
+                link_target: None,
                 location: core::EntryLocation::Fs(result.path.clone()),
                 size: result.size,
                 modified: result.modified,
@@ -613,6 +614,7 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
                 name: message,
                 is_dir: false,
                 is_symlink: false,
+                link_target: None,
                 location: core::EntryLocation::Fs(browser.current_path.clone()),
                 size: None,
                 modified: None,
@@ -867,6 +869,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         name: display_name,
                         is_dir: result.is_dir,
                         is_symlink: false,
+                        link_target: None,
                         location: core::EntryLocation::Fs(result.path),
                         size: result.size,
                         modified: result.modified,
@@ -929,6 +932,7 @@ fn load_fs_directory_async(
             name: "..".to_string(),
             is_dir: true,
             is_symlink: false,
+            link_target: None,
             location: core::EntryLocation::Fs(path.parent().unwrap().to_path_buf()),
             size: None,
             modified: None,
@@ -970,10 +974,18 @@ fn load_fs_directory_async(
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs());
+                    let link_target = if is_symlink {
+                        fs::read_link(entry.path())
+                            .ok()
+                            .map(|t| t.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    };
                     snapshot.push(core::DirEntry {
                         name: file_name,
                         is_dir,
                         is_symlink,
+                        link_target,
                         location: core::EntryLocation::Fs(entry.path()),
                         size,
                         modified,
@@ -1013,10 +1025,18 @@ fn load_fs_directory_async(
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs());
+                    let link_target = if is_symlink {
+                        fs::read_link(entry.path())
+                            .ok()
+                            .map(|t| t.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    };
                     all.push(core::DirEntry {
                         name: file_name,
                         is_dir,
                         is_symlink,
+                        link_target,
                         location: core::EntryLocation::Fs(entry.path()),
                         size,
                         modified,
@@ -1029,6 +1049,7 @@ fn load_fs_directory_async(
                     name: "..".to_string(),
                     is_dir: true,
                     is_symlink: false,
+                    link_target: None,
                     location: core::EntryLocation::Fs(parent.to_path_buf()),
                     size: None,
                     modified: None,
@@ -1079,10 +1100,18 @@ fn load_fs_directory_async(
                             .and_then(|m| m.modified().ok())
                             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                             .map(|d| d.as_secs());
+                        let link_target = if is_symlink {
+                            fs::read_link(entry.path())
+                                .ok()
+                                .map(|t| t.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        };
                         all.push(core::DirEntry {
                             name: file_name,
                             is_dir,
                             is_symlink,
+                            link_target,
                             location: core::EntryLocation::Fs(entry.path()),
                             size,
                             modified,
@@ -1096,6 +1125,7 @@ fn load_fs_directory_async(
                     name: "..".to_string(),
                     is_dir: true,
                     is_symlink: false,
+                    link_target: None,
                     location: core::EntryLocation::Fs(parent.to_path_buf()),
                     size: None,
                     modified: None,
@@ -1208,6 +1238,7 @@ fn build_listing_from_index(
             name: "..".into(),
             is_dir: true,
             is_symlink: false,
+            link_target: None,
             location: core::EntryLocation::Container {
                 kind,
                 archive_path: archive_path.to_path_buf(),
@@ -1225,6 +1256,7 @@ fn build_listing_from_index(
             name: "..".into(),
             is_dir: true,
             is_symlink: false,
+            link_target: None,
             location: core::EntryLocation::Fs(parent),
             size: None,
             modified: None,
@@ -1252,6 +1284,7 @@ fn build_listing_from_index(
             name: d,
             is_dir: true,
             is_symlink: false,
+            link_target: None,
             location: core::EntryLocation::Container {
                 kind,
                 archive_path: archive_path.to_path_buf(),
@@ -1283,6 +1316,7 @@ fn build_listing_from_index(
             name: f,
             is_dir: false,
             is_symlink: false,
+            link_target: None,
             location: core::EntryLocation::Container {
                 kind,
                 archive_path: archive_path.to_path_buf(),
@@ -1338,6 +1372,7 @@ fn load_container_directory_async(
                 name: "..".into(),
                 is_dir: true,
                 is_symlink: false,
+                link_target: None,
                 location: core::EntryLocation::Container {
                     kind,
                     archive_path: archive_path.clone(),
@@ -1355,6 +1390,7 @@ fn load_container_directory_async(
                 name: "..".into(),
                 is_dir: true,
                 is_symlink: false,
+                link_target: None,
                 location: core::EntryLocation::Fs(parent),
                 size: None,
                 modified: None,
@@ -1806,6 +1842,7 @@ fn apply_panel_snapshot(
                     name: display_name,
                     is_dir: result.is_dir,
                     is_symlink: false,
+                    link_target: None,
                     location: core::EntryLocation::Fs(result.path.clone()),
                     size: result.size,
                     modified: result.modified,
@@ -2240,14 +2277,13 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     // Now decode all frames (may take a while for large GIFs)
                     if let Some((decoded, meta)) =
                         image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)
+                        && matches!(decoded, image_decode::DecodedImage::Animated(_))
                     {
-                        if matches!(decoded, image_decode::DecodedImage::Animated(_)) {
-                            let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
-                                key: req.key,
-                                image: decoded,
-                                meta,
-                            }));
-                        }
+                        let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                            key: req.key,
+                            image: decoded,
+                            meta,
+                        }));
                     }
                     let _ = proxy.send_event(UserEvent::Wake);
                     continue;
