@@ -567,13 +567,20 @@ pub fn draw_panel(
                                     } else {
                                         color32(fade_color(fg, 0.65))
                                     };
+                                    let full = format!("{arrow_text}{target_text}");
                                     let galley = ui.painter().layout_no_wrap(
+                                        full,
+                                        font_id.clone(),
+                                        color32(fg),
+                                    );
+                                    let arrow_galley = ui.painter().layout_no_wrap(
                                         arrow_text.clone(),
                                         font_id.clone(),
                                         color32(fg),
                                     );
-                                    let arrow_w = galley.size().x;
-                                    ui.painter().with_clip_rect(name_rect).text(
+                                    let arrow_w = arrow_galley.size().x;
+                                    let clipped = ui.painter().with_clip_rect(name_rect);
+                                    clipped.text(
                                         name_min,
                                         egui::Align2::LEFT_CENTER,
                                         arrow_text,
@@ -581,21 +588,51 @@ pub fn draw_panel(
                                         color32(fg),
                                     );
                                     let target_pos = name_min + egui::Vec2::new(arrow_w, 0.0);
-                                    ui.painter().with_clip_rect(name_rect).text(
+                                    clipped.text(
                                         target_pos,
                                         egui::Align2::LEFT_CENTER,
                                         target_text,
-                                        font_id,
+                                        font_id.clone(),
                                         target_color,
                                     );
+                                    if galley.size().x > name_rect.width() {
+                                        clipped.text(
+                                            egui::pos2(
+                                                name_rect.right() - 12.0,
+                                                name_rect.center().y,
+                                            ),
+                                            egui::Align2::LEFT_CENTER,
+                                            "\u{2026}",
+                                            font_id,
+                                            color32(fg),
+                                        );
+                                    }
                                 } else {
-                                    ui.painter().with_clip_rect(name_rect).text(
+                                    let galley = ui.painter().layout_no_wrap(
+                                        entry.name.clone(),
+                                        font_id.clone(),
+                                        color32(fg),
+                                    );
+                                    let clipped = ui.painter().with_clip_rect(name_rect);
+                                    clipped.text(
                                         name_min,
                                         egui::Align2::LEFT_CENTER,
                                         &entry.name,
-                                        font_id,
+                                        font_id.clone(),
                                         color32(fg),
                                     );
+                                    if galley.size().x > name_rect.width() {
+                                        clipped.text(
+                                            egui::pos2(
+                                                name_rect.right() - 12.0,
+                                                name_rect.center().y,
+                                            ),
+                                            egui::Align2::LEFT_CENTER,
+                                            "\u{2026}",
+                                            font_id,
+                                            color32(fg),
+                                        );
+                                    }
                                 }
 
                                 if response.clicked_by(egui::PointerButton::Primary) {
