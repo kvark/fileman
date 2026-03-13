@@ -2154,13 +2154,18 @@ impl Runtime {
 struct App {
     runtime: Option<Runtime>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    start_dir: Option<PathBuf>,
 }
 
 impl App {
-    fn new(proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Self {
+    fn new(
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+        start_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             runtime: None,
             proxy,
+            start_dir,
         }
     }
 }
@@ -2240,7 +2245,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             buffer_count: 1,
         });
 
-        let cur_dir = std::env::current_dir().expect("current_dir");
+        let cur_dir = self
+            .start_dir
+            .take()
+            .unwrap_or_else(|| std::env::current_dir().expect("current_dir"));
         let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker();
         let (preview_tx, preview_rx) = workers::start_preview_worker(Some(Arc::new({
             let proxy = self.proxy.clone();
@@ -2981,6 +2989,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 struct CliArgs {
     snapshot: Option<PathBuf>,
     replay: Option<PathBuf>,
+    start_dir: Option<PathBuf>,
 }
 
 fn parse_cli_args() -> anyhow::Result<CliArgs> {
@@ -2988,6 +2997,17 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
     let mut parsed = CliArgs::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--help" | "-h" => {
+                eprintln!("fileman - a two-panel file manager");
+                eprintln!();
+                eprintln!("Usage: fileman [OPTIONS] [DIRECTORY]");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  -h, --help         Show this help message");
+                eprintln!("  --snapshot <PATH>   Render a snapshot to PNG");
+                eprintln!("  --replay <PATH>     Replay an input recording");
+                std::process::exit(0);
+            }
             "--snapshot" => {
                 parsed.snapshot = Some(
                     args.next()
@@ -3002,7 +3022,18 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
                         .ok_or_else(|| anyhow::anyhow!("--replay requires a path"))?,
                 );
             }
-            _ => {}
+            other if !other.starts_with('-') => {
+                let path = PathBuf::from(other);
+                let path = if path.is_relative() {
+                    std::env::current_dir()?.join(path)
+                } else {
+                    path
+                };
+                parsed.start_dir = Some(path);
+            }
+            other => {
+                anyhow::bail!("Unknown option: {other}\nRun with --help for usage.");
+            }
         }
     }
     Ok(parsed)
@@ -3215,7 +3246,7 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy);
+    let mut app = App::new(proxy, args.start_dir);
     event_loop
         .run_app(&mut app)
         .map_err(|e| anyhow::anyhow!(e))?;
