@@ -421,6 +421,10 @@ impl AppState {
         };
     }
 
+    pub fn swap_panels(&mut self) {
+        std::mem::swap(&mut self.left_panel, &mut self.right_panel);
+    }
+
     pub fn store_current_selection_memory(&mut self) {
         self.store_selection_memory_for(self.active_panel);
     }
