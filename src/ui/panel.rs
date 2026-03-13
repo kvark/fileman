@@ -234,37 +234,55 @@ pub fn draw_panel(
                                         egui::Vec2::new(left_width, ui.available_height()),
                                         egui::Sense::hover(),
                                     );
-                                    let mut header_display = if is_active {
+                                    let header_display = if is_active {
                                         format!("● {header_text}")
                                     } else {
                                         header_text.clone()
                                     };
+                                    let header_font = egui::TextStyle::Body.resolve(ui.style());
+                                    let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
+                                    let header_color = color32(colors.header_fg);
+                                    let mut job = egui::text::LayoutJob::default();
                                     if loading {
                                         let t = ui.ctx().input(|i| i.time);
                                         let spinner =
                                             ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
+                                        job.append(spinner, 0.0, egui::text::TextFormat {
+                                            font_id: mono_font.clone(),
+                                            color: header_color,
+                                            ..Default::default()
+                                        });
+                                        job.append(" ", 0.0, egui::text::TextFormat {
+                                            font_id: header_font.clone(),
+                                            color: header_color,
+                                            ..Default::default()
+                                        });
+                                    }
+                                    let suffix = if loading {
                                         if let Some((loaded, total)) = loading_progress {
                                             if let Some(total) = total {
-                                                header_display = format!(
-                                                    "{spinner} {header_display} ({loaded}/{total})"
-                                                );
+                                                format!("{header_display} ({loaded}/{total})")
                                             } else {
-                                                header_display = format!(
-                                                    "{spinner} {header_display} ({loaded})"
-                                                );
+                                                format!("{header_display} ({loaded})")
                                             }
                                         } else {
-                                            header_display = format!("{spinner} {header_display}");
+                                            header_display.clone()
                                         }
-                                    }
-                                    let header_font = egui::TextStyle::Body.resolve(ui.style());
-                                    ui.painter().with_clip_rect(left_rect).text(
+                                    } else {
+                                        header_display.clone()
+                                    };
+                                    job.append(&suffix, 0.0, egui::text::TextFormat {
+                                        font_id: header_font.clone(),
+                                        color: header_color,
+                                        ..Default::default()
+                                    });
+                                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                                    let painter = ui.painter().with_clip_rect(left_rect);
+                                    let pos = egui::Align2::LEFT_CENTER.anchor_size(
                                         left_rect.left_center(),
-                                        egui::Align2::LEFT_CENTER,
-                                        header_display,
-                                        header_font,
-                                        color32(colors.header_fg),
+                                        galley.size(),
                                     );
+                                    painter.galley(pos.min, galley, header_color);
                                     if left_width > 0.0 {
                                         ui.add_space(gap);
                                     }
