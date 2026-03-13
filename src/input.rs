@@ -351,6 +351,10 @@ pub(crate) fn handle_keyboard(
         }
         ctx.request_repaint();
     }
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::U)) {
+        app.swap_panels();
+        ctx.request_repaint();
+    }
     let ctrl_pgup = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
     let backspace = input.key_pressed(egui::Key::Backspace);
     let typing_in_ui = ctx.wants_keyboard_input();

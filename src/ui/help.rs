@@ -9,6 +9,7 @@ pub fn draw_help(ui: &mut egui::Ui, theme: &theme::Theme, is_focused: bool, min_
         ("Enter", "Open"),
         ("Shift+Enter", "Open with system default app"),
         ("Tab / Ctrl+I", "Switch panels"),
+        ("Ctrl+U", "Swap panels"),
         ("Alt+Left / Alt+Right", "Back / forward"),
         ("Backspace / Ctrl+PgUp", "Parent folder"),
         ("Ctrl+PgDn", "Open selected"),
