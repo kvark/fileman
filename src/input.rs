@@ -355,6 +355,7 @@ pub(crate) fn handle_keyboard(
         }
     }
     let alt_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter));
+    #[cfg(unix)]
     if alt_enter {
         open_props_dialog(app);
         ctx.request_repaint();

@@ -1,4 +1,6 @@
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::File,
@@ -125,6 +127,7 @@ pub fn start_io_worker() -> (
                         eprintln!("Mkdir error: {e}");
                     }
                 }
+                #[cfg(unix)]
                 IOTask::SetProps {
                     path,
                     mode,
@@ -141,6 +144,10 @@ pub fn start_io_worker() -> (
                         eprintln!("Props error: {e}");
                     }
                 }
+                #[cfg(not(unix))]
+                IOTask::SetProps { .. } => {
+                    eprintln!("SetProps is not supported on this platform");
+                }
             }
             let _ = result_tx.send(IOResult::Completed);
         }
@@ -148,6 +155,7 @@ pub fn start_io_worker() -> (
     (tx, result_rx, cancel_tx)
 }
 
+#[cfg(unix)]
 fn apply_props(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io::Result<()> {
     let permissions = std::fs::Permissions::from_mode(mode);
     std::fs::set_permissions(path, permissions)?;
@@ -158,6 +166,7 @@ fn apply_props(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io::Result<()
     Ok(())
 }
 
+#[cfg(unix)]
 fn apply_props_recursive(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
