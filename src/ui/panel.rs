@@ -247,16 +247,24 @@ pub fn draw_panel(
                                         let t = ui.ctx().input(|i| i.time);
                                         let spinner =
                                             ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
-                                        job.append(spinner, 0.0, egui::text::TextFormat {
-                                            font_id: mono_font.clone(),
-                                            color: header_color,
-                                            ..Default::default()
-                                        });
-                                        job.append(" ", 0.0, egui::text::TextFormat {
-                                            font_id: header_font.clone(),
-                                            color: header_color,
-                                            ..Default::default()
-                                        });
+                                        job.append(
+                                            spinner,
+                                            0.0,
+                                            egui::text::TextFormat {
+                                                font_id: mono_font.clone(),
+                                                color: header_color,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        job.append(
+                                            " ",
+                                            0.0,
+                                            egui::text::TextFormat {
+                                                font_id: header_font.clone(),
+                                                color: header_color,
+                                                ..Default::default()
+                                            },
+                                        );
                                     }
                                     let suffix = if loading {
                                         if let Some((loaded, total)) = loading_progress {
@@ -271,17 +279,19 @@ pub fn draw_panel(
                                     } else {
                                         header_display.clone()
                                     };
-                                    job.append(&suffix, 0.0, egui::text::TextFormat {
-                                        font_id: header_font.clone(),
-                                        color: header_color,
-                                        ..Default::default()
-                                    });
+                                    job.append(
+                                        &suffix,
+                                        0.0,
+                                        egui::text::TextFormat {
+                                            font_id: header_font.clone(),
+                                            color: header_color,
+                                            ..Default::default()
+                                        },
+                                    );
                                     let galley = ui.fonts_mut(|f| f.layout_job(job));
                                     let painter = ui.painter().with_clip_rect(left_rect);
-                                    let pos = egui::Align2::LEFT_CENTER.anchor_size(
-                                        left_rect.left_center(),
-                                        galley.size(),
-                                    );
+                                    let pos = egui::Align2::LEFT_CENTER
+                                        .anchor_size(left_rect.left_center(), galley.size());
                                     painter.galley(pos.min, galley, header_color);
                                     if left_width > 0.0 {
                                         ui.add_space(gap);

@@ -9,8 +9,8 @@ use fileman::{app_state, core, snapshot, theme, workers};
 
 use crate::input;
 use crate::replay::{
-    FileAssert, FsAssert, FsCheckMode, FsEntryKind, ReplayAsserts, ReplayKey, SnapshotAssert,
-    load_replay_case,
+    FileAssert, FsAssert, FsCheckMode, FsEntryKind, PanelAssert, ReplayAsserts, ReplayKey,
+    SnapshotAssert, load_replay_case,
 };
 use crate::snapshot_render::render_snapshot;
 use crate::{
@@ -605,6 +605,39 @@ fn assert_snapshots(
     Ok(())
 }
 
+fn assert_panel(
+    panel: &app_state::PanelState,
+    panel_name: &str,
+    expected: &PanelAssert,
+) -> anyhow::Result<()> {
+    let actual: Vec<&str> = panel
+        .browser
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    match expected.mode {
+        FsCheckMode::Contains => {
+            for name in &expected.entries {
+                if !actual.contains(&name.as_str()) {
+                    return Err(anyhow::anyhow!(
+                        "{panel_name} panel missing expected entry \"{name}\". Actual: {actual:?}"
+                    ));
+                }
+            }
+        }
+        FsCheckMode::Exact => {
+            let expected_names: Vec<&str> = expected.entries.iter().map(|s| s.as_str()).collect();
+            if actual != expected_names {
+                return Err(anyhow::anyhow!(
+                    "{panel_name} panel entries mismatch.\n  Expected: {expected_names:?}\n  Actual:   {actual:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_replay_asserts(
     base: &Path,
     root: &Path,
@@ -620,6 +653,12 @@ fn run_replay_asserts(
     }
     if !asserts.snapshots.is_empty() {
         assert_snapshots(base, app, ui_cache, &asserts.snapshots)?;
+    }
+    if let Some(ref panel_assert) = asserts.left_panel {
+        assert_panel(&app.left_panel, "Left", panel_assert)?;
+    }
+    if let Some(ref panel_assert) = asserts.right_panel {
+        assert_panel(&app.right_panel, "Right", panel_assert)?;
     }
     Ok(())
 }

@@ -27,6 +27,15 @@ pub struct ReplayAsserts {
     pub files: Vec<FileAssert>,
     #[serde(default, deserialize_with = "deserialize_vec_or_option")]
     pub snapshots: Vec<SnapshotAssert>,
+    pub left_panel: Option<PanelAssert>,
+    pub right_panel: Option<PanelAssert>,
+}
+
+#[derive(Deserialize)]
+pub struct PanelAssert {
+    #[serde(default)]
+    pub mode: FsCheckMode,
+    pub entries: Vec<String>,
 }
 
 #[derive(Deserialize)]
