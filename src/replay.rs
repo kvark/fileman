@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
 use serde::de::{DeserializeOwned, Deserializer};
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 pub struct ReplayCase {
@@ -9,6 +9,7 @@ pub struct ReplayCase {
     pub left: Option<PathBuf>,
     pub right: Option<PathBuf>,
     pub keys: Vec<ReplayKey>,
+    pub state_dump: Option<PathBuf>,
     #[serde(default)]
     pub asserts: ReplayAsserts,
 }
@@ -35,7 +36,13 @@ pub struct ReplayAsserts {
 pub struct PanelAssert {
     #[serde(default)]
     pub mode: FsCheckMode,
+    #[serde(default)]
     pub entries: Vec<String>,
+    pub selected: Option<String>,
+    pub browser_mode: Option<String>,
+    pub panel_mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_option")]
+    pub marked: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -110,4 +117,53 @@ where
         MaybeVec::Vec(items) => Ok(items),
         MaybeVec::Option(items) => Ok(items.unwrap_or_default()),
     }
+}
+
+// --- State dump types (serializable) ---
+
+#[derive(Serialize)]
+pub struct StateDump {
+    pub active_panel: String,
+    pub search_ui: String,
+    pub search_query: String,
+    pub left: PanelDump,
+    pub right: PanelDump,
+}
+
+#[derive(Serialize)]
+pub struct PanelDump {
+    pub mode: String,
+    pub browser_mode: BrowserModeDump,
+    pub current_path: PathBuf,
+    pub selected_index: usize,
+    pub selected_name: Option<String>,
+    pub sort_mode: String,
+    pub sort_desc: bool,
+    pub loading: bool,
+    pub marked: Vec<String>,
+    pub entries: Vec<EntryDump>,
+}
+
+#[derive(Serialize)]
+pub enum BrowserModeDump {
+    Fs,
+    Container {
+        kind: String,
+        archive_path: PathBuf,
+        cwd: String,
+    },
+    Search {
+        root: PathBuf,
+        query: String,
+        mode: String,
+    },
+}
+
+#[derive(Serialize)]
+pub struct EntryDump {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: Option<u64>,
+    pub location: String,
 }

@@ -1,0 +1,25 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Move down to select "out" directory (entries: .., out, binary.bin, source.txt)
+    (key: "Down"),
+    // Move to end
+    (key: "End"),
+    // Move to home
+    (key: "Home"),
+    // Move down twice
+    (key: "Down"),
+    (key: "Down"),
+  ],
+  asserts: (
+    left_panel: Some((
+      mode: Exact,
+      entries: ["..", "out", "binary.bin", "source.txt"],
+      // After Home (index 0) + Down + Down => index 2 = "binary.bin"
+      selected: Some("binary.bin"),
+      browser_mode: Some("Fs"),
+      panel_mode: Some("Browser"),
+    )),
+  ),
+)

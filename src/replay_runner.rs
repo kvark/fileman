@@ -9,8 +9,8 @@ use fileman::{app_state, core, snapshot, theme, workers};
 
 use crate::input;
 use crate::replay::{
-    FileAssert, FsAssert, FsCheckMode, FsEntryKind, PanelAssert, ReplayAsserts, ReplayKey,
-    SnapshotAssert, load_replay_case,
+    BrowserModeDump, EntryDump, FileAssert, FsAssert, FsCheckMode, FsEntryKind, PanelAssert,
+    PanelDump, ReplayAsserts, ReplayKey, SnapshotAssert, StateDump, load_replay_case,
 };
 use crate::snapshot_render::render_snapshot;
 use crate::{
@@ -47,6 +47,8 @@ fn parse_key_name(name: &str) -> Option<egui::Key> {
         "home" => Some(egui::Key::Home),
         "end" => Some(egui::Key::End),
         "space" => Some(egui::Key::Space),
+        "insert" | "ins" => Some(egui::Key::Insert),
+        "delete" | "del" => Some(egui::Key::Delete),
         "f1" => Some(egui::Key::F1),
         "f2" => Some(egui::Key::F2),
         "f3" => Some(egui::Key::F3),
@@ -394,6 +396,10 @@ pub(crate) fn run_replay(case_path: &PathBuf, snapshot: Option<PathBuf>) -> anyh
     if let Some(path) = snapshot {
         render_snapshot(&mut app, &mut ui_cache, &path)?;
     }
+    if let Some(ref dump_path) = case.state_dump {
+        let dump_path = resolve_case_path(&repo_root, dump_path);
+        write_state_dump(&app, &dump_path)?;
+    }
     run_replay_asserts(
         &repo_root,
         root.as_path(),
@@ -605,34 +611,208 @@ fn assert_snapshots(
     Ok(())
 }
 
+fn container_kind_str(kind: fileman::archive::ContainerKind) -> &'static str {
+    use fileman::archive::ContainerKind;
+    match kind {
+        ContainerKind::Zip => "Zip",
+        ContainerKind::Tar => "Tar",
+        ContainerKind::TarGz => "TarGz",
+        ContainerKind::TarBz2 => "TarBz2",
+    }
+}
+
+fn build_panel_dump(panel: &app_state::PanelState) -> PanelDump {
+    let browser = &panel.browser;
+    let mode = match panel.mode {
+        app_state::PanelMode::Browser => "Browser",
+        app_state::PanelMode::Preview(_) => "Preview",
+        app_state::PanelMode::Edit(_) => "Edit",
+        app_state::PanelMode::Help(_) => "Help",
+    };
+    let browser_mode = match &browser.browser_mode {
+        core::BrowserMode::Fs => BrowserModeDump::Fs,
+        core::BrowserMode::Container {
+            kind,
+            archive_path,
+            cwd,
+            ..
+        } => BrowserModeDump::Container {
+            kind: container_kind_str(*kind).to_string(),
+            archive_path: archive_path.clone(),
+            cwd: cwd.clone(),
+        },
+        core::BrowserMode::Search {
+            root, query, mode, ..
+        } => BrowserModeDump::Search {
+            root: root.clone(),
+            query: query.clone(),
+            mode: match mode {
+                core::SearchMode::Name => "Name",
+                core::SearchMode::Content => "Content",
+            }
+            .to_string(),
+        },
+    };
+    let sort_mode = match browser.sort_mode {
+        core::SortMode::Name => "Name",
+        core::SortMode::Date => "Date",
+        core::SortMode::Size => "Size",
+        core::SortMode::Raw => "Raw",
+    };
+    let selected_name = browser
+        .entries
+        .get(browser.selected_index)
+        .map(|e| e.name.clone());
+    let entries = browser
+        .entries
+        .iter()
+        .map(|e| {
+            let location = match &e.location {
+                core::EntryLocation::Fs(p) => format!("{}", p.display()),
+                core::EntryLocation::Container {
+                    kind, inner_path, ..
+                } => format!("{}:{inner_path}", container_kind_str(*kind)),
+            };
+            EntryDump {
+                name: e.name.clone(),
+                is_dir: e.is_dir,
+                is_symlink: e.is_symlink,
+                size: e.size,
+                location,
+            }
+        })
+        .collect();
+    let mut marked: Vec<String> = browser.marked.iter().cloned().collect();
+    marked.sort();
+    PanelDump {
+        mode: mode.to_string(),
+        browser_mode,
+        current_path: browser.current_path.clone(),
+        selected_index: browser.selected_index,
+        selected_name,
+        sort_mode: sort_mode.to_string(),
+        sort_desc: browser.sort_desc,
+        loading: browser.loading,
+        marked,
+        entries,
+    }
+}
+
+fn write_state_dump(app: &app_state::AppState, path: &Path) -> anyhow::Result<()> {
+    let active_panel = match app.active_panel {
+        core::ActivePanel::Left => "Left",
+        core::ActivePanel::Right => "Right",
+    };
+    let search_ui = match app.search_ui {
+        app_state::SearchUiState::Closed => "Closed",
+        app_state::SearchUiState::Open => "Open",
+    };
+    let dump = StateDump {
+        active_panel: active_panel.to_string(),
+        search_ui: search_ui.to_string(),
+        search_query: app.search_query.clone(),
+        left: build_panel_dump(&app.left_panel),
+        right: build_panel_dump(&app.right_panel),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let pretty = ron::ser::PrettyConfig::default();
+    let text = ron::ser::to_string_pretty(&dump, pretty)?;
+    std::fs::write(path, text)?;
+    println!("State dump written to {}", path.display());
+    Ok(())
+}
+
+fn panel_mode_str(panel: &app_state::PanelState) -> &'static str {
+    match panel.mode {
+        app_state::PanelMode::Browser => "Browser",
+        app_state::PanelMode::Preview(_) => "Preview",
+        app_state::PanelMode::Edit(_) => "Edit",
+        app_state::PanelMode::Help(_) => "Help",
+    }
+}
+
+fn browser_mode_str(mode: &core::BrowserMode) -> &'static str {
+    match mode {
+        core::BrowserMode::Fs => "Fs",
+        core::BrowserMode::Container { .. } => "Container",
+        core::BrowserMode::Search { .. } => "Search",
+    }
+}
+
 fn assert_panel(
     panel: &app_state::PanelState,
     panel_name: &str,
     expected: &PanelAssert,
 ) -> anyhow::Result<()> {
-    let actual: Vec<&str> = panel
-        .browser
-        .entries
-        .iter()
-        .map(|e| e.name.as_str())
-        .collect();
-    match expected.mode {
-        FsCheckMode::Contains => {
-            for name in &expected.entries {
-                if !actual.contains(&name.as_str()) {
+    if !expected.entries.is_empty() {
+        let actual: Vec<&str> = panel
+            .browser
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        match expected.mode {
+            FsCheckMode::Contains => {
+                for name in &expected.entries {
+                    if !actual.contains(&name.as_str()) {
+                        return Err(anyhow::anyhow!(
+                            "{panel_name} panel missing expected entry \"{name}\". Actual: {actual:?}"
+                        ));
+                    }
+                }
+            }
+            FsCheckMode::Exact => {
+                let expected_names: Vec<&str> =
+                    expected.entries.iter().map(|s| s.as_str()).collect();
+                if actual != expected_names {
                     return Err(anyhow::anyhow!(
-                        "{panel_name} panel missing expected entry \"{name}\". Actual: {actual:?}"
+                        "{panel_name} panel entries mismatch.\n  Expected: {expected_names:?}\n  Actual:   {actual:?}"
                     ));
                 }
             }
         }
-        FsCheckMode::Exact => {
-            let expected_names: Vec<&str> = expected.entries.iter().map(|s| s.as_str()).collect();
-            if actual != expected_names {
-                return Err(anyhow::anyhow!(
-                    "{panel_name} panel entries mismatch.\n  Expected: {expected_names:?}\n  Actual:   {actual:?}"
-                ));
-            }
+    }
+    if let Some(ref expected_selected) = expected.selected {
+        let actual_selected = panel
+            .browser
+            .entries
+            .get(panel.browser.selected_index)
+            .map(|e| e.name.as_str())
+            .unwrap_or("<none>");
+        if actual_selected != expected_selected {
+            return Err(anyhow::anyhow!(
+                "{panel_name} panel selected mismatch: expected \"{expected_selected}\", got \"{actual_selected}\""
+            ));
+        }
+    }
+    if let Some(ref expected_mode) = expected.browser_mode {
+        let actual_mode = browser_mode_str(&panel.browser.browser_mode);
+        if actual_mode != expected_mode {
+            return Err(anyhow::anyhow!(
+                "{panel_name} panel browser_mode mismatch: expected \"{expected_mode}\", got \"{actual_mode}\""
+            ));
+        }
+    }
+    if let Some(ref expected_mode) = expected.panel_mode {
+        let actual_mode = panel_mode_str(panel);
+        if actual_mode != expected_mode {
+            return Err(anyhow::anyhow!(
+                "{panel_name} panel mode mismatch: expected \"{expected_mode}\", got \"{actual_mode}\""
+            ));
+        }
+    }
+    if !expected.marked.is_empty() {
+        let mut actual_marked: Vec<&str> =
+            panel.browser.marked.iter().map(|s| s.as_str()).collect();
+        actual_marked.sort();
+        let mut expected_marked: Vec<&str> = expected.marked.iter().map(|s| s.as_str()).collect();
+        expected_marked.sort();
+        if actual_marked != expected_marked {
+            return Err(anyhow::anyhow!(
+                "{panel_name} panel marked mismatch.\n  Expected: {expected_marked:?}\n  Actual:   {actual_marked:?}"
+            ));
         }
     }
     Ok(())

@@ -14,10 +14,6 @@ if [[ ! -x "${fileman_bin}" ]]; then
   exit 1
 fi
 
-if [[ -d "${out_dir}" ]]; then
-  find "${out_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-fi
-
 shopt -s nullglob
 cases=("${cases_dir}"/*.ron)
 shopt -u nullglob
@@ -28,6 +24,10 @@ fi
 
 failures=0
 for case in "${cases[@]}"; do
+  # Clean test output directory before each case for isolation
+  if [[ -d "${out_dir}" ]]; then
+    find "${out_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  fi
   "${fileman_bin}" --replay "${case}" || {
     echo "Replay failed: ${case}" >&2
     failures=$((failures + 1))

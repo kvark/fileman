@@ -89,27 +89,5 @@ cp etc/fileman.desktop ~/.local/share/applications/
 cp etc/fileman.svg ~/.local/share/icons/hicolor/scalable/apps/fileman.svg
 ```
 
-## Test Replays
-Replay cases live in `tests/cases/` and use the RON format. To run a case and emit a snapshot:
-```bash
-cargo run -- --replay tests/cases/preview.ron --snapshot /tmp/replay.png
-```
-To run all replay cases:
-```bash
-scripts/replay_runner.sh
-```
-To update the reference images:
-```bash
-cp target/test-artifacts/*.png etc/snapshots/tests/
-```
-
-## Repository Layout
-- `src/main.rs` — app entry point, event loop, directory loading
-- `src/archive.rs` — container plugins (zip, tar, tar.gz, tar.bz2)
-- `src/core.rs` — shared types and utilities
-- `src/app_state.rs` — application state
-- `src/input.rs` — keyboard handling
-- `src/ui/` — UI components (panel, preview, help)
-- `src/image_decode.rs` — image decoding (including animated GIF)
-- `themes/` — external theme files
-- `etc/` — desktop entry, icon, test snapshots
+## Contributing
+See [CONTRIBUTING.md](CONTRIBUTING.md) for repository layout, testing, and code style.

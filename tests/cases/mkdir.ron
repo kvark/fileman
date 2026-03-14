@@ -1,0 +1,31 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Navigate into "out" directory
+    (key: "select:out"),
+    (key: "Enter"),
+    (key: "Wait"),
+    // Create a new directory with F7 (starts inline rename with "new_dir")
+    (key: "F7"),
+    // Replace the default name
+    (key: "replace:test_mkdir"),
+    (key: "Enter"),
+    (key: "Wait"),
+  ],
+  asserts: (
+    fs: Some((
+      mode: Contains,
+      entries: [
+        (path: "out/test_mkdir", kind: Dir),
+      ],
+    )),
+    // The new dir should appear in the listing
+    left_panel: Some((
+      mode: Contains,
+      entries: ["test_mkdir"],
+      browser_mode: Some("Fs"),
+      selected: Some("test_mkdir"),
+    )),
+  ),
+)

@@ -1,0 +1,26 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Enter "out" directory
+    (key: "select:out"),
+    (key: "Enter"),
+    (key: "Wait"),
+    // Go back via Alt+Left
+    (key: "Left", modifiers: ["Alt"]),
+    (key: "Wait"),
+    // Go forward via Alt+Right
+    (key: "Right", modifiers: ["Alt"]),
+    (key: "Wait"),
+    // Go back via Backspace
+    (key: "Backspace"),
+    (key: "Wait"),
+  ],
+  asserts: (
+    left_panel: Some((
+      mode: Contains,
+      entries: ["..", "out", "binary.bin", "source.txt"],
+      browser_mode: Some("Fs"),
+    )),
+  ),
+)

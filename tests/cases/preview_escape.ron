@@ -1,0 +1,21 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Select source.txt and open preview (opens on opposite panel)
+    (key: "select:source.txt"),
+    (key: "F3"),
+    (key: "Wait"),
+  ],
+  asserts: (
+    // Left panel stays in Browser mode with selection preserved
+    left_panel: Some((
+      panel_mode: Some("Browser"),
+      selected: Some("source.txt"),
+    )),
+    // Right panel should now be in Preview mode
+    right_panel: Some((
+      panel_mode: Some("Preview"),
+    )),
+  ),
+)

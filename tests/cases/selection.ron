@@ -1,0 +1,20 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Move to first file entry (skip "..")
+    (key: "Down"),
+    // Mark "out" with Insert (Insert marks + moves down)
+    (key: "Insert"),
+    // Now on "binary.bin", mark it too
+    (key: "Insert"),
+    // Now on "source.txt", don't mark it
+  ],
+  asserts: (
+    left_panel: Some((
+      // After two Insert presses, cursor should be on source.txt
+      selected: Some("source.txt"),
+      marked: ["out", "binary.bin"],
+    )),
+  ),
+)

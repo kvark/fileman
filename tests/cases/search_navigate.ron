@@ -1,0 +1,23 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Open search dialog
+    (key: "F7", modifiers: ["Alt"]),
+    // Type search query
+    (key: "text:source"),
+    // Start search
+    (key: "Enter"),
+    // Wait for search results
+    (key: "Wait"),
+  ],
+  asserts: (
+    // Verify we're in search mode with results
+    left_panel: Some((
+      mode: Contains,
+      entries: ["source.txt"],
+      browser_mode: Some("Search"),
+      panel_mode: Some("Browser"),
+    )),
+  ),
+)
