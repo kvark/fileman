@@ -70,16 +70,17 @@ drivers or use the GLES fallback:
 RUSTFLAGS="--cfg gles" cargo run
 ```
 
-## macOS App Bundle
-Install `cargo-bundle` once:
+## App Bundling
+Install `cargo-bundle` from git (the crates.io release has a Windows bug):
 ```bash
-cargo install cargo-bundle
+cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle
 ```
 Then build the bundle:
 ```bash
 cargo bundle --release
 ```
-The icon is configured in `Cargo.toml` via `package.metadata.bundle.icon` and uses `etc/macos/icon.png`.
+On macOS this produces a `.app` bundle, on Windows an `.msi` installer.
+Icons are configured in `Cargo.toml` via `package.metadata.bundle.icon`.
 
 ## Linux Desktop Integration
 Copy the desktop entry and icon to the standard locations:

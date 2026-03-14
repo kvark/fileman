@@ -43,7 +43,10 @@ jobs:
       - name: Build (macOS)
         if: matrix.os == 'macos-latest'
         run: |
-          cargo install cargo-bundle
+          # Install from git: the crates.io release has a bug where binary_path()
+          # omits the .exe extension on Windows, causing bundling to fail.
+          # The fix is on master but hasn't been published to crates.io yet.
+          cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle
           rustup target add aarch64-apple-darwin
           cargo bundle --release --target aarch64-apple-darwin
           mkdir -p dist
