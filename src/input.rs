@@ -4,9 +4,11 @@ use fileman::{app_state, archive, core};
 
 use crate::{
     ContainerLoadMode, UiCache, active_window_rows, apply_panel_snapshot, cancel_search,
-    load_container_directory_async, load_fs_directory_async, open_props_dialog, open_search,
+    load_container_directory_async, load_fs_directory_async, open_search,
     preview_find_next, refresh_active_panel, refresh_fs_panels, start_search,
 };
+#[cfg(unix)]
+use crate::open_props_dialog;
 
 pub(crate) fn open_selected(app: &mut app_state::AppState) {
     let active = app.active_panel;
@@ -354,12 +356,14 @@ pub(crate) fn handle_keyboard(
             ctx.request_repaint();
         }
     }
-    let alt_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter));
     #[cfg(unix)]
-    if alt_enter {
-        open_props_dialog(app);
-        ctx.request_repaint();
-        return;
+    {
+        let alt_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter));
+        if alt_enter {
+            open_props_dialog(app);
+            ctx.request_repaint();
+            return;
+        }
     }
     let shift_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
     if shift_enter {
