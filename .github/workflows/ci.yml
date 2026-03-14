@@ -19,17 +19,23 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
-  ci-status:
-    if: always()
-    needs: [build-test, replay]
-    runs-on: ubuntu-latest
+  cross-platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Successful
-        if: ${{ !(contains(needs.*.result, 'failure')) }}
-        run: exit 0
-      - name: Failing
-        if: ${{ contains(needs.*.result, 'failure') }}
-        run: exit 1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build
+      - name: Build release
+        run: cargo build --release
+      - name: Test
+        run: cargo test
+      - name: Clippy
+        run: cargo clippy -- -D warnings
 
   replay:
     runs-on: ubuntu-latest
