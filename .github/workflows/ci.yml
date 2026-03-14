@@ -19,6 +19,24 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+  build-gles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (GLES)
+        run: cargo build
+        env:
+          RUSTFLAGS: "--cfg gles"
+      - name: Test (GLES)
+        run: cargo test
+        env:
+          RUSTFLAGS: "--cfg gles"
+      - name: Clippy (GLES)
+        run: cargo clippy -- -D warnings
+        env:
+          RUSTFLAGS: "--cfg gles"
+
   cross-platform:
     strategy:
       fail-fast: false

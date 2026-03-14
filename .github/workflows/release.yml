@@ -15,44 +15,113 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: fileman-linux-x86_64.tar.gz
+            variant: vulkan
+            rustflags: ""
+            suffix: ""
+          - os: ubuntu-latest
+            variant: gles
+            rustflags: "--cfg gles"
+            suffix: "-gles"
           - os: windows-latest
-            artifact: fileman-windows-x86_64.zip
+            variant: default
+            rustflags: ""
+            suffix: ""
           - os: macos-latest
-            artifact: fileman-macos-aarch64.zip
+            variant: default
+            rustflags: ""
+            suffix: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      # --- Linux ---
+      - name: Install packaging tools (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo install cargo-deb cargo-generate-rpm
+
       - name: Build (Linux)
         if: matrix.os == 'ubuntu-latest'
+        run: cargo build --release --bin fileman
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Package tarball (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: |
-          cargo build --release --bin fileman
           mkdir -p dist
-          tar -C target/release -czf dist/${{ matrix.artifact }} fileman
+          tar -C target/release -czf dist/fileman-linux-x86_64${{ matrix.suffix }}.tar.gz fileman
 
-      - name: Build (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
+      - name: Package deb + rpm (Linux Vulkan)
+        if: matrix.os == 'ubuntu-latest' && matrix.variant == 'vulkan'
         run: |
-          cargo build --release --bin fileman
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path target/release/fileman.exe -DestinationPath dist/${{ matrix.artifact }}
+          cargo deb --no-build
+          cp target/debian/*.deb dist/
+          cargo generate-rpm
+          cp target/generate-rpm/*.rpm dist/
 
+      - name: Package AppImage (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Download appimagetool
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+          # Build AppDir structure
+          mkdir -p Fileman.AppDir/usr/bin
+          mkdir -p Fileman.AppDir/usr/share/applications
+          mkdir -p Fileman.AppDir/usr/share/icons/hicolor/scalable/apps
+          cp target/release/fileman Fileman.AppDir/usr/bin/fileman
+          cp etc/fileman.desktop Fileman.AppDir/fileman.desktop
+          cp etc/fileman.svg Fileman.AppDir/fileman.svg
+          cp etc/fileman.desktop Fileman.AppDir/usr/share/applications/fileman.desktop
+          cp etc/fileman.svg Fileman.AppDir/usr/share/icons/hicolor/scalable/apps/fileman.svg
+          ln -s usr/bin/fileman Fileman.AppDir/AppRun
+
+          # Build AppImage (no FUSE on GitHub runners)
+          APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool Fileman.AppDir dist/fileman-linux-x86_64${{ matrix.suffix }}.AppImage
+        env:
+          ARCH: x86_64
+
+      # --- macOS ---
       - name: Build (macOS)
         if: matrix.os == 'macos-latest'
         run: |
-          # Install from git: the crates.io release has a bug where binary_path()
-          # omits the .exe extension on Windows, causing bundling to fail.
-          # The fix is on master but hasn't been published to crates.io yet.
           cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle
           rustup target add aarch64-apple-darwin
           cargo bundle --release --target aarch64-apple-darwin
-          mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent target/aarch64-apple-darwin/release/bundle/osx/Fileman.app dist/${{ matrix.artifact }}
 
+      - name: Package (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          mkdir -p dist
+          codesign --sign - --deep --force target/aarch64-apple-darwin/release/bundle/osx/Fileman.app
+          ditto -c -k --sequesterRsrc --keepParent target/aarch64-apple-darwin/release/bundle/osx/Fileman.app dist/fileman-macos-aarch64.zip
+
+      # --- Windows ---
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: cargo build --release --bin fileman
+
+      - name: Package zip (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/fileman.exe -DestinationPath dist/fileman-windows-x86_64.zip
+
+      - name: Package MSI (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cargo install cargo-wix
+          cargo wix init --force
+          cargo wix --no-build --nocapture
+          Copy-Item target/wix/*.msi dist/
+
+      # --- Upload ---
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.artifact }}
+          files: dist/*
