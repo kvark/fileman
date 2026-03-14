@@ -269,6 +269,9 @@ fn highlight_text_job(
     if ext.as_deref() == Some("nix") {
         return fileman::syntax::nix::highlight_nix_job(text, theme_kind);
     }
+    if ext.as_deref() == Some("ron") {
+        return fileman::syntax::ron::highlight_ron_job(text, theme_kind);
+    }
     let by_name_ci = |name: &str| {
         let needle = name.to_ascii_lowercase();
         SYNTAX_SET
