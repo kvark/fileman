@@ -1,0 +1,33 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Open search dialog
+    (key: "F7", modifiers: ["Alt"]),
+    // Type search query
+    (key: "text:source"),
+    // Start search
+    (key: "Enter"),
+    // Wait for search results
+    (key: "Wait"),
+    // Escape should return to original directory listing
+    (key: "Escape"),
+    (key: "Wait"),
+  ],
+  asserts: (
+    // Verify no spurious new_dir was created by F7 leaking through
+    fs: Some((
+      mode: Exact,
+      entries: [
+        (path: "out", kind: Dir),
+        (path: "source.txt", kind: File),
+        (path: "binary.bin", kind: File),
+      ],
+    )),
+    // Verify Escape restored original directory (not search results)
+    left_panel: Some((
+      mode: Contains,
+      entries: ["..", "source.txt", "binary.bin", "out"],
+    )),
+  ),
+)

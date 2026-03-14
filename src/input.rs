@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 
 use fileman::{app_state, archive, core};
 
-use crate::{
-    ContainerLoadMode, UiCache, active_window_rows, apply_panel_snapshot, cancel_search,
-    load_container_directory_async, load_fs_directory_async, open_search,
-    preview_find_next, refresh_active_panel, refresh_fs_panels, start_search,
-};
 #[cfg(unix)]
 use crate::open_props_dialog;
+use crate::{
+    ContainerLoadMode, UiCache, active_window_rows, apply_panel_snapshot, cancel_search,
+    load_container_directory_async, load_fs_directory_async, open_search, preview_find_next,
+    refresh_active_panel, refresh_fs_panels, start_search,
+};
 
 pub(crate) fn open_selected(app: &mut app_state::AppState) {
     let active = app.active_panel;
@@ -371,7 +371,7 @@ pub(crate) fn handle_keyboard(
         ctx.request_repaint();
         return;
     }
-    if input.key_pressed(egui::Key::Escape) {
+    if input.key_pressed(egui::Key::Escape) && app.preview_panel_side().is_none() {
         let panel = app.get_active_panel();
         let browser = &panel.browser;
         if matches!(browser.browser_mode, core::BrowserMode::Search { .. }) {
@@ -467,12 +467,14 @@ pub(crate) fn handle_keyboard(
                 app.get_active_panel().browser.browser_mode,
                 core::BrowserMode::Search { .. }
             ) {
-                // Open selected result.
+                // Fall through to open selected result below.
             } else {
                 start_search(app);
+                app.search_ui = app_state::SearchUiState::Closed;
+                ctx.request_repaint();
+                // Don't fall through — search just started, no results to navigate yet.
             }
-        }
-        if matches!(
+        } else if matches!(
             app.get_active_panel().browser.browser_mode,
             core::BrowserMode::Search { .. }
         ) {
@@ -626,26 +628,31 @@ pub(crate) fn handle_keyboard(
         app.prepare_copy_selected();
         ctx.request_repaint();
     }
-    if input.key_pressed(egui::Key::F6) && !other_panel_preview {
-        app.prepare_move_selected();
-        ctx.request_repaint();
-    }
-    if input.key_pressed(egui::Key::F4) {
-        app.prepare_edit_selected();
-        ctx.request_repaint();
-    }
+    // Modified F-key variants must be consumed before bare variants,
+    // because egui's consume_key(NONE, ...) matches regardless of modifiers.
     let shift_f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4));
     if shift_f4 {
         app.start_inline_new_file();
         ctx.request_repaint();
     }
-    if input.key_pressed(egui::Key::F7) {
-        app.start_inline_new_dir();
+    let f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F4));
+    if f4 {
+        app.prepare_edit_selected();
         ctx.request_repaint();
     }
     let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
     if shift_f6 {
         app.prepare_rename_selected();
+        ctx.request_repaint();
+    }
+    let f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F6));
+    if f6 && !other_panel_preview {
+        app.prepare_move_selected();
+        ctx.request_repaint();
+    }
+    let f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F7));
+    if f7 {
+        app.start_inline_new_dir();
         ctx.request_repaint();
     }
     if input.key_pressed(egui::Key::F9) {

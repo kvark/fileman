@@ -5,6 +5,8 @@
 
 use blade_egui as be;
 use blade_graphics as bg;
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
@@ -16,8 +18,6 @@ use std::{
     thread,
     time::UNIX_EPOCH,
 };
-#[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 mod image_decode;
 mod input;
