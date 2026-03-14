@@ -17,17 +17,20 @@
   asserts: (
     // Verify no spurious new_dir was created by F7 leaking through
     fs: Some((
-      mode: Exact,
+      mode: Contains,
       entries: [
         (path: "out", kind: Dir),
         (path: "source.txt", kind: File),
         (path: "binary.bin", kind: File),
       ],
     )),
-    // Verify Escape restored original directory (not search results)
+    // Verify Escape restored original directory with no spurious entries
     left_panel: Some((
-      mode: Contains,
-      entries: ["..", "source.txt", "binary.bin", "out"],
+      mode: Exact,
+      entries: ["..", "out", "binary.bin", "source.txt"],
+      browser_mode: Some("Fs"),
+      panel_mode: Some("Browser"),
+      selected: Some(".."),
     )),
   ),
 )

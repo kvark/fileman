@@ -133,8 +133,7 @@ pub fn highlight_ron_job(text: &str, theme_kind: ThemeKind) -> egui::text::Layou
                 }
                 while i < bytes.len() {
                     let c = bytes[i];
-                    if c.is_ascii_digit() || c == b'.' || c == b'_' || c == b'x' || c == b'o'
-                    {
+                    if c.is_ascii_digit() || c == b'.' || c == b'_' || c == b'x' || c == b'o' {
                         i += 1;
                     } else {
                         break;

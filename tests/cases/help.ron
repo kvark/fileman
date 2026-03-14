@@ -1,0 +1,18 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Open help screen
+    (key: "F1"),
+  ],
+  asserts: (
+    // Help opens on the opposite (right) panel
+    right_panel: Some((
+      panel_mode: Some("Help"),
+    )),
+    // Left panel remains in Browser mode
+    left_panel: Some((
+      panel_mode: Some("Browser"),
+    )),
+  ),
+)

@@ -1,0 +1,25 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Move down on left panel
+    (key: "Down"),
+    (key: "Down"),
+    // Switch to right panel
+    (key: "Tab"),
+    // Move down once on right panel
+    (key: "Down"),
+  ],
+  asserts: (
+    // Left panel: cursor should remain at index 2 (binary.bin)
+    left_panel: Some((
+      selected: Some("binary.bin"),
+      panel_mode: Some("Browser"),
+    )),
+    // Right panel is active, cursor at index 1 (out)
+    right_panel: Some((
+      selected: Some("out"),
+      panel_mode: Some("Browser"),
+    )),
+  ),
+)
