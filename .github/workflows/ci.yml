@@ -19,6 +19,18 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+  ci-status:
+    if: always()
+    needs: [build-test, replay]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Successful
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+      - name: Failing
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1
+
   replay:
     runs-on: ubuntu-latest
     steps:
