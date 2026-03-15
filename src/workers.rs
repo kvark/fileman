@@ -321,6 +321,7 @@ fn send_streaming_preview<R: Read>(
     let mut buf = vec![0u8; PREVIEW_CHUNK_BYTES];
     let mut decided = force_text;
     let mut is_text = force_text;
+    let mut bom_stripped = false;
 
     while remaining > 0 {
         if !is_preview_current(current_id, id) {
@@ -338,6 +339,13 @@ fn send_streaming_preview<R: Read>(
             decided = true;
         }
         if is_text {
+            // Strip UTF-8 BOM from the first chunk
+            let chunk = if !bom_stripped {
+                bom_stripped = true;
+                chunk.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(chunk)
+            } else {
+                chunk
+            };
             let text = String::from_utf8_lossy(chunk).into_owned();
             let _ = tx.send((
                 id,
