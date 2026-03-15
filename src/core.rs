@@ -516,11 +516,19 @@ pub fn is_probably_text(bytes: &[u8]) -> bool {
     if bytes.contains(&0) {
         return false;
     }
+    // Strip UTF-8 BOM if present
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    // Valid UTF-8 is almost certainly text
+    if std::str::from_utf8(bytes).is_ok() {
+        return true;
+    }
+    // Fall back to printable ASCII ratio for non-UTF-8 encodings
     let mut printable = 0usize;
     for &b in bytes {
         match b {
             0x09 | 0x0A | 0x0D => printable += 1,
             0x20..=0x7E => printable += 1,
+            0x80..=0xFF => printable += 1, // high bytes (Latin-1, etc.)
             _ => {}
         }
     }
