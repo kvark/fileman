@@ -108,6 +108,10 @@ pub fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
         return decode_hdr_bytes(bytes, max_side);
     }
 
+    if bytes.len() >= 4 && &bytes[..4] == b"DDS " {
+        return decode_dds_bytes(bytes, max_side);
+    }
+
     // TGA has no magic bytes; try it as a last resort
     if bytes.len() >= 18 {
         if let Some(result) = decode_tga_bytes(bytes, max_side) {
@@ -231,6 +235,31 @@ fn decode_webp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Image
         }
         out
     };
+    let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
+    let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    Some((
+        DecodedImage::Static(color),
+        ImageMeta {
+            width,
+            height,
+            depth: zune_core::bit_depth::BitDepth::Eight,
+        },
+    ))
+}
+
+fn decode_dds_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
+    let cursor = io::Cursor::new(bytes);
+    let mut decoder = dds::Decoder::new(cursor).ok()?;
+    let size = decoder.main_size();
+    let width = size.width as usize;
+    let height = size.height as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pixel_count = width.checked_mul(height)?;
+    let mut rgba = vec![0u8; pixel_count * 4];
+    let view = dds::ImageViewMut::new(&mut rgba, size, dds::ColorFormat::RGBA_U8)?;
+    decoder.read_surface(view).ok()?;
     let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
     let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
     Some((
