@@ -113,10 +113,10 @@ pub fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
     }
 
     // TGA has no magic bytes; try it as a last resort
-    if bytes.len() >= 18 {
-        if let Some(result) = decode_tga_bytes(bytes, max_side) {
-            return Some(result);
-        }
+    if bytes.len() >= 18
+        && let Some(result) = decode_tga_bytes(bytes, max_side)
+    {
+        return Some(result);
     }
 
     None
@@ -308,7 +308,7 @@ fn decode_hdr_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
     // Decode scanlines
     for y in 0..height {
         let scanline = &mut rgbe_data[y * width..(y + 1) * width];
-        pos = hdr_read_scanline(&bytes, pos, scanline, width)?;
+        pos = hdr_read_scanline(bytes, pos, scanline, width)?;
     }
 
     // Convert RGBE to RGBA (tone-mapped to LDR)
@@ -357,7 +357,7 @@ fn hdr_read_scanline(bytes: &[u8], mut pos: usize, scanline: &mut [[u8; 4]], wid
     }
 
     // Check for new-style RLE: starts with 2, 2, width_hi, width_lo
-    if bytes[pos] == 2 && bytes[pos + 1] == 2 && width >= 8 && width <= 0x7FFF {
+    if bytes[pos] == 2 && bytes[pos + 1] == 2 && (8..=0x7FFF).contains(&width) {
         let line_w = ((bytes[pos + 2] as usize) << 8) | bytes[pos + 3] as usize;
         if line_w != width {
             return None;
@@ -365,6 +365,7 @@ fn hdr_read_scanline(bytes: &[u8], mut pos: usize, scanline: &mut [[u8; 4]], wid
         pos += 4;
 
         // Each channel is RLE-encoded separately
+        #[allow(clippy::needless_range_loop)]
         for ch in 0..4 {
             let mut x = 0;
             while x < width {
@@ -431,7 +432,7 @@ fn decode_tga_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
 
     let colormap_length = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
     let colormap_entry_size = bytes[7] as usize;
-    let colormap_bytes = colormap_length * ((colormap_entry_size + 7) / 8);
+    let colormap_bytes = colormap_length * colormap_entry_size.div_ceil(8);
     let pixel_data_offset = 18 + id_length + colormap_bytes;
     if pixel_data_offset > bytes.len() {
         return None;
@@ -508,8 +509,7 @@ fn tga_read_pixel(src: &[u8], pixel_depth: u8) -> Option<[u8; 4]> {
             let r = ((v & 0x7C00) >> 7) as u8 | ((v & 0x7C00) >> 12) as u8;
             let g = ((v & 0x03E0) >> 2) as u8 | ((v & 0x03E0) >> 7) as u8;
             let b = ((v & 0x001F) << 3) as u8 | ((v & 0x001F) >> 2) as u8;
-            let a = if v & 0x8000 != 0 { 255 } else { 255 }; // alpha bit often unused
-            Some([r, g, b, a])
+            Some([r, g, b, 255])
         }
         _ => None,
     }
@@ -522,7 +522,7 @@ fn tga_decode_uncompressed(
     height: usize,
     depth: u8,
 ) -> Option<()> {
-    let bpp = (depth as usize + 7) / 8;
+    let bpp = (depth as usize).div_ceil(8);
     let needed = width * height * bpp;
     if data.len() < needed {
         return None;
@@ -541,7 +541,7 @@ fn tga_decode_rle(
     height: usize,
     depth: u8,
 ) -> Option<()> {
-    let bpp = (depth as usize + 7) / 8;
+    let bpp = (depth as usize).div_ceil(8);
     let total = width * height;
     let mut src = 0;
     let mut dst = 0;
@@ -613,7 +613,7 @@ fn tga_decode_rle_gray(
     height: usize,
     depth: u8,
 ) -> Option<()> {
-    let bpp = (depth as usize + 7) / 8;
+    let bpp = (depth as usize).div_ceil(8);
     let total = width * height;
     let mut src = 0;
     let mut dst = 0;
