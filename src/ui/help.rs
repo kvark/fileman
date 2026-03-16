@@ -1,8 +1,15 @@
+use fileman::app_state::{AsyncStatus, SearchStatus};
 use fileman::theme;
 
 use crate::color32;
 
-pub fn draw_help(ui: &mut egui::Ui, theme: &theme::Theme, is_focused: bool, min_height: f32) {
+pub fn draw_help(
+    ui: &mut egui::Ui,
+    theme: &theme::Theme,
+    is_focused: bool,
+    min_height: f32,
+    async_status: &AsyncStatus,
+) {
     let colors = theme.colors();
     let version = env!("CARGO_PKG_VERSION");
     let shortcuts = [
@@ -52,6 +59,13 @@ pub fn draw_help(ui: &mut egui::Ui, theme: &theme::Theme, is_focused: bool, min_
             ui.add_space(8.0);
             ui.colored_label(color32(colors.preview_text), format!("Fileman {version}"));
             ui.colored_label(color32(colors.row_fg_inactive), "Author: Dzmitry Malyshau");
+
+            // Async workers status
+            ui.add_space(10.0);
+            ui.colored_label(color32(colors.preview_text), "Async Workers");
+            ui.add_space(6.0);
+            draw_async_status(ui, &colors, async_status);
+
             ui.add_space(10.0);
             ui.colored_label(color32(colors.preview_text), "Shortcuts");
             ui.add_space(6.0);
@@ -66,4 +80,64 @@ pub fn draw_help(ui: &mut egui::Ui, theme: &theme::Theme, is_focused: bool, min_
                 });
             }
         });
+}
+
+fn draw_async_status(
+    ui: &mut egui::Ui,
+    colors: &theme::ThemeColors,
+    status: &AsyncStatus,
+) {
+    // IO worker
+    let io_label = if status.io_in_flight == 0 {
+        "idle".to_string()
+    } else if status.io_cancel_requested {
+        format!("{} tasks (cancelling)", status.io_in_flight)
+    } else {
+        format!("{} tasks in flight", status.io_in_flight)
+    };
+    draw_worker_row(ui, colors, "IO", &io_label, status.io_in_flight > 0);
+
+    // Dir size worker
+    let dir_label = if status.dir_size_pending == 0 {
+        "idle".to_string()
+    } else {
+        format!("{} pending", status.dir_size_pending)
+    };
+    draw_worker_row(ui, colors, "Dir size", &dir_label, status.dir_size_pending > 0);
+
+    // Search worker
+    let (search_label, search_active) = match status.search {
+        SearchStatus::Idle => ("idle".to_string(), false),
+        SearchStatus::Running(progress) => (
+            format!("scanning ({} scanned, {} matched)", progress.scanned, progress.matched),
+            true,
+        ),
+        SearchStatus::Done(progress) => (
+            format!("done ({} scanned, {} matched)", progress.scanned, progress.matched),
+            false,
+        ),
+    };
+    draw_worker_row(ui, colors, "Search", &search_label, search_active);
+}
+
+fn draw_worker_row(
+    ui: &mut egui::Ui,
+    colors: &theme::ThemeColors,
+    name: &str,
+    status: &str,
+    active: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        ui.colored_label(
+            color32(colors.row_fg_selected),
+            egui::RichText::new(format!("{name}:")).monospace().strong(),
+        );
+        let color = if active {
+            colors.row_fg_active
+        } else {
+            colors.row_fg_inactive
+        };
+        ui.colored_label(color32(color), status);
+    });
 }
