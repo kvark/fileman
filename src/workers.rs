@@ -14,8 +14,8 @@ use std::{
 use crate::core::{
     EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
     SearchMode, SearchProgress, SearchRequest, SearchResult, copy_container_dir,
-    copy_container_entry, copy_recursively, format_container_listing, is_probably_text,
-    is_text_name, is_text_path, read_container_directory,
+    copy_container_entry, copy_recursively, create_archive, format_container_listing,
+    is_probably_text, is_text_name, is_text_path, read_container_directory,
 };
 
 const PREVIEW_CHUNK_BYTES: usize = 16 * 1024;
@@ -125,6 +125,15 @@ pub fn start_io_worker() -> (
                 IOTask::Mkdir { path } => {
                     if let Err(e) = std::fs::create_dir(&path) {
                         eprintln!("Mkdir error: {e}");
+                    }
+                }
+                IOTask::Pack {
+                    sources,
+                    archive_path,
+                    kind,
+                } => {
+                    if let Err(e) = create_archive(&sources, &archive_path, kind) {
+                        eprintln!("Pack error: {e}");
                     }
                 }
                 #[cfg(unix)]

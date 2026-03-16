@@ -255,6 +255,10 @@ pub enum PendingOp {
     Rename {
         src: path::PathBuf,
     },
+    Pack {
+        sources: Vec<path::PathBuf>,
+        dst_dir: path::PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -990,6 +994,27 @@ impl AppState {
         }
     }
 
+    pub fn prepare_pack_selected(&mut self) {
+        if self.pending_op.is_some() {
+            return;
+        }
+        if let Some(op) = self.build_pack_op() {
+            self.pending_op = Some(op);
+            // Pre-fill archive name based on first source
+            let name = match self.pending_op {
+                Some(PendingOp::Pack { ref sources, .. }) => sources
+                    .first()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|n| format!("{n}.zip"))
+                    .unwrap_or_else(|| "archive.zip".to_string()),
+                _ => "archive.zip".to_string(),
+            };
+            self.rename_input = Some(name);
+            self.rename_focus = true;
+        }
+    }
+
     pub fn take_pending_op(&mut self) -> Option<PendingOp> {
         self.pending_op.take()
     }
@@ -1067,6 +1092,21 @@ impl AppState {
                     self.enqueue_io(IOTask::Rename {
                         src: src.clone(),
                         new_name,
+                    });
+                }
+            }
+            PendingOp::Pack {
+                ref sources,
+                ref dst_dir,
+            } => {
+                if let Some(archive_name) = self.rename_input.clone() {
+                    let archive_path = dst_dir.join(&archive_name);
+                    let kind = crate::core::container_kind_from_path(&archive_path)
+                        .unwrap_or(ContainerKind::Zip);
+                    self.enqueue_io(IOTask::Pack {
+                        sources: sources.clone(),
+                        archive_path,
+                        kind,
                     });
                 }
             }
@@ -1184,6 +1224,28 @@ impl AppState {
             return None;
         }
         Some(PendingOp::Delete { targets })
+    }
+
+    fn build_pack_op(&self) -> Option<PendingOp> {
+        let indices = self.effective_selection();
+        if indices.is_empty() {
+            return None;
+        }
+        let browser = &self.get_active_panel().browser;
+        // Only pack filesystem entries
+        let sources: Vec<path::PathBuf> = indices
+            .iter()
+            .filter_map(|&i| match browser.entries[i].location {
+                EntryLocation::Fs(ref path) => Some(path.clone()),
+                EntryLocation::Container { .. } => None,
+            })
+            .collect();
+        if sources.is_empty() {
+            return None;
+        }
+        // Archive goes into the current panel's directory
+        let dst_dir = browser.current_path.clone();
+        Some(PendingOp::Pack { sources, dst_dir })
     }
 
     pub fn switch_theme(&mut self) {

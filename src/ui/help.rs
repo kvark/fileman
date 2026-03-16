@@ -21,6 +21,7 @@ pub fn draw_help(ui: &mut egui::Ui, theme: &theme::Theme, is_focused: bool, min_
         ("Insert", "Mark / unmark"),
         ("Shift+F6", "Rename"),
         ("F5", "Copy"),
+        ("Alt+F5", "Pack (create archive)"),
         ("F6", "Move"),
         ("F8", "Delete"),
         ("Space", "Compute folder size"),
