@@ -2199,6 +2199,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let context = unsafe {
             match bg::Context::init(bg::ContextDesc {
                 presentation: true,
+                xr: None,
+                ray_tracing: false,
                 validation: cfg!(debug_assertions),
                 timing: false,
                 capture: false,
