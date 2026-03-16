@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{self, Path},
 };
 
@@ -1224,6 +1224,107 @@ impl ContainerPlugin for TarGzPlugin {
         }
         Ok(None)
     }
+}
+
+pub fn create_archive(
+    sources: &[path::PathBuf],
+    archive_path: &Path,
+    kind: ContainerKind,
+) -> io::Result<()> {
+    match kind {
+        ContainerKind::Zip => create_zip_archive(sources, archive_path),
+        ContainerKind::Tar => create_tar_archive(sources, archive_path),
+        ContainerKind::TarGz => create_tar_gz_archive(sources, archive_path),
+        ContainerKind::TarBz2 => create_tar_bz2_archive(sources, archive_path),
+    }
+}
+
+fn create_zip_archive(sources: &[path::PathBuf], archive_path: &Path) -> io::Result<()> {
+    let file = fs::File::create(archive_path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for src in sources {
+        add_path_to_zip(&mut zip, src, "", options)?;
+    }
+    zip.finish().map_err(io::Error::other)?;
+    Ok(())
+}
+
+fn add_path_to_zip<W: Write + io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    path: &Path,
+    prefix: &str,
+    options: zip::write::FileOptions,
+) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let archive_name = if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    };
+    if path.is_dir() {
+        let dir_name = format!("{archive_name}/");
+        zip.add_directory(&dir_name, options).map_err(io::Error::other)?;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            add_path_to_zip(zip, &entry.path(), &archive_name, options)?;
+        }
+    } else {
+        zip.start_file(&archive_name, options).map_err(io::Error::other)?;
+        let mut file = fs::File::open(path)?;
+        io::copy(&mut file, zip)?;
+    }
+    Ok(())
+}
+
+fn create_tar_archive(sources: &[path::PathBuf], archive_path: &Path) -> io::Result<()> {
+    let file = fs::File::create(archive_path)?;
+    let mut builder = tar::Builder::new(file);
+    for src in sources {
+        append_path_to_tar(&mut builder, src)?;
+    }
+    builder.finish()?;
+    Ok(())
+}
+
+fn create_tar_gz_archive(sources: &[path::PathBuf], archive_path: &Path) -> io::Result<()> {
+    let file = fs::File::create(archive_path)?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    for src in sources {
+        append_path_to_tar(&mut builder, src)?;
+    }
+    builder.into_inner()?.finish()?;
+    Ok(())
+}
+
+fn create_tar_bz2_archive(sources: &[path::PathBuf], archive_path: &Path) -> io::Result<()> {
+    let file = fs::File::create(archive_path)?;
+    let encoder = bzip2::write::BzEncoder::new(file, bzip2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    for src in sources {
+        append_path_to_tar(&mut builder, src)?;
+    }
+    builder.into_inner()?.finish()?;
+    Ok(())
+}
+
+fn append_path_to_tar<W: Write>(builder: &mut tar::Builder<W>, path: &Path) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    if path.is_dir() {
+        builder.append_dir_all(name, path)?;
+    } else {
+        let mut file = fs::File::open(path)?;
+        builder.append_file(name, &mut file)?;
+    }
+    Ok(())
 }
 
 impl ContainerPlugin for TarBz2Plugin {

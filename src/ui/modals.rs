@@ -22,7 +22,10 @@ pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
     );
     let mut confirmed = false;
     let mut cancelled = false;
-    let is_rename = matches!(op, app_state::PendingOp::Rename { .. });
+    let is_rename = matches!(
+        op,
+        app_state::PendingOp::Rename { .. } | app_state::PendingOp::Pack { .. }
+    );
 
     egui::Window::new(title)
         .collapsible(false)
@@ -238,5 +241,24 @@ fn pending_op_text(op: &app_state::PendingOp) -> (&'static str, String) {
                     .unwrap_or("<unknown>")
             ),
         ),
+        app_state::PendingOp::Pack { sources, dst_dir } => {
+            let body = if sources.len() == 1 {
+                format!(
+                    "Pack \"{}\" into archive\n(in {}):",
+                    sources[0]
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<unknown>"),
+                    dst_dir.to_string_lossy()
+                )
+            } else {
+                format!(
+                    "Pack {} items into archive\n(in {}):",
+                    sources.len(),
+                    dst_dir.to_string_lossy()
+                )
+            };
+            ("Pack", body)
+        }
     }
 }

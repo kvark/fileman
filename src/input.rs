@@ -624,6 +624,11 @@ pub(crate) fn handle_keyboard(
     let other_panel_preview = app
         .preview_panel_side()
         .is_some_and(|side| side != app.active_panel);
+    let alt_f5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F5));
+    if alt_f5 && !other_panel_preview {
+        app.prepare_pack_selected();
+        ctx.request_repaint();
+    }
     if input.key_pressed(egui::Key::F5) && !other_panel_preview {
         app.prepare_copy_selected();
         ctx.request_repaint();
@@ -746,12 +751,29 @@ pub(crate) fn confirm_pending_op(app: &mut app_state::AppState) {
                 name,
             );
         }
+        if let app_state::PendingOp::Pack { .. } = &op {
+            let name = app.rename_input.clone().unwrap_or_default();
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\\')
+            {
+                app.clear_pending_op();
+                return;
+            }
+            if archive::container_kind_from_path(std::path::Path::new(&name)).is_none() {
+                app.clear_pending_op();
+                return;
+            }
+        }
         app.enqueue_pending_op(&op);
         match op {
             app_state::PendingOp::Copy { .. }
             | app_state::PendingOp::Move { .. }
             | app_state::PendingOp::Rename { .. } => refresh_fs_panels(app),
             app_state::PendingOp::Delete { .. } => refresh_active_panel(app),
+            app_state::PendingOp::Pack { .. } => refresh_active_panel(app),
         }
     }
 }

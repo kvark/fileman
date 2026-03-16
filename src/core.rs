@@ -8,9 +8,9 @@ use std::{
 
 pub use crate::archive::{
     ContainerKind, container_display_path, container_kind_from_path, copy_container_dir,
-    copy_container_entry, format_container_listing, is_container_path, normalize_archive_path,
-    read_container_bytes_prefix, read_container_directory, read_container_directory_with_progress,
-    read_container_metadata,
+    copy_container_entry, create_archive, format_container_listing, is_container_path,
+    normalize_archive_path, read_container_bytes_prefix, read_container_directory,
+    read_container_directory_with_progress, read_container_metadata,
 };
 
 #[derive(Clone)]
@@ -158,6 +158,11 @@ pub enum IOTask {
         uid: u32,
         gid: u32,
         recursive: bool,
+    },
+    Pack {
+        sources: Vec<path::PathBuf>,
+        archive_path: path::PathBuf,
+        kind: crate::archive::ContainerKind,
     },
 }
 
