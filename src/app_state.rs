@@ -280,7 +280,23 @@ pub enum SearchStatus {
     Done(crate::core::SearchProgress),
 }
 
+pub struct AsyncStatus {
+    pub io_in_flight: usize,
+    pub io_cancel_requested: bool,
+    pub dir_size_pending: usize,
+    pub search: SearchStatus,
+}
+
 impl AppState {
+    pub fn async_status(&self) -> AsyncStatus {
+        AsyncStatus {
+            io_in_flight: self.io_in_flight,
+            io_cancel_requested: self.io_cancel_requested,
+            dir_size_pending: self.dir_size_pending.len(),
+            search: self.search_status,
+        }
+    }
+
     pub fn panel(&self, which: ActivePanel) -> &PanelState {
         match which {
             ActivePanel::Left => &self.left_panel,

@@ -2722,7 +2722,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                 let is_focused =
                                     runtime.app.active_panel == core::ActivePanel::Left;
                                 let theme = runtime.app.theme.clone();
-                                ui::help::draw_help(ui, &theme, is_focused, rect.height());
+                                let async_status = runtime.app.async_status();
+                                ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
                             } else {
                                 runtime.ui_cache.left_rows = ui::panel::draw_panel(
                                     ui,
@@ -2782,7 +2783,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                 let is_focused =
                                     runtime.app.active_panel == core::ActivePanel::Right;
                                 let theme = runtime.app.theme.clone();
-                                ui::help::draw_help(ui, &theme, is_focused, rect.height());
+                                let async_status = runtime.app.async_status();
+                                ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
                             } else {
                                 runtime.ui_cache.right_rows = ui::panel::draw_panel(
                                     ui,
@@ -3129,7 +3131,8 @@ fn draw_root_ui(render: UiRender<'_>) {
                 } else if let Some(_help) = app.help_panel(core::ActivePanel::Left) {
                     let is_focused = app.active_panel == core::ActivePanel::Left;
                     let theme = app.theme.clone();
-                    ui::help::draw_help(ui, &theme, is_focused, rect.height());
+                    let async_status = app.async_status();
+                    ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
                     ui_cache.left_rows
                 } else {
                     ui::panel::draw_panel(
@@ -3189,7 +3192,8 @@ fn draw_root_ui(render: UiRender<'_>) {
                 } else if let Some(_help) = app.help_panel(core::ActivePanel::Right) {
                     let is_focused = app.active_panel == core::ActivePanel::Right;
                     let theme = app.theme.clone();
-                    ui::help::draw_help(ui, &theme, is_focused, rect.height());
+                    let async_status = app.async_status();
+                    ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
                     ui_cache.right_rows
                 } else {
                     ui::panel::draw_panel(
