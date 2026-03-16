@@ -104,6 +104,10 @@ pub fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
         return decode_bmp_bytes(bytes, max_side);
     }
 
+    if bytes.starts_with(b"#?RADIANCE") || bytes.starts_with(b"#?RGBE") {
+        return decode_hdr_bytes(bytes, max_side);
+    }
+
     // TGA has no magic bytes; try it as a last resort
     if bytes.len() >= 18 {
         if let Some(result) = decode_tga_bytes(bytes, max_side) {
@@ -237,6 +241,147 @@ fn decode_webp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Image
             depth: zune_core::bit_depth::BitDepth::Eight,
         },
     ))
+}
+
+fn decode_hdr_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
+    // Skip header lines until empty line
+    let mut pos = 0;
+    loop {
+        let line_end = memchr::memchr(b'\n', &bytes[pos..])? + pos;
+        let line = &bytes[pos..line_end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        pos = line_end + 1;
+        if line.is_empty() {
+            break;
+        }
+    }
+
+    // Parse resolution line: "-Y height +X width"
+    let res_end = memchr::memchr(b'\n', &bytes[pos..])? + pos;
+    let res_line = std::str::from_utf8(&bytes[pos..res_end]).ok()?;
+    let res_line = res_line.trim();
+    pos = res_end + 1;
+
+    let mut parts = res_line.split_whitespace();
+    let (width, height) = match (parts.next()?, parts.next()?, parts.next()?, parts.next()?) {
+        ("-Y", h, "+X", w) => (w.parse::<usize>().ok()?, h.parse::<usize>().ok()?),
+        ("+X", w, "-Y", h) => (w.parse::<usize>().ok()?, h.parse::<usize>().ok()?),
+        _ => return None,
+    };
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let pixels = width.checked_mul(height)?;
+    let mut rgbe_data = vec![[0u8; 4]; pixels];
+
+    // Decode scanlines
+    for y in 0..height {
+        let scanline = &mut rgbe_data[y * width..(y + 1) * width];
+        pos = hdr_read_scanline(&bytes, pos, scanline, width)?;
+    }
+
+    // Convert RGBE to RGBA (tone-mapped to LDR)
+    let mut rgba = vec![0u8; pixels * 4];
+    for (i, rgbe) in rgbe_data.iter().enumerate() {
+        let (r, g, b) = rgbe_to_rgb(rgbe);
+        // Simple Reinhard tone mapping + gamma
+        let tone_map = |v: f32| -> u8 {
+            let mapped = v / (1.0 + v);
+            let gamma = mapped.powf(1.0 / 2.2);
+            (gamma * 255.0).clamp(0.0, 255.0) as u8
+        };
+        rgba[i * 4] = tone_map(r);
+        rgba[i * 4 + 1] = tone_map(g);
+        rgba[i * 4 + 2] = tone_map(b);
+        rgba[i * 4 + 3] = 255;
+    }
+
+    let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
+    let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    Some((
+        DecodedImage::Static(color),
+        ImageMeta {
+            width,
+            height,
+            depth: zune_core::bit_depth::BitDepth::Eight,
+        },
+    ))
+}
+
+fn rgbe_to_rgb(rgbe: &[u8; 4]) -> (f32, f32, f32) {
+    if rgbe[3] == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let exp = 2.0_f32.powi(rgbe[3] as i32 - 128 - 8);
+    (
+        rgbe[0] as f32 * exp,
+        rgbe[1] as f32 * exp,
+        rgbe[2] as f32 * exp,
+    )
+}
+
+fn hdr_read_scanline(bytes: &[u8], mut pos: usize, scanline: &mut [[u8; 4]], width: usize) -> Option<usize> {
+    if pos + 4 > bytes.len() {
+        return None;
+    }
+
+    // Check for new-style RLE: starts with 2, 2, width_hi, width_lo
+    if bytes[pos] == 2 && bytes[pos + 1] == 2 && width >= 8 && width <= 0x7FFF {
+        let line_w = ((bytes[pos + 2] as usize) << 8) | bytes[pos + 3] as usize;
+        if line_w != width {
+            return None;
+        }
+        pos += 4;
+
+        // Each channel is RLE-encoded separately
+        for ch in 0..4 {
+            let mut x = 0;
+            while x < width {
+                if pos >= bytes.len() {
+                    return None;
+                }
+                let code = bytes[pos];
+                pos += 1;
+                if code > 128 {
+                    // Run
+                    let count = (code - 128) as usize;
+                    if pos >= bytes.len() || x + count > width {
+                        return None;
+                    }
+                    let val = bytes[pos];
+                    pos += 1;
+                    for i in 0..count {
+                        scanline[x + i][ch] = val;
+                    }
+                    x += count;
+                } else {
+                    // Literal
+                    let count = code as usize;
+                    if count == 0 || pos + count > bytes.len() || x + count > width {
+                        return None;
+                    }
+                    for i in 0..count {
+                        scanline[x + i][ch] = bytes[pos + i];
+                    }
+                    pos += count;
+                    x += count;
+                }
+            }
+        }
+    } else {
+        // Old-style: raw RGBE pixels (possibly with old RLE)
+        for px in scanline.iter_mut() {
+            if pos + 4 > bytes.len() {
+                return None;
+            }
+            px.copy_from_slice(&bytes[pos..pos + 4]);
+            pos += 4;
+        }
+    }
+
+    Some(pos)
 }
 
 fn decode_tga_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
