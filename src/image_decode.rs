@@ -104,6 +104,13 @@ pub fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
         return decode_bmp_bytes(bytes, max_side);
     }
 
+    // TGA has no magic bytes; try it as a last resort
+    if bytes.len() >= 18 {
+        if let Some(result) = decode_tga_bytes(bytes, max_side) {
+            return Some(result);
+        }
+    }
+
     None
 }
 
@@ -230,6 +237,252 @@ fn decode_webp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Image
             depth: zune_core::bit_depth::BitDepth::Eight,
         },
     ))
+}
+
+fn decode_tga_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
+    if bytes.len() < 18 {
+        return None;
+    }
+    let id_length = bytes[0] as usize;
+    let image_type = bytes[2];
+    let width = u16::from_le_bytes([bytes[12], bytes[13]]) as usize;
+    let height = u16::from_le_bytes([bytes[14], bytes[15]]) as usize;
+    let pixel_depth = bytes[16];
+    let descriptor = bytes[17];
+    let top_origin = descriptor & 0x20 != 0;
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let colormap_length = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+    let colormap_entry_size = bytes[7] as usize;
+    let colormap_bytes = colormap_length * ((colormap_entry_size + 7) / 8);
+    let pixel_data_offset = 18 + id_length + colormap_bytes;
+    if pixel_data_offset > bytes.len() {
+        return None;
+    }
+    let pixel_data = &bytes[pixel_data_offset..];
+
+    let pixels = width.checked_mul(height)?;
+    let mut rgba = vec![0u8; pixels * 4];
+
+    match image_type {
+        // Uncompressed true-color
+        2 => {
+            tga_decode_uncompressed(pixel_data, &mut rgba, width, height, pixel_depth)?;
+        }
+        // RLE true-color
+        10 => {
+            tga_decode_rle(pixel_data, &mut rgba, width, height, pixel_depth)?;
+        }
+        // Uncompressed grayscale
+        3 => {
+            tga_decode_uncompressed_gray(pixel_data, &mut rgba, width, height, pixel_depth)?;
+        }
+        // RLE grayscale
+        11 => {
+            tga_decode_rle_gray(pixel_data, &mut rgba, width, height, pixel_depth)?;
+        }
+        _ => return None,
+    }
+
+    // Flip vertically if origin is bottom-left (default for TGA)
+    if !top_origin {
+        let row_bytes = width * 4;
+        let mut tmp = vec![0u8; row_bytes];
+        for y in 0..height / 2 {
+            let top = y * row_bytes;
+            let bot = (height - 1 - y) * row_bytes;
+            tmp.copy_from_slice(&rgba[top..top + row_bytes]);
+            rgba.copy_within(bot..bot + row_bytes, top);
+            rgba[bot..bot + row_bytes].copy_from_slice(&tmp);
+        }
+    }
+
+    let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
+    let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    Some((
+        DecodedImage::Static(color),
+        ImageMeta {
+            width,
+            height,
+            depth: zune_core::bit_depth::BitDepth::Eight,
+        },
+    ))
+}
+
+fn tga_read_pixel(src: &[u8], pixel_depth: u8) -> Option<[u8; 4]> {
+    match pixel_depth {
+        32 => {
+            if src.len() < 4 {
+                return None;
+            }
+            Some([src[2], src[1], src[0], src[3]]) // BGRA -> RGBA
+        }
+        24 => {
+            if src.len() < 3 {
+                return None;
+            }
+            Some([src[2], src[1], src[0], 255]) // BGR -> RGBA
+        }
+        16 => {
+            if src.len() < 2 {
+                return None;
+            }
+            let v = u16::from_le_bytes([src[0], src[1]]);
+            let r = ((v & 0x7C00) >> 7) as u8 | ((v & 0x7C00) >> 12) as u8;
+            let g = ((v & 0x03E0) >> 2) as u8 | ((v & 0x03E0) >> 7) as u8;
+            let b = ((v & 0x001F) << 3) as u8 | ((v & 0x001F) >> 2) as u8;
+            let a = if v & 0x8000 != 0 { 255 } else { 255 }; // alpha bit often unused
+            Some([r, g, b, a])
+        }
+        _ => None,
+    }
+}
+
+fn tga_decode_uncompressed(
+    data: &[u8],
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+    depth: u8,
+) -> Option<()> {
+    let bpp = (depth as usize + 7) / 8;
+    let needed = width * height * bpp;
+    if data.len() < needed {
+        return None;
+    }
+    for i in 0..width * height {
+        let px = tga_read_pixel(&data[i * bpp..], depth)?;
+        rgba[i * 4..i * 4 + 4].copy_from_slice(&px);
+    }
+    Some(())
+}
+
+fn tga_decode_rle(
+    data: &[u8],
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+    depth: u8,
+) -> Option<()> {
+    let bpp = (depth as usize + 7) / 8;
+    let total = width * height;
+    let mut src = 0;
+    let mut dst = 0;
+    while dst < total {
+        if src >= data.len() {
+            return None;
+        }
+        let header = data[src];
+        src += 1;
+        let count = (header & 0x7F) as usize + 1;
+        if header & 0x80 != 0 {
+            // RLE packet
+            let px = tga_read_pixel(data.get(src..)?, depth)?;
+            src += bpp;
+            for _ in 0..count.min(total - dst) {
+                rgba[dst * 4..dst * 4 + 4].copy_from_slice(&px);
+                dst += 1;
+            }
+        } else {
+            // Raw packet
+            for _ in 0..count.min(total - dst) {
+                let px = tga_read_pixel(data.get(src..)?, depth)?;
+                src += bpp;
+                rgba[dst * 4..dst * 4 + 4].copy_from_slice(&px);
+                dst += 1;
+            }
+        }
+    }
+    Some(())
+}
+
+fn tga_decode_uncompressed_gray(
+    data: &[u8],
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+    depth: u8,
+) -> Option<()> {
+    let total = width * height;
+    match depth {
+        8 => {
+            if data.len() < total {
+                return None;
+            }
+            for i in 0..total {
+                let v = data[i];
+                rgba[i * 4..i * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        16 => {
+            if data.len() < total * 2 {
+                return None;
+            }
+            for i in 0..total {
+                let v = data[i * 2];
+                let a = data[i * 2 + 1];
+                rgba[i * 4..i * 4 + 4].copy_from_slice(&[v, v, v, a]);
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn tga_decode_rle_gray(
+    data: &[u8],
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+    depth: u8,
+) -> Option<()> {
+    let bpp = (depth as usize + 7) / 8;
+    let total = width * height;
+    let mut src = 0;
+    let mut dst = 0;
+    while dst < total {
+        if src >= data.len() {
+            return None;
+        }
+        let header = data[src];
+        src += 1;
+        let count = (header & 0x7F) as usize + 1;
+        if header & 0x80 != 0 {
+            // RLE packet
+            if src + bpp > data.len() {
+                return None;
+            }
+            let (v, a) = if bpp == 2 {
+                (data[src], data[src + 1])
+            } else {
+                (data[src], 255)
+            };
+            src += bpp;
+            for _ in 0..count.min(total - dst) {
+                rgba[dst * 4..dst * 4 + 4].copy_from_slice(&[v, v, v, a]);
+                dst += 1;
+            }
+        } else {
+            // Raw packet
+            for _ in 0..count.min(total - dst) {
+                if src + bpp > data.len() {
+                    return None;
+                }
+                let (v, a) = if bpp == 2 {
+                    (data[src], data[src + 1])
+                } else {
+                    (data[src], 255)
+                };
+                src += bpp;
+                rgba[dst * 4..dst * 4 + 4].copy_from_slice(&[v, v, v, a]);
+                dst += 1;
+            }
+        }
+    }
+    Some(())
 }
 
 fn decode_bmp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
