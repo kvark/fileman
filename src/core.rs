@@ -330,7 +330,7 @@ pub fn is_image_path(p: &Path) -> bool {
         p.extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase()),
-        Some(ext) if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tga")
+        Some(ext) if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tga" | "hdr")
     )
 }
 
