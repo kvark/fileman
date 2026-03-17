@@ -1,0 +1,19 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Open help screen on opposite panel
+    (key: "F1"),
+    // Close help with Escape
+    (key: "Escape"),
+  ],
+  asserts: (
+    // Both panels should be back in Browser mode
+    left_panel: Some((
+      panel_mode: Some("Browser"),
+    )),
+    right_panel: Some((
+      panel_mode: Some("Browser"),
+    )),
+  ),
+)

@@ -1,0 +1,33 @@
+(
+  root: "tests/data/basic",
+  right: Some("tests/data/basic/out"),
+  keys: [
+    (key: "Wait"),
+    // Select source.txt and copy to out/ (right panel)
+    (key: "select:source.txt"),
+    (key: "F5"),
+    (key: "Enter"),
+    (key: "Wait"),
+    // Now switch to right panel (which shows out/)
+    (key: "Tab"),
+    (key: "Wait"),
+    // Select copied source.txt in out/
+    (key: "select:source.txt"),
+    // Move it with F6 (move back to left panel dir = tests/data/basic)
+    (key: "F6"),
+    (key: "Enter"),
+    (key: "Wait"),
+  ],
+  asserts: (
+    // source.txt should NOT be in out/ (it was moved)
+    // but it should still be in root (moved back to where it already existed)
+    fs: Some((
+      mode: Contains,
+      entries: [
+        (path: "source.txt", kind: File),
+        (path: "binary.bin", kind: File),
+        (path: "out", kind: Dir),
+      ],
+    )),
+  ),
+)
