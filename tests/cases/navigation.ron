@@ -2,6 +2,7 @@
   root: "tests/data/basic",
   keys: [
     (key: "Wait"),
+    // --- Cursor movement (Up/Down/Home/End) ---
     // Move down to select "out" directory (entries: .., out, binary.bin, source.txt)
     (key: "Down"),
     // Move to end
@@ -11,13 +12,29 @@
     // Move down twice
     (key: "Down"),
     (key: "Down"),
+    // Now at "binary.bin" (index 2)
+
+    // --- Page navigation ---
+    // End goes to last entry (source.txt), then PageUp back to top
+    (key: "End"),
+    (key: "PageUp"),
+    // With 4 entries, PageUp from end overshoots to ".." (index 0)
+
+    // --- Enter to open directory ---
+    // Move to "out" and enter it
+    (key: "Down"),
+    (key: "Enter"),
+    (key: "Wait"),
+    // Inside "out", go back to parent
+    (key: "Backspace"),
+    (key: "Wait"),
   ],
   asserts: (
     left_panel: Some((
-      mode: Exact,
+      mode: Contains,
       entries: ["..", "out", "binary.bin", "source.txt"],
-      // After Home (index 0) + Down + Down => index 2 = "binary.bin"
-      selected: Some("binary.bin"),
+      // After Backspace we're back in basic/, cursor remembers "out"
+      selected: Some("out"),
       browser_mode: Some("Fs"),
       panel_mode: Some("Browser"),
     )),

@@ -3,20 +3,49 @@
   right: Some("tests/data/basic/out"),
   keys: [
     (key: "Wait"),
+    // --- Copy (F5) ---
     (key: "select:source.txt"),
     (key: "F5"),
     (key: "Enter"),
     (key: "Tab"),
     (key: "Wait"),
+
+    // --- Rename (Shift+F6) ---
     (key: "select:source.txt"),
     (key: "F6", modifiers: ["Shift"]),
     (key: "Wait"),
     (key: "replace:source_copy.txt"),
     (key: "Enter"),
     (key: "Wait"),
+
+    // --- Delete (F8) ---
     (key: "select:source_copy.txt"),
     (key: "F8"),
     (key: "Enter"),
+    (key: "Wait"),
+
+    // --- New file (Shift+F4) ---
+    (key: "F4", modifiers: ["Shift"]),
+    (key: "replace:test_new_file.txt"),
+    (key: "Enter"),
+    (key: "Wait"),
+
+    // --- Move (F6) to left panel ---
+    (key: "select:test_new_file.txt"),
+    (key: "F6"),
+    (key: "Enter"),
+    (key: "Wait"),
+
+    // --- Editor save (F4 + Ctrl+S) ---
+    // Switch back to left panel to edit the moved file
+    (key: "Tab"),
+    (key: "Wait"),
+    (key: "select:test_new_file.txt"),
+    (key: "F4"),
+    (key: "Wait"),
+    (key: "text:Hello World"),
+    (key: "S", modifiers: ["Ctrl"]),
+    (key: "Wait"),
   ],
   asserts: (
     fs: Some((
@@ -25,7 +54,13 @@
         (path: "out", kind: Dir),
         (path: "source.txt", kind: File),
         (path: "binary.bin", kind: File),
+        // test_new_file.txt was moved from out/ to root
+        (path: "test_new_file.txt", kind: File),
       ],
     )),
+    // Verify saved file content
+    files: [
+      (path: "test_new_file.txt", contains: Some("Hello World")),
+    ],
   ),
 )

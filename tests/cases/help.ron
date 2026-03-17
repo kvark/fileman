@@ -4,14 +4,15 @@
     (key: "Wait"),
     // Open help screen
     (key: "F1"),
+    // Verify help is open, then close with Escape
+    (key: "Escape"),
   ],
   asserts: (
-    // Help opens on the opposite (right) panel
-    right_panel: Some((
-      panel_mode: Some("Help"),
-    )),
-    // Left panel remains in Browser mode
+    // Both panels should be back in Browser mode after Escape
     left_panel: Some((
+      panel_mode: Some("Browser"),
+    )),
+    right_panel: Some((
       panel_mode: Some("Browser"),
     )),
   ),

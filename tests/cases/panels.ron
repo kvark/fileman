@@ -1,7 +1,9 @@
 (
   root: "tests/data/basic",
+  right: Some("tests/data/basic"),
   keys: [
     (key: "Wait"),
+    // --- Panel switching (Tab) ---
     // Move down on left panel
     (key: "Down"),
     (key: "Down"),
@@ -9,17 +11,32 @@
     (key: "Tab"),
     // Move down once on right panel
     (key: "Down"),
+    // Switch back to left panel
+    (key: "Tab"),
+
+    // --- Panel swap (Ctrl+U) ---
+    (key: "U", modifiers: ["Ctrl"]),
+    // After swap: left panel has right's state (cursor on "out"),
+    //             right panel has left's state (cursor on "binary.bin")
+
+    // --- Cross-panel navigation (Ctrl+Right) ---
+    // Left panel now has "out" selected. Open it in right panel.
+    (key: "Right", modifiers: ["Ctrl"]),
+    (key: "Wait"),
   ],
   asserts: (
-    // Left panel: cursor should remain at index 2 (binary.bin)
+    // Left panel: was right before swap, had cursor on "out"
     left_panel: Some((
-      selected: Some("binary.bin"),
-      panel_mode: Some("Browser"),
-    )),
-    // Right panel is active, cursor at index 1 (out)
-    right_panel: Some((
       selected: Some("out"),
       panel_mode: Some("Browser"),
+      browser_mode: Some("Fs"),
+    )),
+    // Right panel: Ctrl+Right opened "out" dir, so it's inside out/
+    right_panel: Some((
+      mode: Contains,
+      entries: [".."],
+      panel_mode: Some("Browser"),
+      browser_mode: Some("Fs"),
     )),
   ),
 )
