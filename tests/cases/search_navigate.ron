@@ -2,17 +2,14 @@
   root: "tests/data/basic",
   keys: [
     (key: "Wait"),
-    // Open search dialog
-    (key: "F7", modifiers: ["Alt"]),
-    // Type search query
-    (key: "text:source"),
-    // Start search
+    // --- Search by content (Shift+Alt+F7) ---
+    (key: "F7", modifiers: ["Shift", "Alt"]),
+    (key: "text:sample text"),
     (key: "Enter"),
-    // Wait for search results
     (key: "Wait"),
   ],
   asserts: (
-    // Verify we're in search mode with results
+    // Content search should find source.txt
     left_panel: Some((
       mode: Contains,
       entries: ["source.txt"],

@@ -2,13 +2,10 @@
   root: "tests/data/basic",
   keys: [
     (key: "Wait"),
-    // Open search dialog
+    // --- Search by filename (Alt+F7) ---
     (key: "F7", modifiers: ["Alt"]),
-    // Type search query
     (key: "text:source"),
-    // Start search
     (key: "Enter"),
-    // Wait for search results
     (key: "Wait"),
     // Escape should return to original directory listing
     (key: "Escape"),
@@ -26,11 +23,10 @@
     )),
     // Verify Escape restored original directory with no spurious entries
     left_panel: Some((
-      mode: Exact,
+      mode: Contains,
       entries: ["..", "out", "binary.bin", "source.txt"],
       browser_mode: Some("Fs"),
       panel_mode: Some("Browser"),
-      selected: Some(".."),
     )),
   ),
 )

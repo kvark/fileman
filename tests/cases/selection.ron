@@ -2,6 +2,7 @@
   root: "tests/data/basic",
   keys: [
     (key: "Wait"),
+    // --- Mark files with Insert ---
     // Move to first file entry (skip "..")
     (key: "Down"),
     // Mark "out" with Insert (Insert marks + moves down)
@@ -9,12 +10,18 @@
     // Now on "binary.bin", mark it too
     (key: "Insert"),
     // Now on "source.txt", don't mark it
+
+    // --- Unmark with Insert (toggle) ---
+    // Go back up to "binary.bin" and unmark it
+    (key: "Up"),
+    (key: "Insert"),
+    // Insert unmarks + moves down, now on "source.txt" again
   ],
   asserts: (
     left_panel: Some((
-      // After two Insert presses, cursor should be on source.txt
       selected: Some("source.txt"),
-      marked: ["out", "binary.bin"],
+      // Only "out" remains marked; "binary.bin" was toggled off
+      marked: ["out"],
     )),
   ),
 )
