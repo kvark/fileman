@@ -452,14 +452,16 @@ pub(crate) fn handle_keyboard(
     if alt_right && let Some(snapshot) = app.pop_history_forward(app.active_panel) {
         apply_panel_snapshot(app, app.active_panel, snapshot);
     }
-    let alt_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F7));
-    if alt_f7 {
-        open_search(app, core::SearchMode::Name);
-    }
+    // Shift+Alt+F7 must be consumed before Alt+F7, because egui's
+    // consume_key(ALT, ...) matches regardless of the Shift modifier.
     let shift_alt_f7 = ctx
         .input_mut(|i| i.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::F7));
     if shift_alt_f7 {
         open_search(app, core::SearchMode::Content);
+    }
+    let alt_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F7));
+    if alt_f7 {
+        open_search(app, core::SearchMode::Name);
     }
     if input.key_pressed(egui::Key::Enter) {
         if app.search_ui == app_state::SearchUiState::Open {
