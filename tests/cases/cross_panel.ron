@@ -1,0 +1,26 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Select "out" directory in left panel
+    (key: "select:out"),
+    // Press Ctrl+Right to open selected in right panel
+    (key: "Right", modifiers: ["Ctrl"]),
+    (key: "Wait"),
+  ],
+  asserts: (
+    // Left panel should remain showing basic/ with "out" selected
+    left_panel: Some((
+      selected: Some("out"),
+      panel_mode: Some("Browser"),
+      browser_mode: Some("Fs"),
+    )),
+    // Right panel should now be inside "out" directory
+    right_panel: Some((
+      mode: Contains,
+      entries: [".."],
+      panel_mode: Some("Browser"),
+      browser_mode: Some("Fs"),
+    )),
+  ),
+)
