@@ -40,9 +40,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo install cargo-deb cargo-generate-rpm
 
-      - name: Build (Linux)
+      - name: Build with self-update (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo build --release --bin fileman
+        run: cargo build --release --bin fileman --features self-update
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
@@ -51,6 +51,10 @@ jobs:
         run: |
           mkdir -p dist
           tar -C target/release -czf dist/fileman-linux-x86_64${{ matrix.suffix }}.tar.gz fileman
+
+      - name: Rebuild without self-update for packages (Linux Vulkan)
+        if: matrix.os == 'ubuntu-latest' && matrix.variant == 'vulkan'
+        run: cargo build --release --bin fileman
 
       - name: Package deb + rpm (Linux Vulkan)
         if: matrix.os == 'ubuntu-latest' && matrix.variant == 'vulkan'
@@ -89,7 +93,7 @@ jobs:
         run: |
           cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle
           rustup target add aarch64-apple-darwin
-          cargo bundle --release --target aarch64-apple-darwin
+          cargo bundle --release --target aarch64-apple-darwin --features self-update
 
       - name: Package (macOS)
         if: matrix.os == 'macos-latest'
@@ -102,7 +106,7 @@ jobs:
       - name: Build (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
-        run: cargo build --release --bin fileman
+        run: cargo build --release --bin fileman --features self-update
 
       - name: Package zip (Windows)
         if: matrix.os == 'windows-latest'
