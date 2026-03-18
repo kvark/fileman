@@ -1,0 +1,69 @@
+(
+  root: "tests/data/basic",
+  right: Some("tests/data/basic"),
+  keys: [
+    (key: "Wait"),
+    // --- Verify initial state: single tab, left panel active ---
+    // Move cursor to "out"
+    (key: "Down"),
+
+    // --- Ctrl+T: open a new tab (clones current dir) ---
+    (key: "T", modifiers: ["Ctrl"]),
+    (key: "Wait"),
+    // New tab opened, directory reloaded, cursor at top (..)
+    // Navigate into "out" on tab 2
+    (key: "Down"),
+    (key: "Enter"),
+    (key: "Wait"),
+
+    // --- Ctrl+Shift+Tab: switch to prev tab ---
+    (key: "Tab", modifiers: ["Ctrl", "Shift"]),
+    (key: "Wait"),
+    // Now on tab 1 — should still be in basic/ with "out" selected
+
+    // --- Ctrl+Tab: switch to next tab ---
+    (key: "Tab", modifiers: ["Ctrl"]),
+    (key: "Wait"),
+    // Now on tab 2 — inside "out/" directory
+
+    // --- Ctrl+W: close current tab ---
+    (key: "W", modifiers: ["Ctrl"]),
+    // Tab 2 closed, falls back to tab 1 in basic/
+
+    // --- Tab: panel switch still works ---
+    (key: "Tab"),
+    // Now right panel active
+
+    // --- Ctrl+T on right panel: open tab there ---
+    (key: "T", modifiers: ["Ctrl"]),
+    (key: "Wait"),
+    // Right panel now has 2 tabs
+
+    // --- Ctrl+W: close the new tab ---
+    (key: "W", modifiers: ["Ctrl"]),
+    // Right panel back to 1 tab
+
+    // --- Ctrl+W on single tab: no-op ---
+    (key: "W", modifiers: ["Ctrl"]),
+    // Still 1 tab, nothing changes
+
+    // Switch back to left panel to verify state
+    (key: "Tab"),
+  ],
+  asserts: (
+    // Left panel: back to basic/ after closing tab 2
+    left_panel: Some((
+      mode: Contains,
+      entries: ["..", "out", "source.txt"],
+      browser_mode: Some("Fs"),
+      panel_mode: Some("Browser"),
+    )),
+    // Right panel: still in basic/
+    right_panel: Some((
+      mode: Contains,
+      entries: ["..", "out", "source.txt"],
+      browser_mode: Some("Fs"),
+      panel_mode: Some("Browser"),
+    )),
+  ),
+)
