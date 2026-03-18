@@ -1,4 +1,4 @@
-use fileman::app_state::{AsyncStatus, SearchStatus};
+use fileman::app_state::{AsyncStatus, SearchStatus, UpdateStatus};
 use fileman::theme;
 
 use crate::color32;
@@ -60,6 +60,10 @@ pub fn draw_help(
             ui.colored_label(color32(colors.preview_text), format!("Fileman {version}"));
             ui.colored_label(color32(colors.row_fg_inactive), "Author: Dzmitry Malyshau");
 
+            // Update status
+            ui.add_space(6.0);
+            draw_update_status(ui, &colors, &async_status.update);
+
             // Async workers status
             ui.add_space(10.0);
             ui.colored_label(color32(colors.preview_text), "Async Workers");
@@ -80,6 +84,51 @@ pub fn draw_help(
                 });
             }
         });
+}
+
+fn draw_update_status(
+    ui: &mut egui::Ui,
+    colors: &theme::ThemeColors,
+    status: &UpdateStatus,
+) {
+    match status {
+        UpdateStatus::Disabled => {}
+        UpdateStatus::Checking => {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.spinner();
+                ui.colored_label(color32(colors.row_fg_inactive), "Checking for updates...");
+            });
+        }
+        UpdateStatus::UpToDate => {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.colored_label(color32(colors.row_fg_inactive), "Up to date.");
+            });
+        }
+        UpdateStatus::Available(version) => {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.colored_label(
+                    color32(colors.row_fg_selected),
+                    egui::RichText::new(format!("Update available: v{version}")).strong(),
+                );
+                ui.colored_label(
+                    color32(colors.row_fg_inactive),
+                    " — run `fileman --update` to install",
+                );
+            });
+        }
+        UpdateStatus::Failed(err) => {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.colored_label(
+                    color32(colors.row_fg_inactive),
+                    format!("Update check failed: {err}"),
+                );
+            });
+        }
+    }
 }
 
 fn draw_async_status(

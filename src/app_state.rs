@@ -231,6 +231,8 @@ pub struct AppState {
     pub search_tx: mpsc::Sender<crate::core::SearchRequest>,
     pub search_rx: mpsc::Receiver<crate::core::SearchEvent>,
     pub refresh_tick: u64,
+    pub update_status: UpdateStatus,
+    pub update_rx: Option<mpsc::Receiver<UpdateStatus>>,
 }
 
 #[derive(Clone)]
@@ -280,20 +282,45 @@ pub enum SearchStatus {
     Done(crate::core::SearchProgress),
 }
 
+#[derive(Clone)]
+pub enum UpdateStatus {
+    /// Feature not compiled in, or not checking
+    Disabled,
+    /// Background check in progress
+    Checking,
+    /// Already on latest version
+    UpToDate,
+    /// A newer version is available
+    Available(String),
+    /// Check failed
+    Failed(String),
+}
+
 pub struct AsyncStatus {
     pub io_in_flight: usize,
     pub io_cancel_requested: bool,
     pub dir_size_pending: usize,
     pub search: SearchStatus,
+    pub update: UpdateStatus,
 }
 
 impl AppState {
+    pub fn poll_update_status(&mut self) {
+        if let Some(ref rx) = self.update_rx {
+            if let Ok(status) = rx.try_recv() {
+                self.update_status = status;
+                self.update_rx = None;
+            }
+        }
+    }
+
     pub fn async_status(&self) -> AsyncStatus {
         AsyncStatus {
             io_in_flight: self.io_in_flight,
             io_cancel_requested: self.io_cancel_requested,
             dir_size_pending: self.dir_size_pending.len(),
             search: self.search_status,
+            update: self.update_status.clone(),
         }
     }
 

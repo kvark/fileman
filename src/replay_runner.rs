@@ -378,6 +378,8 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         search_tx,
         search_rx,
         refresh_tick: 0,
+        update_status: app_state::UpdateStatus::Disabled,
+        update_rx: None,
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));
