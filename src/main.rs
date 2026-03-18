@@ -934,6 +934,8 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         }
     }
 
+    app.poll_update_status();
+
     changed
 }
 
@@ -2469,12 +2471,35 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             search_tx,
             search_rx,
             refresh_tick: 0,
+            update_status: app_state::UpdateStatus::Disabled,
+            update_rx: None,
         };
 
         app.theme
             .load_external_from_dir(std::path::Path::new("./themes"));
         load_fs_directory_async(&mut app, cur_dir.clone(), core::ActivePanel::Left, None);
         load_fs_directory_async(&mut app, cur_dir, core::ActivePanel::Right, None);
+
+        #[cfg(feature = "self-update")]
+        {
+            let (update_tx, update_rx) = mpsc::channel();
+            app.update_status = app_state::UpdateStatus::Checking;
+            app.update_rx = Some(update_rx);
+            let wake = app.wake.clone();
+            thread::spawn(move || {
+                let status = match update::check_for_update() {
+                    Ok(Some(release)) => {
+                        app_state::UpdateStatus::Available(release.version.to_string())
+                    }
+                    Ok(None) => app_state::UpdateStatus::UpToDate,
+                    Err(e) => app_state::UpdateStatus::Failed(e.to_string()),
+                };
+                let _ = update_tx.send(status);
+                if let Some(ref w) = wake {
+                    w();
+                }
+            });
+        }
 
         let ui_cache = UiCache {
             left_rows: 10,
