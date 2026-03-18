@@ -9,7 +9,8 @@ pub fn draw_help(
     is_focused: bool,
     min_height: f32,
     async_status: &AsyncStatus,
-) {
+) -> bool {
+    let mut install_requested = false;
     let colors = theme.colors();
     let version = env!("CARGO_PKG_VERSION");
     let shortcuts = [
@@ -62,7 +63,7 @@ pub fn draw_help(
 
             // Update status
             ui.add_space(6.0);
-            draw_update_status(ui, &colors, &async_status.update);
+            install_requested = draw_update_status(ui, &colors, &async_status.update);
 
             // Async workers status
             ui.add_space(10.0);
@@ -84,13 +85,15 @@ pub fn draw_help(
                 });
             }
         });
+    install_requested
 }
 
 fn draw_update_status(
     ui: &mut egui::Ui,
     colors: &theme::ThemeColors,
     status: &UpdateStatus,
-) {
+) -> bool {
+    let mut install_requested = false;
     match status {
         UpdateStatus::Disabled => {}
         UpdateStatus::Checking => {
@@ -113,9 +116,27 @@ fn draw_update_status(
                     color32(colors.row_fg_selected),
                     egui::RichText::new(format!("Update available: v{version}")).strong(),
                 );
+                if ui.button("Install").clicked() {
+                    install_requested = true;
+                }
+            });
+        }
+        UpdateStatus::Installing(version) => {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.spinner();
                 ui.colored_label(
                     color32(colors.row_fg_inactive),
-                    " — run `fileman --update` to install",
+                    format!("Installing v{version}..."),
+                );
+            });
+        }
+        UpdateStatus::Installed(version) => {
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.colored_label(
+                    color32(colors.row_fg_selected),
+                    egui::RichText::new(format!("v{version} installed — restart to use")).strong(),
                 );
             });
         }
@@ -124,11 +145,12 @@ fn draw_update_status(
                 ui.add_space(10.0);
                 ui.colored_label(
                     color32(colors.row_fg_inactive),
-                    format!("Update check failed: {err}"),
+                    format!("Update failed: {err}"),
                 );
             });
         }
     }
+    install_requested
 }
 
 fn draw_async_status(

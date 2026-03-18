@@ -2750,7 +2750,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                     runtime.app.active_panel == core::ActivePanel::Left;
                                 let theme = runtime.app.theme.clone();
                                 let async_status = runtime.app.async_status();
-                                ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
+                                if ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status) {
+                                    start_install(&mut runtime.app);
+                                }
                             } else {
                                 runtime.ui_cache.left_rows = ui::panel::draw_panel(
                                     ui,
@@ -2811,7 +2813,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                     runtime.app.active_panel == core::ActivePanel::Right;
                                 let theme = runtime.app.theme.clone();
                                 let async_status = runtime.app.async_status();
-                                ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
+                                if ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status) {
+                                    start_install(&mut runtime.app);
+                                }
                             } else {
                                 runtime.ui_cache.right_rows = ui::panel::draw_panel(
                                     ui,
@@ -3279,6 +3283,35 @@ fn draw_root_ui(render: UiRender<'_>) {
         ctx.request_repaint_after(std::time::Duration::from_millis(333));
     }
 }
+
+#[cfg(feature = "self-update")]
+fn start_install(app: &mut app_state::AppState) {
+    let version = match &app.update_status {
+        app_state::UpdateStatus::Available(v) => v.clone(),
+        _ => return,
+    };
+    app.update_status = app_state::UpdateStatus::Installing(version.clone());
+    let (tx, rx) = mpsc::channel();
+    app.update_rx = Some(rx);
+    let wake = app.wake.clone();
+    thread::spawn(move || {
+        let status = match update::check_for_update() {
+            Ok(Some(release)) => match update::perform_update(&release) {
+                Ok(()) => app_state::UpdateStatus::Installed(version),
+                Err(e) => app_state::UpdateStatus::Failed(e.to_string()),
+            },
+            Ok(None) => app_state::UpdateStatus::UpToDate,
+            Err(e) => app_state::UpdateStatus::Failed(e.to_string()),
+        };
+        let _ = tx.send(status);
+        if let Some(ref w) = wake {
+            w();
+        }
+    });
+}
+
+#[cfg(not(feature = "self-update"))]
+fn start_install(_app: &mut app_state::AppState) {}
 
 #[cfg(feature = "self-update")]
 fn run_update() -> anyhow::Result<()> {
