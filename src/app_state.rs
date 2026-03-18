@@ -306,11 +306,11 @@ pub struct AsyncStatus {
 
 impl AppState {
     pub fn poll_update_status(&mut self) {
-        if let Some(ref rx) = self.update_rx {
-            if let Ok(status) = rx.try_recv() {
-                self.update_status = status;
-                self.update_rx = None;
-            }
+        if let Some(ref rx) = self.update_rx
+            && let Ok(status) = rx.try_recv()
+        {
+            self.update_status = status;
+            self.update_rx = None;
         }
     }
 
