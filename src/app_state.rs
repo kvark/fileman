@@ -14,8 +14,69 @@ use crate::core::{
 use crate::theme::Theme;
 
 pub struct PanelState {
-    pub browser: BrowserState,
+    pub tabs: Vec<BrowserState>,
+    pub active_tab: usize,
     pub mode: PanelMode,
+}
+
+impl PanelState {
+    pub fn browser(&self) -> &BrowserState {
+        &self.tabs[self.active_tab]
+    }
+
+    pub fn browser_mut(&mut self) -> &mut BrowserState {
+        &mut self.tabs[self.active_tab]
+    }
+
+    pub fn new_tab(&mut self) {
+        let current = &self.tabs[self.active_tab];
+        let new_browser = BrowserState {
+            browser_mode: current.browser_mode.clone(),
+            current_path: current.current_path.clone(),
+            selected_index: 0,
+            entries: Vec::new(),
+            entries_rx: None,
+            prefer_select_name: None,
+            top_index: 0,
+            loading: false,
+            loading_progress: None,
+            container_root: current.container_root.clone(),
+            dir_token: 0,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
+            inline_rename: None,
+            sort_mode: current.sort_mode,
+            sort_desc: current.sort_desc,
+            watching_archive: None,
+            index_last_seen: 0,
+            marked: std::collections::HashSet::new(),
+        };
+        let new_idx = self.active_tab + 1;
+        self.tabs.insert(new_idx, new_browser);
+        self.active_tab = new_idx;
+    }
+
+    pub fn close_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.tabs.remove(self.active_tab);
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
+    }
+
+    pub fn next_tab(&mut self) {
+        if self.tabs.len() > 1 {
+            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        }
+    }
+
+    pub fn prev_tab(&mut self) {
+        if self.tabs.len() > 1 {
+            self.active_tab = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+        }
+    }
 }
 
 pub struct FileProps {
@@ -450,7 +511,7 @@ impl AppState {
 
     pub fn select_entry(&mut self, index: usize, window_rows: usize) {
         let panel = self.get_active_panel_mut();
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         if index < browser.entries.len() {
             browser.selected_index = index;
             if browser.selected_index < browser.top_index {
@@ -484,7 +545,7 @@ impl AppState {
     pub fn store_selection_memory_for(&mut self, which: ActivePanel) {
         let (fs_key, container_key, selected_name_opt) = {
             let panel = self.panel(which);
-            let browser = &panel.browser;
+            let browser = panel.browser();
             if browser.entries.is_empty() {
                 return;
             }
@@ -521,7 +582,7 @@ impl AppState {
     pub fn stash_container_cache(&mut self, which: ActivePanel) {
         let (key, cache) = {
             let panel = self.panel_mut(which);
-            let browser = &mut panel.browser;
+            let browser = panel.browser_mut();
             let BrowserMode::Container {
                 ref archive_path,
                 ref cwd,
@@ -548,7 +609,7 @@ impl AppState {
 
     pub fn select_entry_by_name(&mut self, which: ActivePanel, name: &str) {
         let panel = self.panel_mut(which);
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         if let Some(idx) = browser.entries.iter().position(|e| e.name == name) {
             browser.selected_index = idx;
         }
@@ -557,7 +618,7 @@ impl AppState {
     pub fn push_history(&mut self, which: ActivePanel) {
         let snapshot = {
             let panel = self.panel(which);
-            let browser = &panel.browser;
+            let browser = panel.browser();
             let selected = browser.entries.get(browser.selected_index).map(|e| {
                 if matches!(browser.browser_mode, BrowserMode::Search { .. })
                     && let EntryLocation::Fs(path) = e.location.clone()
@@ -573,7 +634,7 @@ impl AppState {
             }
         };
         let panel = self.panel_mut(which);
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         if let Some(last) = browser.history_back.last()
             && history_key(last) == history_key(&snapshot)
         {
@@ -586,7 +647,7 @@ impl AppState {
     pub fn pop_history_back(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
         let current = {
             let panel = self.panel(which);
-            let browser = &panel.browser;
+            let browser = panel.browser();
             let selected = browser.entries.get(browser.selected_index).map(|e| {
                 if matches!(browser.browser_mode, BrowserMode::Search { .. })
                     && let EntryLocation::Fs(path) = e.location.clone()
@@ -602,7 +663,7 @@ impl AppState {
             }
         };
         let panel = self.panel_mut(which);
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         let prev = browser.history_back.pop();
         if prev.is_some() {
             browser.history_forward.push(current);
@@ -613,7 +674,7 @@ impl AppState {
     pub fn pop_history_forward(&mut self, which: ActivePanel) -> Option<PanelSnapshot> {
         let current = {
             let panel = self.panel(which);
-            let browser = &panel.browser;
+            let browser = panel.browser();
             let selected = browser.entries.get(browser.selected_index).map(|e| {
                 if matches!(browser.browser_mode, BrowserMode::Search { .. })
                     && let EntryLocation::Fs(path) = e.location.clone()
@@ -629,7 +690,7 @@ impl AppState {
             }
         };
         let panel = self.panel_mut(which);
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         let next = browser.history_forward.pop();
         if next.is_some() {
             browser.history_back.push(current);
@@ -640,7 +701,7 @@ impl AppState {
     pub fn prepare_rename_selected(&mut self) {
         let name = {
             let panel = self.get_active_panel();
-            let browser = &panel.browser;
+            let browser = panel.browser();
             if browser.entries.is_empty() {
                 return;
             }
@@ -659,7 +720,7 @@ impl AppState {
         };
         if let Some(name) = name {
             let panel = self.get_active_panel_mut();
-            let browser = &mut panel.browser;
+            let browser = panel.browser_mut();
             browser.inline_rename = Some(InlineRename {
                 index: browser.selected_index,
                 text: name,
@@ -675,14 +736,14 @@ impl AppState {
     pub fn start_inline_new_file(&mut self) {
         let target_dir = {
             let panel = self.get_active_panel();
-            let browser = &panel.browser;
+            let browser = panel.browser();
             if !matches!(browser.browser_mode, BrowserMode::Fs) {
                 return;
             }
             browser.current_path.clone()
         };
         let panel = self.get_active_panel_mut();
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         let base = "new_file".to_string();
         let mut candidate = base.clone();
         let mut counter = 1;
@@ -720,14 +781,14 @@ impl AppState {
     pub fn start_inline_new_dir(&mut self) {
         let target_dir = {
             let panel = self.get_active_panel();
-            let browser = &panel.browser;
+            let browser = panel.browser();
             if !matches!(browser.browser_mode, BrowserMode::Fs) {
                 return;
             }
             browser.current_path.clone()
         };
         let panel = self.get_active_panel_mut();
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         let base = "new_dir".to_string();
         let mut candidate = base.clone();
         let mut counter = 1;
@@ -766,7 +827,7 @@ impl AppState {
     pub fn prepare_edit_selected(&mut self) {
         let (path, ext) = {
             let panel = self.get_active_panel();
-            let browser = &panel.browser;
+            let browser = panel.browser();
             if browser.entries.is_empty() {
                 return;
             }
@@ -841,7 +902,7 @@ impl AppState {
     pub fn update_preview_for_current_selection(&mut self) {
         let (is_dir, location, key, ext) = {
             let panel = self.get_active_panel();
-            let browser = &panel.browser;
+            let browser = panel.browser();
             if browser.entries.is_empty() {
                 self.clear_preview();
                 return;
@@ -1159,7 +1220,7 @@ impl AppState {
             }
         }
         // Clear marks after operation is enqueued
-        self.get_active_panel_mut().browser.marked.clear();
+        self.get_active_panel_mut().browser_mut().marked.clear();
     }
 
     pub fn on_io_completed(&mut self, count: usize) {
@@ -1180,7 +1241,7 @@ impl AppState {
     /// Returns indices of marked entries, or just the cursor entry if nothing is marked.
     /// Excludes ".." entries.
     fn effective_selection(&self) -> Vec<usize> {
-        let browser = &self.get_active_panel().browser;
+        let browser = self.get_active_panel().browser();
         if browser.entries.is_empty() {
             return Vec::new();
         }
@@ -1204,8 +1265,8 @@ impl AppState {
             ActivePanel::Left => &self.right_panel,
             ActivePanel::Right => &self.left_panel,
         };
-        match other.browser.browser_mode {
-            BrowserMode::Fs => Some(other.browser.current_path.clone()),
+        match other.browser().browser_mode {
+            BrowserMode::Fs => Some(other.browser().current_path.clone()),
             _ => None,
         }
     }
@@ -1216,7 +1277,7 @@ impl AppState {
             return None;
         }
         let dst_dir = self.other_panel_fs_dir()?;
-        let browser = &self.get_active_panel().browser;
+        let browser = self.get_active_panel().browser();
         let items: Vec<CopyItem> = indices
             .iter()
             .map(|&i| {
@@ -1240,7 +1301,7 @@ impl AppState {
             return None;
         }
         let dst_dir = self.other_panel_fs_dir()?;
-        let browser = &self.get_active_panel().browser;
+        let browser = self.get_active_panel().browser();
         let sources: Vec<path::PathBuf> = indices
             .iter()
             .filter_map(|&i| match browser.entries[i].location {
@@ -1259,7 +1320,7 @@ impl AppState {
         if indices.is_empty() {
             return None;
         }
-        let browser = &self.get_active_panel().browser;
+        let browser = self.get_active_panel().browser();
         let targets: Vec<path::PathBuf> = indices
             .iter()
             .filter_map(|&i| match browser.entries[i].location {
@@ -1278,7 +1339,7 @@ impl AppState {
         if indices.is_empty() {
             return None;
         }
-        let browser = &self.get_active_panel().browser;
+        let browser = self.get_active_panel().browser();
         // Only pack filesystem entries
         let sources: Vec<path::PathBuf> = indices
             .iter()

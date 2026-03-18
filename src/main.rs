@@ -64,11 +64,11 @@ enum ContainerLoadMode {
 
 impl UiCache {
     fn update_scroll_mode(&mut self, app: &app_state::AppState) {
-        let left_selected = app.left_panel.browser.selected_index;
-        let right_selected = app.right_panel.browser.selected_index;
+        let left_selected = app.left_panel.browser().selected_index;
+        let right_selected = app.right_panel.browser().selected_index;
         let active = app.active_panel;
-        let left_dir = app.left_panel.browser.dir_token;
-        let right_dir = app.right_panel.browser.dir_token;
+        let left_dir = app.left_panel.browser().dir_token;
+        let right_dir = app.right_panel.browser().dir_token;
         // Don't trigger ForceActive on Tab alone — ensure_visible handles
         // bringing the selection into view without unnecessary re-centering.
         let selection_changed = left_selected != self.last_left_selected
@@ -339,7 +339,7 @@ On Linux in CI or headless environments, Vulkan is often unavailable."
 }
 
 fn panel_path_display(panel: &app_state::PanelState) -> String {
-    let browser = &panel.browser;
+    let browser = panel.browser();
     let app_state::BrowserState {
         browser_mode: ref mode,
         ..
@@ -680,7 +680,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
     let mut changed = false;
     for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
         let panel = app.panel_mut(side);
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         if let Some(rx) = browser.entries_rx.take() {
             let mut handled = 0usize;
             while handled < 8 {
@@ -702,7 +702,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
 
     // Poll shared archive indexes for incremental updates
     for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
-        let watching = app.panel(side).browser.watching_archive.clone();
+        let watching = app.panel(side).browser().watching_archive.clone();
         if let Some(ref archive_path) = watching
             && let Some(shared) = app.archive_index.get(archive_path).cloned()
         {
@@ -711,7 +711,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 (idx.entries.len(), idx.complete, idx.root.clone())
             };
             let panel = app.panel_mut(side);
-            let browser = &mut panel.browser;
+            let browser = panel.browser_mut();
             let last_seen = browser.index_last_seen;
             if entry_count > last_seen || complete {
                 if let core::BrowserMode::Container {
@@ -759,7 +759,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                     }
                 }
                 if complete {
-                    let browser = &mut app.panel_mut(side).browser;
+                    let browser = app.panel_mut(side).browser_mut();
                     browser.watching_archive = None;
                     browser.loading = false;
                     browser.loading_progress = None;
@@ -803,7 +803,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         app.dir_sizes.insert(path.clone(), size);
         for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
             let panel = app.panel_mut(side);
-            let browser = &mut panel.browser;
+            let browser = panel.browser_mut();
             let mut updated = false;
             for entry in &mut browser.entries {
                 if entry.is_dir
@@ -857,7 +857,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         app_state::SearchStatus::Idle => None,
                     };
                     let panel = app.get_active_panel_mut();
-                    let browser = &mut panel.browser;
+                    let browser = panel.browser_mut();
                     let app_state::BrowserState {
                         browser_mode: ref mode,
                         ..
@@ -904,7 +904,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 if id == app.search_request_id {
                     app.search_status = app_state::SearchStatus::Running(progress);
                     let panel = app.get_active_panel_mut();
-                    panel.browser.loading_progress =
+                    panel.browser_mut().loading_progress =
                         Some((progress.matched, Some(progress.scanned)));
                     changed = true;
                 }
@@ -913,8 +913,8 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 if id == app.search_request_id {
                     app.search_status = app_state::SearchStatus::Done(progress);
                     let panel = app.get_active_panel_mut();
-                    panel.browser.loading = false;
-                    panel.browser.loading_progress =
+                    panel.browser_mut().loading = false;
+                    panel.browser_mut().loading_progress =
                         Some((progress.matched, Some(progress.scanned)));
                     changed = true;
                 }
@@ -927,7 +927,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         matched: 0,
                     });
                     let panel = app.get_active_panel_mut();
-                    panel.browser.loading = false;
+                    panel.browser_mut().loading = false;
                     changed = true;
                 }
             }
@@ -945,7 +945,7 @@ fn load_fs_directory_async(
     target_panel: core::ActivePanel,
     prefer_name: Option<String>,
 ) {
-    let same_dir = app.panel(target_panel).browser.current_path == path;
+    let same_dir = app.panel(target_panel).browser().current_path == path;
     let mut initial: Vec<core::DirEntry> = Vec::new();
     let mut has_parent_entry = false;
     if path.parent().is_some() {
@@ -1186,7 +1186,7 @@ fn load_fs_directory_async(
         .clone()
         .or_else(|| app.fs_last_selected_name.get(&path).cloned());
     let panel_state = app.panel_mut(target_panel);
-    let browser = &mut panel_state.browser;
+    let browser = panel_state.browser_mut();
     let initial_loading = initial.is_empty() || has_parent_entry;
     if !same_dir {
         browser.marked.clear();
@@ -1438,7 +1438,7 @@ fn load_container_directory_async(
     if !skip_loading && let Some(shared) = app.archive_index.get(&archive_path).cloned() {
         let idx = shared.lock().unwrap();
         let mut listing = build_listing_from_index(&idx, &archive_path, kind, &cwd);
-        let browser = &app.panel(target_panel).browser;
+        let browser = app.panel(target_panel).browser();
         sort_entries(&mut listing, browser.sort_mode, browser.sort_desc);
         root_hint = idx.root.clone();
         let entry_count = idx.entries.len();
@@ -1702,7 +1702,7 @@ fn load_container_directory_async(
     };
 
     let panel_state = app.panel_mut(target_panel);
-    let browser = &mut panel_state.browser;
+    let browser = panel_state.browser_mut();
     let initial_loading = cached
         .as_ref()
         .map(|cache| cache.loading)
@@ -1837,7 +1837,7 @@ fn apply_panel_snapshot(
         core::BrowserMode::Search { .. } => {
             let results = app.search_results.clone();
             let panel = app.panel_mut(which);
-            let browser = &mut panel.browser;
+            let browser = panel.browser_mut();
             browser.browser_mode = snapshot.mode;
             browser.current_path = snapshot.current_path;
             browser.entries.clear();
@@ -1925,13 +1925,13 @@ fn start_search(app: &mut app_state::AppState) {
     });
     let root = {
         let panel = app.get_active_panel();
-        let browser = &panel.browser;
+        let browser = panel.browser();
         browser.current_path.clone()
     };
     {
         app.push_history(app.active_panel);
         let panel = app.get_active_panel_mut();
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         browser.current_path = root.clone();
         browser.browser_mode = core::BrowserMode::Search {
             root: root.clone(),
@@ -1960,7 +1960,7 @@ fn start_search(app: &mut app_state::AppState) {
 fn refresh_active_panel(app: &mut app_state::AppState) {
     let which = app.active_panel;
     let panel = app.panel(which);
-    let browser = &panel.browser;
+    let browser = panel.browser();
     let path = browser.current_path.clone();
     if matches!(browser.browser_mode, core::BrowserMode::Fs) {
         load_fs_directory_async(app, path, which, None);
@@ -1969,7 +1969,7 @@ fn refresh_active_panel(app: &mut app_state::AppState) {
 
 fn refresh_fs_panels(app: &mut app_state::AppState) {
     for which in [core::ActivePanel::Left, core::ActivePanel::Right] {
-        let browser = &app.panel(which).browser;
+        let browser = app.panel(which).browser();
         if !matches!(browser.browser_mode, core::BrowserMode::Fs) {
             continue;
         }
@@ -1985,7 +1985,7 @@ fn refresh_fs_panels(app: &mut app_state::AppState) {
 fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
     let (mode, current_path, selected_name) = {
         let panel = app.panel(which);
-        let browser = &panel.browser;
+        let browser = panel.browser();
         (
             browser.browser_mode.clone(),
             browser.current_path.clone(),
@@ -2015,7 +2015,7 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
         core::BrowserMode::Search { .. } => {
             let results = app.search_results.clone();
             let panel = app.panel_mut(which);
-            let browser = &mut panel.browser;
+            let browser = panel.browser_mut();
             rebuild_search_entries(browser, &results);
             if let Some(name) = selected_name
                 && let Some(idx) = browser.entries.iter().position(|entry| entry.name == name)
@@ -2032,7 +2032,7 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
 #[cfg(unix)]
 fn open_props_dialog(app: &mut app_state::AppState) {
     let panel = app.get_active_panel();
-    let browser = &panel.browser;
+    let browser = panel.browser();
     if !matches!(browser.browser_mode, core::BrowserMode::Fs) {
         return;
     }
@@ -2377,7 +2377,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
         let mut app = app_state::AppState {
             left_panel: app_state::PanelState {
-                browser: app_state::BrowserState {
+                tabs: vec![app_state::BrowserState {
                     browser_mode: core::BrowserMode::Fs,
                     current_path: cur_dir.clone(),
                     selected_index: 0,
@@ -2397,11 +2397,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     watching_archive: None,
                     index_last_seen: 0,
                     marked: std::collections::HashSet::new(),
-                },
+                }],
+                active_tab: 0,
                 mode: app_state::PanelMode::Browser,
             },
             right_panel: app_state::PanelState {
-                browser: app_state::BrowserState {
+                tabs: vec![app_state::BrowserState {
                     browser_mode: core::BrowserMode::Fs,
                     current_path: cur_dir.clone(),
                     selected_index: 0,
@@ -2421,7 +2422,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     watching_archive: None,
                     index_last_seen: 0,
                     marked: std::collections::HashSet::new(),
-                },
+                }],
+                active_tab: 0,
                 mode: app_state::PanelMode::Browser,
             },
             active_panel: core::ActivePanel::Left,
@@ -3274,8 +3276,8 @@ fn draw_root_ui(render: UiRender<'_>) {
     }
 
     // Animate loading indicators at ~3fps
-    let any_loading = app.left_panel.browser.loading
-        || app.right_panel.browser.loading
+    let any_loading = app.left_panel.browser().loading
+        || app.right_panel.browser().loading
         || app
             .preview_panel()
             .is_some_and(|p| p.loading_since.is_some());

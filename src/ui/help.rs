@@ -16,7 +16,10 @@ pub fn draw_help(
     let shortcuts = [
         ("Enter", "Open"),
         ("Shift+Enter", "Open with system default app"),
-        ("Tab / Ctrl+I", "Switch panels"),
+        ("Tab", "Switch panels"),
+        ("Ctrl+T", "New tab"),
+        ("Ctrl+W", "Close tab"),
+        ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / prev tab"),
         ("Ctrl+U", "Swap panels"),
         ("Alt+Left / Alt+Right", "Back / forward"),
         ("Backspace / Ctrl+PgUp", "Parent folder"),

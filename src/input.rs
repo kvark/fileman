@@ -21,7 +21,7 @@ pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
     }
     let entry = {
         let panel = app.get_active_panel();
-        let browser = &panel.browser;
+        let browser = panel.browser();
         if browser.entries.is_empty() {
             return;
         }
@@ -109,7 +109,7 @@ fn open_selected_from_to(
 ) {
     let (selected_entry, current_path, container_cwd) = {
         let panel = app.panel(source);
-        let browser = &panel.browser;
+        let browser = panel.browser();
         if browser.entries.is_empty() {
             return;
         }
@@ -125,7 +125,7 @@ fn open_selected_from_to(
         };
         (entry, current_path, container_cwd)
     };
-    let container_root = app.panel(source).browser.container_root.clone();
+    let container_root = app.panel(source).browser().container_root.clone();
 
     app.store_selection_memory_for(source);
     app.push_history(target);
@@ -219,7 +219,7 @@ fn open_selected_from_to(
         app.dir_sizes.insert(path.clone(), size);
         for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
             let panel = app.panel_mut(side);
-            let browser = &mut panel.browser;
+            let browser = panel.browser_mut();
             for entry in &mut browser.entries {
                 if entry.is_dir
                     && let core::EntryLocation::Fs(p) = &entry.location
@@ -373,7 +373,7 @@ pub(crate) fn handle_keyboard(
     }
     if input.key_pressed(egui::Key::Escape) && app.preview_panel_side().is_none() {
         let panel = app.get_active_panel();
-        let browser = &panel.browser;
+        let browser = panel.browser();
         if matches!(browser.browser_mode, core::BrowserMode::Search { .. }) {
             cancel_search(app);
             if let Some(snapshot) = app.pop_history_back(app.active_panel) {
@@ -385,11 +385,37 @@ pub(crate) fn handle_keyboard(
     }
     let window_rows = active_window_rows(app, cache);
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
-    let ctrl_tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
-    if tab_pressed || ctrl_tab_pressed {
+    if tab_pressed {
         if app.props_dialog.is_none() {
             app.switch_panel();
         }
+        ctx.request_repaint();
+    }
+    // Tab management — only in Browser mode
+    let active_is_browser_mode = matches!(app.get_active_panel().mode, app_state::PanelMode::Browser);
+    let ctrl_shift_tab = ctx.input_mut(|i| {
+        i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)
+    });
+    if ctrl_shift_tab && active_is_browser_mode {
+        app.get_active_panel_mut().prev_tab();
+        refresh_active_panel(app);
+        ctx.request_repaint();
+    }
+    let ctrl_tab = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab));
+    if ctrl_tab && active_is_browser_mode {
+        app.get_active_panel_mut().next_tab();
+        refresh_active_panel(app);
+        ctx.request_repaint();
+    }
+    let ctrl_t = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::T));
+    if ctrl_t && active_is_browser_mode {
+        app.get_active_panel_mut().new_tab();
+        refresh_active_panel(app);
+        ctx.request_repaint();
+    }
+    let ctrl_w = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::W));
+    if ctrl_w && active_is_browser_mode {
+        app.get_active_panel_mut().close_tab();
         ctx.request_repaint();
     }
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::U)) {
@@ -416,7 +442,7 @@ pub(crate) fn handle_keyboard(
     if space {
         let target_path = {
             let panel = app.get_active_panel();
-            let browser = &panel.browser;
+            let browser = panel.browser();
             browser
                 .entries
                 .get(browser.selected_index)
@@ -466,7 +492,7 @@ pub(crate) fn handle_keyboard(
     if input.key_pressed(egui::Key::Enter) {
         if app.search_ui == app_state::SearchUiState::Open {
             if matches!(
-                app.get_active_panel().browser.browser_mode,
+                app.get_active_panel().browser().browser_mode,
                 core::BrowserMode::Search { .. }
             ) {
                 // Fall through to open selected result below.
@@ -477,12 +503,12 @@ pub(crate) fn handle_keyboard(
                 // Don't fall through — search just started, no results to navigate yet.
             }
         } else if matches!(
-            app.get_active_panel().browser.browser_mode,
+            app.get_active_panel().browser().browser_mode,
             core::BrowserMode::Search { .. }
         ) {
             app.push_history(app.active_panel);
             let panel = app.get_active_panel();
-            let browser = &panel.browser;
+            let browser = panel.browser();
             let entry = browser.entries.get(browser.selected_index).cloned();
             if let Some(entry) = entry
                 && let core::EntryLocation::Fs(path) = entry.location
@@ -561,7 +587,7 @@ pub(crate) fn handle_keyboard(
         if app.theme_picker_open {
             app.select_next_theme();
         } else {
-            let browser = &app.get_active_panel().browser;
+            let browser = app.get_active_panel().browser();
             if browser.selected_index + 1 < browser.entries.len() {
                 app.select_entry(browser.selected_index + 1, window_rows);
             }
@@ -571,14 +597,14 @@ pub(crate) fn handle_keyboard(
         if app.theme_picker_open {
             app.select_prev_theme();
         } else {
-            let browser = &app.get_active_panel().browser;
+            let browser = app.get_active_panel().browser();
             if browser.selected_index > 0 {
                 app.select_entry(browser.selected_index - 1, window_rows);
             }
         }
     }
     if input.key_pressed(egui::Key::Insert) && active_is_browser {
-        let browser = &mut app.get_active_panel_mut().browser;
+        let browser = app.get_active_panel_mut().browser_mut();
         let idx = browser.selected_index;
         if idx < browser.entries.len() && browser.entries[idx].name != ".." {
             let name = browser.entries[idx].name.clone();
@@ -591,12 +617,12 @@ pub(crate) fn handle_keyboard(
         }
     }
     if input.key_pressed(egui::Key::PageUp) && active_is_browser {
-        let browser = &app.get_active_panel().browser;
+        let browser = app.get_active_panel().browser();
         let new_index = browser.selected_index.saturating_sub(window_rows);
         app.select_entry(new_index, window_rows);
     }
     if input.key_pressed(egui::Key::PageDown) && active_is_browser {
-        let browser = &app.get_active_panel().browser;
+        let browser = app.get_active_panel().browser();
         let len = browser.entries.len();
         let mut new_index = browser.selected_index.saturating_add(window_rows);
         if len > 0 && new_index >= len {
@@ -608,7 +634,7 @@ pub(crate) fn handle_keyboard(
         app.select_entry(0, window_rows);
     }
     if input.key_pressed(egui::Key::End) && active_is_browser {
-        let browser = &app.get_active_panel().browser;
+        let browser = app.get_active_panel().browser();
         if !browser.entries.is_empty() {
             app.select_entry(browser.entries.len() - 1, window_rows);
         }
@@ -678,7 +704,7 @@ pub(crate) fn handle_keyboard(
 
 fn open_parent(app: &mut app_state::AppState, window_rows: usize) {
     let panel = app.get_active_panel();
-    let browser = &panel.browser;
+    let browser = panel.browser();
     let parent_index = browser.entries.iter().position(|e| e.name == "..");
     let Some(idx) = parent_index else { return };
     if browser.selected_index != idx {
@@ -693,7 +719,7 @@ pub(crate) fn confirm_pending_op(app: &mut app_state::AppState) {
             && let Some(first) = targets.first()
         {
             let panel = app.get_active_panel();
-            let browser = &panel.browser;
+            let browser = panel.browser();
             let mut next_name: Option<String> = None;
             if !browser.entries.is_empty() {
                 let mut next_idx = browser.selected_index.saturating_add(1);
@@ -785,7 +811,7 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
     let escape = input.key_pressed(egui::Key::Escape);
     let (action, next_selection, handled) = {
         let panel = app.get_active_panel_mut();
-        let browser = &mut panel.browser;
+        let browser = panel.browser_mut();
         let Some(_rename) = browser.inline_rename.as_ref() else {
             return false;
         };
