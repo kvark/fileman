@@ -42,7 +42,13 @@ pub fn check_for_update() -> anyhow::Result<Option<Release>> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing tag_name in release response"))?;
     let version_str = tag.strip_prefix('v').unwrap_or(tag);
-    let remote_version = semver::Version::parse(version_str)
+    // Pad incomplete versions: "0.1" -> "0.1.0"
+    let version_str = match version_str.matches('.').count() {
+        0 => format!("{version_str}.0.0"),
+        1 => format!("{version_str}.0"),
+        _ => version_str.to_string(),
+    };
+    let remote_version = semver::Version::parse(&version_str)
         .map_err(|e| anyhow::anyhow!("invalid version '{version_str}': {e}"))?;
 
     if remote_version <= current_version() {
