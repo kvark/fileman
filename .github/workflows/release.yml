@@ -38,11 +38,11 @@ jobs:
       # --- Linux ---
       - name: Install packaging tools (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo install cargo-deb cargo-generate-rpm
+        run: cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle cargo-deb cargo-generate-rpm
 
-      - name: Build with self-update (Linux)
+      - name: Build + bundle with self-update (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo build --release --bin fileman --features self-update
+        run: cargo bundle --release --features self-update
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
@@ -51,6 +51,12 @@ jobs:
         run: |
           mkdir -p dist
           tar -C target/release -czf dist/fileman-linux-x86_64${{ matrix.suffix }}.tar.gz fileman
+
+      - name: Package AppImage (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/appimage/fileman_*_x86_64.AppImage dist/fileman-linux-x86_64${{ matrix.suffix }}.AppImage
 
       - name: Rebuild without self-update for packages (Linux Vulkan)
         if: matrix.os == 'ubuntu-latest' && matrix.variant == 'vulkan'
@@ -63,29 +69,6 @@ jobs:
           cp target/debian/*.deb dist/
           cargo generate-rpm
           cp target/generate-rpm/*.rpm dist/
-
-      - name: Package AppImage (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          # Download appimagetool
-          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x appimagetool
-
-          # Build AppDir structure
-          mkdir -p Fileman.AppDir/usr/bin
-          mkdir -p Fileman.AppDir/usr/share/applications
-          mkdir -p Fileman.AppDir/usr/share/icons/hicolor/scalable/apps
-          cp target/release/fileman Fileman.AppDir/usr/bin/fileman
-          cp etc/fileman.desktop Fileman.AppDir/fileman.desktop
-          cp etc/fileman.svg Fileman.AppDir/fileman.svg
-          cp etc/fileman.desktop Fileman.AppDir/usr/share/applications/fileman.desktop
-          cp etc/fileman.svg Fileman.AppDir/usr/share/icons/hicolor/scalable/apps/fileman.svg
-          ln -s usr/bin/fileman Fileman.AppDir/AppRun
-
-          # Build AppImage (no FUSE on GitHub runners)
-          APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool Fileman.AppDir dist/fileman-linux-x86_64${{ matrix.suffix }}.AppImage
-        env:
-          ARCH: x86_64
 
       # --- macOS ---
       - name: Build (macOS)
