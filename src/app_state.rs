@@ -292,7 +292,11 @@ pub enum UpdateStatus {
     UpToDate,
     /// A newer version is available
     Available(String),
-    /// Check failed
+    /// Download + install in progress
+    Installing(String),
+    /// Successfully installed, restart needed
+    Installed(String),
+    /// Check or install failed
     Failed(String),
 }
 
