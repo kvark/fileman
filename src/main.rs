@@ -24,6 +24,8 @@ mod input;
 mod replay_runner;
 mod snapshot_render;
 mod ui;
+#[cfg(feature = "self-update")]
+mod update;
 
 use fileman::{app_state, core, theme, workers};
 mod replay;
@@ -3001,6 +3003,8 @@ struct CliArgs {
     snapshot: Option<PathBuf>,
     replay: Option<PathBuf>,
     start_dir: Option<PathBuf>,
+    #[cfg(feature = "self-update")]
+    update: bool,
 }
 
 fn parse_cli_args() -> anyhow::Result<CliArgs> {
@@ -3017,6 +3021,9 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
                 eprintln!("  -h, --help         Show this help message");
                 eprintln!("  --snapshot <PATH>   Render a snapshot to PNG");
                 eprintln!("  --replay <PATH>     Replay an input recording");
+                if cfg!(feature = "self-update") {
+                    eprintln!("  --update            Check for updates and install");
+                }
                 std::process::exit(0);
             }
             "--snapshot" => {
@@ -3032,6 +3039,10 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
                         .map(PathBuf::from)
                         .ok_or_else(|| anyhow::anyhow!("--replay requires a path"))?,
                 );
+            }
+            #[cfg(feature = "self-update")]
+            "--update" => {
+                parsed.update = true;
             }
             other if !other.starts_with('-') => {
                 let path = PathBuf::from(other);
@@ -3244,6 +3255,21 @@ fn draw_root_ui(render: UiRender<'_>) {
     }
 }
 
+#[cfg(feature = "self-update")]
+fn run_update() -> anyhow::Result<()> {
+    eprintln!("fileman v{} — checking for updates...", env!("CARGO_PKG_VERSION"));
+    match update::check_for_update()? {
+        Some(release) => {
+            eprintln!("New version available: {} ({})", release.version, release.tag);
+            update::perform_update(&release)?;
+        }
+        None => {
+            eprintln!("Already up to date.");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_default_env()
         .filter_module("egui", log::LevelFilter::Warn)
@@ -3256,6 +3282,10 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(snapshot_path) = args.snapshot {
         return replay_runner::run_snapshot(&snapshot_path);
+    }
+    #[cfg(feature = "self-update")]
+    if args.update {
+        return run_update();
     }
 
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;

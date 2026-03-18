@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- Self-update: `fileman --update` checks GitHub releases and replaces the binary in-place (compile feature `self-update`, enabled for tarball/zip/AppImage/MSI, disabled for deb/rpm)
+
 ## 0.1.0
 
 Initial release.
