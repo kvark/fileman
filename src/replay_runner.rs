@@ -138,11 +138,11 @@ fn apply_replay_key(
             core::ActivePanel::Right => ui_cache.right_rows.max(1),
         };
         let panel = app.get_active_panel_mut();
-        if let Some(index) = panel.browser.entries.iter().position(|e| e.name == name) {
+        if let Some(index) = panel.browser_mut().entries.iter().position(|e| e.name == name) {
             app.select_entry(index, window_rows);
         } else {
             let mut sample = String::new();
-            for entry in panel.browser.entries.iter().take(8) {
+            for entry in panel.browser_mut().entries.iter().take(8) {
                 if !sample.is_empty() {
                     sample.push_str(", ");
                 }
@@ -156,7 +156,7 @@ fn apply_replay_key(
     if let Some(rest) = key_name.strip_prefix("replace:") {
         let name = rest.trim();
         let panel = app.get_active_panel_mut();
-        if let Some(ref mut rename) = panel.browser.inline_rename {
+        if let Some(ref mut rename) = panel.browser_mut().inline_rename {
             rename.text = name.to_string();
         } else {
             panic!("Replay replace failed: inline rename is not active");
@@ -188,8 +188,8 @@ fn apply_replay_key(
 }
 
 fn is_app_pending(app: &app_state::AppState) -> bool {
-    let left = &app.left_panel.browser;
-    let right = &app.right_panel.browser;
+    let left = app.left_panel.browser();
+    let right = app.right_panel.browser();
     let edit_loading = app.edit_panel().map(|edit| edit.loading).unwrap_or(false);
     let search_running = matches!(app.search_status, app_state::SearchStatus::Running(_));
     app.io_in_flight > 0
@@ -289,7 +289,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
 
     let mut app = app_state::AppState {
         left_panel: app_state::PanelState {
-            browser: app_state::BrowserState {
+            tabs: vec![app_state::BrowserState {
                 browser_mode: core::BrowserMode::Fs,
                 current_path: root.clone(),
                 selected_index: 0,
@@ -309,11 +309,12 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 watching_archive: None,
                 index_last_seen: 0,
                 marked: std::collections::HashSet::new(),
-            },
+            }],
+            active_tab: 0,
             mode: app_state::PanelMode::Browser,
         },
         right_panel: app_state::PanelState {
-            browser: app_state::BrowserState {
+            tabs: vec![app_state::BrowserState {
                 browser_mode: core::BrowserMode::Fs,
                 current_path: root.clone(),
                 selected_index: 0,
@@ -333,7 +334,8 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 watching_archive: None,
                 index_last_seen: 0,
                 marked: std::collections::HashSet::new(),
-            },
+            }],
+            active_tab: 0,
             mode: app_state::PanelMode::Browser,
         },
         active_panel: core::ActivePanel::Left,
@@ -651,7 +653,7 @@ fn container_kind_str(kind: fileman::archive::ContainerKind) -> &'static str {
 }
 
 fn build_panel_dump(panel: &app_state::PanelState) -> PanelDump {
-    let browser = &panel.browser;
+    let browser = panel.browser();
     let mode = match panel.mode {
         app_state::PanelMode::Browser => "Browser",
         app_state::PanelMode::Preview(_) => "Preview",
@@ -777,7 +779,7 @@ fn assert_panel(
 ) -> anyhow::Result<()> {
     if !expected.entries.is_empty() {
         let actual: Vec<&str> = panel
-            .browser
+            .browser()
             .entries
             .iter()
             .map(|e| e.name.as_str())
@@ -805,9 +807,9 @@ fn assert_panel(
     }
     if let Some(ref expected_selected) = expected.selected {
         let actual_selected = panel
-            .browser
+            .browser()
             .entries
-            .get(panel.browser.selected_index)
+            .get(panel.browser().selected_index)
             .map(|e| e.name.as_str())
             .unwrap_or("<none>");
         if actual_selected != expected_selected {
@@ -817,7 +819,7 @@ fn assert_panel(
         }
     }
     if let Some(ref expected_mode) = expected.browser_mode {
-        let actual_mode = browser_mode_str(&panel.browser.browser_mode);
+        let actual_mode = browser_mode_str(&panel.browser().browser_mode);
         if actual_mode != expected_mode {
             return Err(anyhow::anyhow!(
                 "{panel_name} panel browser_mode mismatch: expected \"{expected_mode}\", got \"{actual_mode}\""
@@ -834,7 +836,7 @@ fn assert_panel(
     }
     if !expected.marked.is_empty() {
         let mut actual_marked: Vec<&str> =
-            panel.browser.marked.iter().map(|s| s.as_str()).collect();
+            panel.browser().marked.iter().map(|s| s.as_str()).collect();
         actual_marked.sort();
         let mut expected_marked: Vec<&str> = expected.marked.iter().map(|s| s.as_str()).collect();
         expected_marked.sort();

@@ -154,7 +154,7 @@ pub fn draw_panel(
         top_index,
     ) = {
         let panel = app.panel(panel_side);
-        let browser = &panel.browser;
+        let browser = panel.browser();
         let entries_len = browser.entries.len();
         let selected_index = browser.selected_index;
         let header_text = format!(
@@ -190,6 +190,8 @@ pub fn draw_panel(
     let panel_side_for_closure = panel_side;
 
     let mut request_raw_reload = false;
+    let mut tab_clicked: Option<usize> = None;
+    let mut tab_close_clicked: Option<usize> = None;
     let panel_response = egui::Frame::NONE
         .fill(color32(theme::Color::rgba(0.0, 0.0, 0.0, 0.0)))
         .stroke(egui::Stroke::new(
@@ -208,6 +210,60 @@ pub fn draw_panel(
                 let footer_height = 24.0;
                 let spacing = ui.spacing().item_spacing.y;
 
+                // Draw tab bar when multiple tabs exist
+                if app.panel(panel_side).tabs.len() > 1 {
+                    let tab_count = app.panel(panel_side).tabs.len();
+                    let active_tab_idx = app.panel(panel_side).active_tab;
+                    ui.allocate_ui_with_layout(
+                        egui::Vec2::new(ui.available_width(), 22.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            for i in 0..tab_count {
+                                let is_active_tab = i == active_tab_idx;
+                                let tab_bg = if is_active_tab {
+                                    colors.header_bg
+                                } else {
+                                    colors.footer_bg
+                                };
+                                let tab_fg = if is_active_tab {
+                                    colors.header_fg
+                                } else {
+                                    colors.row_fg_inactive
+                                };
+                                let label = {
+                                    let browser = &app.panel(panel_side).tabs[i];
+                                    browser.current_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("/")
+                                        .to_string()
+                                };
+                                let resp = egui::Frame::NONE
+                                    .fill(color32(tab_bg))
+                                    .corner_radius(egui::CornerRadius {
+                                        nw: 4, ne: 4, sw: 0, se: 0,
+                                    })
+                                    .inner_margin(egui::Margin::symmetric(6, 2))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(color32(tab_fg), &label);
+                                            let x_resp = ui.colored_label(
+                                                color32(tab_fg),
+                                                egui::RichText::new("×").small(),
+                                            );
+                                            if x_resp.clicked() {
+                                                tab_close_clicked = Some(i);
+                                            }
+                                        });
+                                    });
+                                if resp.response.clicked() {
+                                    tab_clicked = Some(i);
+                                }
+                            }
+                        },
+                    );
+                }
+
                 ui.allocate_ui_with_layout(
                     egui::Vec2::new(ui.available_width(), header_height),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -217,7 +273,7 @@ pub fn draw_panel(
                             .corner_radius(egui::CornerRadius::same(4))
                             .show(ui, |ui| {
                                 let panel = app.panel_mut(panel_side);
-                                let browser = &mut panel.browser;
+                                let browser = panel.browser_mut();
                                 let mut sort_mode = browser.sort_mode;
                                 let mut sort_desc = browser.sort_desc;
                                 let mut sort_changed = false;
@@ -366,7 +422,7 @@ pub fn draw_panel(
                 if request_raw_reload {
                     reload_panel(app, panel_side);
                     let panel = app.panel(panel_side);
-                    let browser = &panel.browser;
+                    let browser = panel.browser();
                     entries_len = browser.entries.len();
                     selected_index = browser.selected_index.min(entries_len.saturating_sub(1));
                     selected_label = browser
@@ -426,7 +482,7 @@ pub fn draw_panel(
                             visible_range = row_range.clone();
                             for idx in row_range {
                                 let (entry, rename_active, is_marked) = {
-                                    let browser = &app.panel(panel_side_for_closure).browser;
+                                    let browser = app.panel(panel_side_for_closure).browser();
                                     let entry = browser.entries[idx].clone();
                                     let rename_active = browser
                                         .inline_rename
@@ -543,7 +599,7 @@ pub fn draw_panel(
                                             ui.set_clip_rect(name_rect);
                                             let rename = app
                                                 .panel_mut(panel_side_for_closure)
-                                                .browser
+                                                .browser_mut()
                                                 .inline_rename
                                                 .as_mut()
                                                 .expect("rename active");
@@ -711,7 +767,7 @@ pub fn draw_panel(
     }
 
     if let Some(top) = new_top_index {
-        app.panel_mut(panel_side).browser.top_index = top;
+        app.panel_mut(panel_side).browser_mut().top_index = top;
     }
 
     if let Some(idx) = clicked_index {
@@ -720,6 +776,23 @@ pub fn draw_panel(
         if open_on_double_click {
             open_selected(app);
         }
+    }
+
+    // Handle tab close before tab switch (close may affect indices)
+    if let Some(i) = tab_close_clicked {
+        app.active_panel = panel_side;
+        let panel = app.panel_mut(panel_side);
+        if panel.tabs.len() > 1 {
+            panel.tabs.remove(i);
+            if panel.active_tab >= panel.tabs.len() {
+                panel.active_tab = panel.tabs.len() - 1;
+            } else if panel.active_tab > i {
+                panel.active_tab -= 1;
+            }
+        }
+    } else if let Some(i) = tab_clicked {
+        app.active_panel = panel_side;
+        app.panel_mut(panel_side).active_tab = i;
     }
 
     rows
