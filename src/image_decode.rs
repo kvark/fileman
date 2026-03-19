@@ -75,11 +75,12 @@ pub fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
     }
 
     // Try JPEG fast preview path (EXIF thumbnail or DC-only 1/8-scale decode)
-    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
-        if let Some(result) = decode_jpeg_preview(bytes, max_side) {
-            return Some(result);
-        }
-        // Fall through to full zune-image decode
+    if bytes.len() >= 3
+        && bytes[0] == 0xFF
+        && bytes[1] == 0xD8
+        && let Some(result) = decode_jpeg_preview(bytes, max_side)
+    {
+        return Some(result);
     }
 
     let options = zune_core::options::DecoderOptions::new_fast();
@@ -695,6 +696,7 @@ fn decode_bmp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
 /// image.  Tries two strategies in order:
 ///   1. Extract the EXIF thumbnail (tiny embedded JPEG, ~160×120)
 ///   2. DC-only decode: one pixel per 8×8 block → 1/8 scale
+///
 /// Returns `None` if neither strategy works (caller falls back to full decode).
 fn decode_jpeg_preview(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
     // Tier 1: try EXIF thumbnail
@@ -955,12 +957,11 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                     let tiff_data = &seg_data[6..];
                     if let Ok(exif_fields) = exif::parse_exif(tiff_data) {
                         for f in &exif_fields.0 {
-                            if f.tag == exif::Tag::Orientation {
-                                if let exif::Value::Short(ref vals) = f.value {
-                                    if let Some(&v) = vals.first() {
-                                        orientation = v;
-                                    }
-                                }
+                            if f.tag == exif::Tag::Orientation
+                                && let exif::Value::Short(ref vals) = f.value
+                                && let Some(&v) = vals.first()
+                            {
+                                orientation = v;
                             }
                         }
                     }
@@ -1114,12 +1115,12 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                 if ns != num_components as usize {
                     return None; // only handle interleaved scans
                 }
-                for i in 0..ns {
+                for (i, comp) in components.iter_mut().enumerate().take(ns) {
                     let off = p + 1 + i * 2;
                     let _cs = bytes[off];
                     let td_ta = bytes[off + 1];
-                    components[i].dc_table = (td_ta >> 4) as usize;
-                    components[i].ac_table = (td_ta & 0x0F) as usize;
+                    comp.dc_table = (td_ta >> 4) as usize;
+                    comp.ac_table = (td_ta & 0x0F) as usize;
                 }
                 pos += seg_len;
                 // Now decode entropy data
@@ -1145,8 +1146,8 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
     let h = height as usize;
     let h_max = components.iter().map(|c| c.h_samp).max().unwrap_or(1);
     let v_max = components.iter().map(|c| c.v_samp).max().unwrap_or(1);
-    let mcu_w = (w + h_max * 8 - 1) / (h_max * 8);
-    let mcu_h = (h + v_max * 8 - 1) / (v_max * 8);
+    let mcu_w = w.div_ceil(h_max * 8);
+    let mcu_h = h.div_ceil(v_max * 8);
     // Allocate DC coefficient planes for each component
     let mut dc_planes: Vec<Vec<f32>> = components
         .iter()
@@ -1160,7 +1161,7 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
     for mcu_y in 0..mcu_h {
         for mcu_x in 0..mcu_w {
             // Handle restart markers
-            if restart_interval > 0 && mcu_count > 0 && mcu_count % restart_interval as u32 == 0 {
+            if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as u32) {
                 // Align to byte boundary
                 reader.nbits = 0;
                 reader.bits = 0;
@@ -1186,7 +1187,7 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                 for vy in 0..comp.v_samp {
                     for hx in 0..comp.h_samp {
                         // Decode DC coefficient
-                        let cat = reader.decode_huff(dc_lut)? as u8;
+                        let cat = reader.decode_huff(dc_lut)?;
                         let dc_diff = if cat == 0 {
                             0
                         } else {
@@ -1208,7 +1209,7 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                                 break; // EOB
                             }
                             let run = (sym >> 4) as usize;
-                            let size = (sym & 0x0F) as u8;
+                            let size = sym & 0x0F;
                             ac_count += run + 1;
                             if size > 0 {
                                 reader.get_bits(size);
@@ -1289,8 +1290,8 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
     }
 
     // Trim to actual image dimensions at 1/8 scale
-    let real_w = ((w + 7) / 8).min(out_w);
-    let real_h = ((h + 7) / 8).min(out_h);
+    let real_w = w.div_ceil(8).min(out_w);
+    let real_h = h.div_ceil(8).min(out_h);
     if real_w < out_w || real_h < out_h {
         let mut trimmed = vec![0u8; real_w * real_h * 4];
         for y in 0..real_h {
