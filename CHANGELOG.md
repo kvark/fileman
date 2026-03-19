@@ -1,11 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (19 Mar 2026)
 
 ### Features
+- Support GLES for older systems (separate build)
+- Tab support (same keys as browsers)
 - Self-update: `fileman --update` checks GitHub releases and replaces the binary in-place (compile feature `self-update`, enabled for tarball/zip/AppImage/MSI, disabled for deb/rpm)
+- Introspection about async tasks displayed in F1 help screen
+- Multi-stage JPEG loading for instant views
+- New image formats: TGA, HDR, and DDS
+- New syntax: RON
 
-## 0.1.0
+## 0.1.0 (13 Mar 2026)
 
 Initial release.
 

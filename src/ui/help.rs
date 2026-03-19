@@ -61,8 +61,13 @@ pub fn draw_help(
                     ui.colored_label(color32(colors.preview_header_fg), "Help (Tab to return)");
                 });
             ui.add_space(8.0);
-            ui.colored_label(color32(colors.preview_text), format!("Fileman {version}"));
+            ui.colored_label(color32(colors.preview_text), format!("FileMan {version}"));
             ui.colored_label(color32(colors.row_fg_inactive), "Author: Dzmitry Malyshau");
+
+            ui.colored_label(
+                color32(colors.row_fg_inactive),
+                format!("GPU: {}", async_status.gpu_info),
+            );
 
             // Update status
             ui.add_space(6.0);
@@ -156,11 +161,7 @@ fn draw_update_status(
     install_requested
 }
 
-fn draw_async_status(
-    ui: &mut egui::Ui,
-    colors: &theme::ThemeColors,
-    status: &AsyncStatus,
-) {
+fn draw_async_status(ui: &mut egui::Ui, colors: &theme::ThemeColors, status: &AsyncStatus) {
     // IO worker
     let io_label = if status.io_in_flight == 0 {
         "idle".to_string()
@@ -177,17 +178,29 @@ fn draw_async_status(
     } else {
         format!("{} pending", status.dir_size_pending)
     };
-    draw_worker_row(ui, colors, "Dir size", &dir_label, status.dir_size_pending > 0);
+    draw_worker_row(
+        ui,
+        colors,
+        "Dir size",
+        &dir_label,
+        status.dir_size_pending > 0,
+    );
 
     // Search worker
     let (search_label, search_active) = match status.search {
         SearchStatus::Idle => ("idle".to_string(), false),
         SearchStatus::Running(progress) => (
-            format!("scanning ({} scanned, {} matched)", progress.scanned, progress.matched),
+            format!(
+                "scanning ({} scanned, {} matched)",
+                progress.scanned, progress.matched
+            ),
             true,
         ),
         SearchStatus::Done(progress) => (
-            format!("done ({} scanned, {} matched)", progress.scanned, progress.matched),
+            format!(
+                "done ({} scanned, {} matched)",
+                progress.scanned, progress.matched
+            ),
             false,
         ),
     };

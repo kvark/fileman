@@ -1,8 +1,8 @@
-# Fileman
+# FileMan
 
-Fileman is a fast, responsive two-panel file manager built with Rust, egui, and blade-egui. Navigation stays snappy even in large directories by doing all I/O off the UI thread and streaming results into the view.
+FileMan is a fast, responsive two-panel file manager built with Rust, egui, and blade-egui. Navigation stays snappy even in large directories by doing all I/O off the UI thread and streaming results into the view.
 
-![Fileman screenshot](etc/snapshots/tests/preview.png)
+![FileMan screenshot](etc/snapshots/tests/preview.png)
 
 ## Features
 - **Dual-panel layout** with independent navigation, history (Alt+Left/Right), and panel swap (Ctrl+U).
@@ -83,10 +83,17 @@ On macOS this produces a `.app` bundle, on Windows an `.msi` installer.
 Icons are configured in `Cargo.toml` via `package.metadata.bundle.icon`.
 
 ## Linux Desktop Integration
-Copy the desktop entry and icon to the standard locations:
+Install the binary, desktop entry, and icon to `~/.local` (the standard per-user prefix):
 ```bash
-cp etc/fileman.desktop ~/.local/share/applications/
-cp etc/fileman.svg ~/.local/share/icons/hicolor/scalable/apps/fileman.svg
+make install
+```
+To install system-wide instead:
+```bash
+sudo make install PREFIX=/usr
+```
+To remove:
+```bash
+make uninstall
 ```
 
 ## Contributing

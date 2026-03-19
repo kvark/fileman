@@ -1242,8 +1242,8 @@ pub fn create_archive(
 fn create_zip_archive(sources: &[path::PathBuf], archive_path: &Path) -> io::Result<()> {
     let file = fs::File::create(archive_path)?;
     let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::FileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     for src in sources {
         add_path_to_zip(&mut zip, src, "", options)?;
     }
@@ -1257,10 +1257,7 @@ fn add_path_to_zip<W: Write + io::Seek>(
     prefix: &str,
     options: zip::write::FileOptions,
 ) -> io::Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let archive_name = if prefix.is_empty() {
         name.to_string()
     } else {
@@ -1268,13 +1265,15 @@ fn add_path_to_zip<W: Write + io::Seek>(
     };
     if path.is_dir() {
         let dir_name = format!("{archive_name}/");
-        zip.add_directory(&dir_name, options).map_err(io::Error::other)?;
+        zip.add_directory(&dir_name, options)
+            .map_err(io::Error::other)?;
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             add_path_to_zip(zip, &entry.path(), &archive_name, options)?;
         }
     } else {
-        zip.start_file(&archive_name, options).map_err(io::Error::other)?;
+        zip.start_file(&archive_name, options)
+            .map_err(io::Error::other)?;
         let mut file = fs::File::open(path)?;
         io::copy(&mut file, zip)?;
     }
@@ -1314,10 +1313,7 @@ fn create_tar_bz2_archive(sources: &[path::PathBuf], archive_path: &Path) -> io:
 }
 
 fn append_path_to_tar<W: Write>(builder: &mut tar::Builder<W>, path: &Path) -> io::Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     if path.is_dir() {
         builder.append_dir_all(name, path)?;
     } else {
