@@ -1,6 +1,6 @@
 [package]
 name = "fileman"
-version = "0.1.0"
+version = "0.2.0"
 description = "Two-panel file manager"
 keywords = ["file-manager", "egui", "blade"]
 categories = ["filesystem"]
@@ -20,7 +20,7 @@ exclude = [
 ]
 
 [package.metadata.bundle]
-name = "Fileman"
+name = "FileMan"
 identifier = "com.fileman.app"
 icon = ["etc/macos/icon.png", "etc/windows/icon.ico"]
 
@@ -82,3 +82,6 @@ self-update = ["reqwest", "semver"]
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(gles)'] }

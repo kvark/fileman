@@ -1,8 +1,8 @@
-# Fileman — Comprehensive Test Plan
+# FileMan — Comprehensive Test Plan
 
 ## Test Infrastructure
 
-Fileman uses a **replay-based headless testing system**. Tests are RON files in
+FileMan uses a **replay-based headless testing system**. Tests are RON files in
 `tests/cases/` that specify a starting directory, a sequence of keyboard events,
 and assertions on panel state, filesystem state, file contents, or screenshots.
 

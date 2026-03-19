@@ -232,7 +232,8 @@ pub fn draw_panel(
                                 };
                                 let label = {
                                     let browser = &app.panel(panel_side).tabs[i];
-                                    browser.current_path
+                                    browser
+                                        .current_path
                                         .file_name()
                                         .and_then(|n| n.to_str())
                                         .unwrap_or("/")
@@ -241,7 +242,10 @@ pub fn draw_panel(
                                 let resp = egui::Frame::NONE
                                     .fill(color32(tab_bg))
                                     .corner_radius(egui::CornerRadius {
-                                        nw: 4, ne: 4, sw: 0, se: 0,
+                                        nw: 4,
+                                        ne: 4,
+                                        sw: 0,
+                                        se: 0,
                                     })
                                     .inner_margin(egui::Margin::symmetric(6, 2))
                                     .show(ui, |ui| {

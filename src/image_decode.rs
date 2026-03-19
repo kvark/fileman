@@ -368,7 +368,12 @@ fn rgbe_to_rgb(rgbe: &[u8; 4]) -> (f32, f32, f32) {
     )
 }
 
-fn hdr_read_scanline(bytes: &[u8], mut pos: usize, scanline: &mut [[u8; 4]], width: usize) -> Option<usize> {
+fn hdr_read_scanline(
+    bytes: &[u8],
+    mut pos: usize,
+    scanline: &mut [[u8; 4]],
+    width: usize,
+) -> Option<usize> {
     if pos + 4 > bytes.len() {
         return None;
     }

@@ -392,9 +392,13 @@ pub(crate) fn handle_keyboard(
         ctx.request_repaint();
     }
     // Tab management — only in Browser mode
-    let active_is_browser_mode = matches!(app.get_active_panel().mode, app_state::PanelMode::Browser);
+    let active_is_browser_mode =
+        matches!(app.get_active_panel().mode, app_state::PanelMode::Browser);
     let ctrl_shift_tab = ctx.input_mut(|i| {
-        i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)
+        i.consume_key(
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            egui::Key::Tab,
+        )
     });
     if ctrl_shift_tab && active_is_browser_mode {
         app.get_active_panel_mut().prev_tab();

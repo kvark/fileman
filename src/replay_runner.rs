@@ -138,7 +138,12 @@ fn apply_replay_key(
             core::ActivePanel::Right => ui_cache.right_rows.max(1),
         };
         let panel = app.get_active_panel_mut();
-        if let Some(index) = panel.browser_mut().entries.iter().position(|e| e.name == name) {
+        if let Some(index) = panel
+            .browser_mut()
+            .entries
+            .iter()
+            .position(|e| e.name == name)
+        {
             app.select_entry(index, window_rows);
         } else {
             let mut sample = String::new();
@@ -382,6 +387,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         refresh_tick: 0,
         update_status: app_state::UpdateStatus::Disabled,
         update_rx: None,
+        gpu_info: String::from("Test"),
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));

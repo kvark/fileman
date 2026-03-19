@@ -2200,12 +2200,21 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             return;
         }
 
+        #[allow(unused_mut)]
+        let mut window_attributes = winit::window::WindowAttributes::default()
+            .with_title("FileMan")
+            .with_window_icon(app_icon());
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            window_attributes =
+                WindowAttributesExtWayland::with_name(window_attributes, "fileman", "fileman");
+            window_attributes =
+                WindowAttributesExtX11::with_name(window_attributes, "fileman", "fileman");
+        }
         let window = event_loop
-            .create_window(
-                winit::window::WindowAttributes::default()
-                    .with_title("Fileman (egui)")
-                    .with_window_icon(app_icon()),
-            )
+            .create_window(window_attributes)
             .expect("create window");
         let window_id = window.id();
 
@@ -2217,7 +2226,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 validation: cfg!(debug_assertions),
                 timing: false,
                 capture: false,
-                overlay: true,
+                overlay: false,
                 device_id: 0,
             }) {
                 Ok(context) => context,
@@ -2544,6 +2553,17 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             refresh_tick: 0,
             update_status: app_state::UpdateStatus::Disabled,
             update_rx: None,
+            gpu_info: {
+                let backend = if cfg!(gles) {
+                    "GLES"
+                } else if cfg!(target_os = "macos") {
+                    "Metal"
+                } else {
+                    "Vulkan"
+                };
+                let dev = context.device_information();
+                format!("{} ({})", dev.device_name, backend)
+            },
         };
 
         app.theme
@@ -2847,7 +2867,13 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                     runtime.app.active_panel == core::ActivePanel::Left;
                                 let theme = runtime.app.theme.clone();
                                 let async_status = runtime.app.async_status();
-                                if ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status) {
+                                if ui::help::draw_help(
+                                    ui,
+                                    &theme,
+                                    is_focused,
+                                    rect.height(),
+                                    &async_status,
+                                ) {
                                     start_install(&mut runtime.app);
                                 }
                             } else {
@@ -2910,7 +2936,13 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                     runtime.app.active_panel == core::ActivePanel::Right;
                                 let theme = runtime.app.theme.clone();
                                 let async_status = runtime.app.async_status();
-                                if ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status) {
+                                if ui::help::draw_help(
+                                    ui,
+                                    &theme,
+                                    is_focused,
+                                    rect.height(),
+                                    &async_status,
+                                ) {
                                     start_install(&mut runtime.app);
                                 }
                             } else {
@@ -3412,10 +3444,16 @@ fn start_install(_app: &mut app_state::AppState) {}
 
 #[cfg(feature = "self-update")]
 fn run_update() -> anyhow::Result<()> {
-    eprintln!("fileman v{} — checking for updates...", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "fileman v{} — checking for updates...",
+        env!("CARGO_PKG_VERSION")
+    );
     match update::check_for_update()? {
         Some(release) => {
-            eprintln!("New version available: {} ({})", release.version, release.tag);
+            eprintln!(
+                "New version available: {} ({})",
+                release.version, release.tag
+            );
             update::perform_update(&release)?;
         }
         None => {

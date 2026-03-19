@@ -1,9 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=Fileman
+Name=FileMan
 Comment=Two-panel file manager
 Exec=fileman %f
 Icon=fileman
 Categories=System;FileTools;FileManager;
 MimeType=inode/directory;
 Terminal=false
+StartupWMClass=fileman

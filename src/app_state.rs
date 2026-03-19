@@ -298,6 +298,7 @@ pub struct AppState {
     pub refresh_tick: u64,
     pub update_status: UpdateStatus,
     pub update_rx: Option<mpsc::Receiver<UpdateStatus>>,
+    pub gpu_info: String,
 }
 
 #[derive(Clone)]
@@ -371,6 +372,7 @@ pub struct AsyncStatus {
     pub dir_size_pending: usize,
     pub search: SearchStatus,
     pub update: UpdateStatus,
+    pub gpu_info: String,
 }
 
 impl AppState {
@@ -390,6 +392,7 @@ impl AppState {
             dir_size_pending: self.dir_size_pending.len(),
             search: self.search_status,
             update: self.update_status.clone(),
+            gpu_info: self.gpu_info.clone(),
         }
     }
 

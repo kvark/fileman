@@ -38,7 +38,9 @@ jobs:
       # --- Linux ---
       - name: Install packaging tools (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle cargo-deb cargo-generate-rpm
+        run: |
+          cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle
+          cargo install cargo-deb cargo-generate-rpm
 
       - name: Build + bundle with self-update (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -82,8 +84,8 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: |
           mkdir -p dist
-          codesign --sign - --deep --force target/aarch64-apple-darwin/release/bundle/osx/Fileman.app
-          ditto -c -k --sequesterRsrc --keepParent target/aarch64-apple-darwin/release/bundle/osx/Fileman.app dist/fileman-macos-aarch64.zip
+          codesign --sign - --deep --force target/aarch64-apple-darwin/release/bundle/osx/FileMan.app
+          ditto -c -k --sequesterRsrc --keepParent target/aarch64-apple-darwin/release/bundle/osx/FileMan.app dist/fileman-macos-aarch64.zip
 
       # --- Windows ---
       - name: Build (Windows)
@@ -103,7 +105,7 @@ jobs:
         shell: pwsh
         run: |
           cargo install cargo-wix
-          cargo wix init --force
+          cargo wix init --force -B target/release/fileman.exe
           cargo wix --no-build --nocapture
           Copy-Item target/wix/*.msi dist/
 

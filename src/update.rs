@@ -28,8 +28,8 @@ fn asset_suffix() -> Option<&'static str> {
 }
 
 pub fn check_for_update() -> anyhow::Result<Option<Release>> {
-    let suffix = asset_suffix()
-        .ok_or_else(|| anyhow::anyhow!("unsupported platform for self-update"))?;
+    let suffix =
+        asset_suffix().ok_or_else(|| anyhow::anyhow!("unsupported platform for self-update"))?;
 
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("fileman/{CURRENT_VERSION}"))
@@ -71,10 +71,7 @@ pub fn check_for_update() -> anyhow::Result<Option<Release>> {
     let asset_url = asset["browser_download_url"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing download URL for asset"))?;
-    let asset_name = asset["name"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
+    let asset_name = asset["name"].as_str().unwrap_or("unknown").to_string();
 
     Ok(Some(Release {
         tag: tag.to_string(),
@@ -202,10 +199,10 @@ fn atomic_replace(target: &std::path::Path, new_binary: &[u8]) -> anyhow::Result
 
 #[cfg(target_os = "macos")]
 fn find_app_bundle(exe: &std::path::Path) -> Option<PathBuf> {
-    // Typical path: Fileman.app/Contents/MacOS/fileman
+    // Typical path: FileMan.app/Contents/MacOS/fileman
     let contents = exe.parent()?; // MacOS
     let contents = contents.parent()?; // Contents
-    let app = contents.parent()?; // Fileman.app
+    let app = contents.parent()?; // FileMan.app
     if app.extension().map_or(false, |e| e == "app") {
         Some(app.to_path_buf())
     } else {
