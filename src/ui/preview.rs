@@ -305,14 +305,134 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                             );
                                             ui.add_space(6.0);
                                         }
+                                        let is_refining = image_cache.refining.contains_key(&key);
+                                        let is_animated = image_cache.animations.contains_key(&key);
+                                        if is_refining {
+                                            let t = ui.ctx().input(|i| i.time);
+                                            let spinner =
+                                                ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
+                                            ui.colored_label(
+                                                text_color,
+                                                format!("{spinner} Loading full image..."),
+                                            );
+                                            ui.ctx().request_repaint_after(
+                                                std::time::Duration::from_millis(333),
+                                            );
+                                        }
                                         let sized = egui::load::SizedTexture::from_handle(&handle);
                                         let available = ui.available_size();
                                         let tex = sized.size;
-                                        let scale = (available.x / tex.x)
+                                        let fit_scale = (available.x / tex.x)
                                             .min(available.y / tex.y)
-                                            .clamp(0.01, 1.0);
-                                        let size = egui::Vec2::new(tex.x * scale, tex.y * scale);
-                                        ui.add(egui::Image::new(sized).fit_to_exact_size(size));
+                                            .max(0.01);
+
+                                        // Zoom slider: only for non-animated, fully loaded images
+                                        let old_scale = if preview.image_zoom == 0.0
+                                            || is_refining
+                                            || is_animated
+                                        {
+                                            fit_scale
+                                        } else {
+                                            preview.image_zoom
+                                        };
+                                        if !is_refining && !is_animated {
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(text_color, "Zoom");
+                                                ui.spacing_mut().slider_width =
+                                                    (available.x - 120.0).max(60.0);
+                                                let min_zoom = fit_scale.max(0.01);
+                                                let mut display_zoom = if preview.image_zoom == 0.0
+                                                {
+                                                    min_zoom
+                                                } else {
+                                                    preview.image_zoom
+                                                };
+                                                let slider = egui::Slider::new(
+                                                    &mut display_zoom,
+                                                    min_zoom..=5.0,
+                                                )
+                                                .logarithmic(true)
+                                                .custom_formatter(move |v, _| {
+                                                    if (v - min_zoom as f64).abs() < 0.001 {
+                                                        "Fit".to_string()
+                                                    } else {
+                                                        format!("{:.0}%", v * 100.0)
+                                                    }
+                                                })
+                                                .custom_parser(|s| {
+                                                    let s = s.trim().trim_end_matches('%');
+                                                    s.parse::<f64>().ok().map(|v| v / 100.0)
+                                                });
+                                                let resp = ui.add(slider);
+                                                if resp.changed() {
+                                                    if (display_zoom - min_zoom).abs() < 0.001 {
+                                                        preview.image_zoom = 0.0;
+                                                    } else {
+                                                        preview.image_zoom = display_zoom;
+                                                    }
+                                                }
+                                            });
+                                            ui.add_space(4.0);
+                                        }
+
+                                        let new_scale = if preview.image_zoom == 0.0
+                                            || is_refining
+                                            || is_animated
+                                        {
+                                            fit_scale
+                                        } else {
+                                            preview.image_zoom
+                                        };
+                                        let viewport = ui.available_size();
+
+                                        // Anchor zoom to center of visible area
+                                        if (new_scale - old_scale).abs() > 0.001 {
+                                            let old_size_x = tex.x * old_scale;
+                                            let old_size_y = tex.y * old_scale;
+                                            let cx = if old_size_x > viewport.x {
+                                                (preview.image_pan[0] + viewport.x * 0.5)
+                                                    / old_size_x
+                                            } else {
+                                                0.5
+                                            };
+                                            let cy = if old_size_y > viewport.y {
+                                                (preview.image_pan[1] + viewport.y * 0.5)
+                                                    / old_size_y
+                                            } else {
+                                                0.5
+                                            };
+                                            let new_size_x = tex.x * new_scale;
+                                            let new_size_y = tex.y * new_scale;
+                                            preview.image_pan[0] = (cx * new_size_x
+                                                - viewport.x * 0.5)
+                                                .clamp(0.0, (new_size_x - viewport.x).max(0.0));
+                                            preview.image_pan[1] = (cy * new_size_y
+                                                - viewport.y * 0.5)
+                                                .clamp(0.0, (new_size_y - viewport.y).max(0.0));
+                                        }
+
+                                        let size =
+                                            egui::Vec2::new(tex.x * new_scale, tex.y * new_scale);
+
+                                        if size.x > viewport.x || size.y > viewport.y {
+                                            // Zoomed beyond panel: show scrollable area
+                                            let scroll_area = egui::ScrollArea::both()
+                                                .auto_shrink([false, false])
+                                                .scroll_offset(egui::Vec2::new(
+                                                    preview.image_pan[0],
+                                                    preview.image_pan[1],
+                                                ));
+                                            let output = scroll_area.show(ui, |ui| {
+                                                ui.add(
+                                                    egui::Image::new(sized).fit_to_exact_size(size),
+                                                );
+                                            });
+                                            preview.image_pan[0] = output.state.offset.x;
+                                            preview.image_pan[1] = output.state.offset.y;
+                                        } else {
+                                            preview.image_pan = [0.0, 0.0];
+                                            ui.add(egui::Image::new(sized).fit_to_exact_size(size));
+                                        }
                                         ui.ctx().request_repaint();
                                     } else {
                                         if image_cache.pending.insert(key.clone()) {

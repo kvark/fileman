@@ -80,6 +80,7 @@ pub(crate) fn render_snapshot(
         meta: HashMap::new(),
         failures: HashMap::new(),
         pending: HashSet::new(),
+        refining: std::collections::HashMap::new(),
         order: VecDeque::new(),
     };
     let highlight_cache = build_snapshot_highlights(app);
