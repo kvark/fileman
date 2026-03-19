@@ -74,6 +74,15 @@ pub fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
         return decode_gif_bytes(bytes, max_side);
     }
 
+    // Try JPEG fast preview path (EXIF thumbnail or DC-only 1/8-scale decode)
+    if bytes.len() >= 3
+        && bytes[0] == 0xFF
+        && bytes[1] == 0xD8
+        && let Some(result) = decode_jpeg_preview(bytes, max_side)
+    {
+        return Some(result);
+    }
+
     let options = zune_core::options::DecoderOptions::new_fast();
     if let Ok(image) = zune_image::image::Image::read(bytes, options) {
         let orientation = exif_orientation(&image).unwrap_or(1);
@@ -675,6 +684,635 @@ fn decode_bmp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
             width,
             height,
             depth,
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// JPEG preview fast-path: EXIF thumbnail extraction + DC-only 1/8 decode
+// ---------------------------------------------------------------------------
+
+/// Try to produce a reduced-resolution JPEG preview without decoding the full
+/// image.  Tries two strategies in order:
+///   1. Extract the EXIF thumbnail (tiny embedded JPEG, ~160×120)
+///   2. DC-only decode: one pixel per 8×8 block → 1/8 scale
+///
+/// Returns `None` if neither strategy works (caller falls back to full decode).
+fn decode_jpeg_preview(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
+    // Tier 1: try EXIF thumbnail
+    if let Some(result) = extract_exif_thumbnail(bytes, max_side) {
+        return Some(result);
+    }
+    // Tier 2: DC-only 1/8-scale decode (baseline JPEG only)
+    decode_jpeg_dc_only(bytes, max_side)
+}
+
+/// Extract and decode the EXIF thumbnail JPEG if present and large enough.
+fn extract_exif_thumbnail(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
+    let cursor = io::Cursor::new(bytes);
+    let mut buf_reader = io::BufReader::new(cursor);
+    let exif = exif::Reader::new().read_from_container(&mut buf_reader).ok()?;
+    let orientation = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|f| match f.value {
+            exif::Value::Short(ref v) => v.first().copied(),
+            _ => None,
+        })
+        .unwrap_or(1);
+    let offset = exif
+        .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
+        .value
+        .get_uint(0)? as usize;
+    let length = exif
+        .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)?
+        .value
+        .get_uint(0)? as usize;
+    // The offset is relative to the TIFF header inside the EXIF APP1 segment.
+    // exif.buf() gives us the raw EXIF data starting from the TIFF header.
+    let exif_buf = exif.buf();
+    if offset + length > exif_buf.len() {
+        return None;
+    }
+    let thumb_bytes = &exif_buf[offset..offset + length];
+    // Sanity: must be a JPEG
+    if thumb_bytes.len() < 3 || thumb_bytes[0] != 0xFF || thumb_bytes[1] != 0xD8 {
+        return None;
+    }
+    // Decode the small thumbnail with zune
+    let options = zune_core::options::DecoderOptions::new_fast();
+    let image = zune_image::image::Image::read(thumb_bytes, options).ok()?;
+    let (width, height) = image.dimensions();
+    // Skip if thumbnail is too small to be useful
+    if width.max(height) < 160 {
+        return None;
+    }
+    let depth = image.depth();
+    let colorspace = image.colorspace();
+    let mut frames = image.flatten_to_u8();
+    let data = frames.pop()?;
+    let rgba = convert_to_rgba(&data, width, height, colorspace)?;
+    let (rgba, width, height) = apply_orientation_rgba(rgba, width, height, orientation);
+    let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
+    let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    Some((
+        DecodedImage::Static(color),
+        ImageMeta {
+            width,
+            height,
+            depth,
+        },
+    ))
+}
+
+// -- DC-only baseline JPEG decoder ------------------------------------------
+
+/// Huffman lookup table for fast decoding (up to 8-bit codes).
+struct HuffLut {
+    /// For codes up to 8 bits: (symbol, code_length). 0 length = not valid.
+    fast: [u16; 256], // packed: high 8 = symbol, low 8 = length
+    /// Slower path for codes > 8 bits.
+    symbols: Vec<u8>,
+    min_code: [i32; 17],
+    max_code: [i32; 17],
+    val_offset: [i32; 17],
+}
+
+impl HuffLut {
+    fn build(counts: &[u8; 16], symbols: &[u8]) -> Self {
+        let mut lut = HuffLut {
+            fast: [0; 256],
+            symbols: symbols.to_vec(),
+            min_code: [0; 17],
+            max_code: [-1; 17],
+            val_offset: [0; 17],
+        };
+        let mut code: u32 = 0;
+        let mut si = 0usize;
+        for bits in 1..=16usize {
+            lut.min_code[bits] = code as i32;
+            let count = counts[bits - 1] as usize;
+            for _ in 0..count {
+                if bits <= 8 && si < symbols.len() {
+                    let sym = symbols[si];
+                    let pad = 8 - bits;
+                    for padding in 0..(1u32 << pad) {
+                        let idx = ((code << pad) | padding) as usize;
+                        if idx < 256 {
+                            lut.fast[idx] = ((sym as u16) << 8) | bits as u16;
+                        }
+                    }
+                }
+                code += 1;
+                si += 1;
+            }
+            lut.max_code[bits] = code as i32 - 1;
+            lut.val_offset[bits] = (si as i32) - (code as i32);
+            code <<= 1;
+        }
+        lut
+    }
+}
+
+struct JpegComponent {
+    h_samp: usize,
+    v_samp: usize,
+    qt_id: usize,
+    dc_table: usize,
+    ac_table: usize,
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bits: u32,
+    nbits: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8], start: usize) -> Self {
+        BitReader {
+            data,
+            pos: start,
+            bits: 0,
+            nbits: 0,
+        }
+    }
+
+    /// Read a single byte from the JPEG entropy stream, handling FF 00 stuffing.
+    fn read_byte(&mut self) -> Option<u8> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+        let b = self.data[self.pos];
+        self.pos += 1;
+        if b == 0xFF {
+            // Must be followed by 0x00 (stuffed byte)
+            if self.pos < self.data.len() && self.data[self.pos] == 0x00 {
+                self.pos += 1;
+            } else {
+                // Marker encountered — signal end
+                return None;
+            }
+        }
+        Some(b)
+    }
+
+    fn fill(&mut self) {
+        while self.nbits <= 24 {
+            if let Some(b) = self.read_byte() {
+                self.bits = (self.bits << 8) | b as u32;
+                self.nbits += 8;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek(&mut self, n: u8) -> u32 {
+        if self.nbits < n {
+            self.fill();
+        }
+        if self.nbits < n {
+            return 0;
+        }
+        (self.bits >> (self.nbits - n)) & ((1u32 << n) - 1)
+    }
+
+    fn consume(&mut self, n: u8) {
+        self.nbits = self.nbits.saturating_sub(n);
+    }
+
+    fn get_bits(&mut self, n: u8) -> i32 {
+        let v = self.peek(n);
+        self.consume(n);
+        v as i32
+    }
+
+    fn decode_huff(&mut self, lut: &HuffLut) -> Option<u8> {
+        // Try fast 8-bit lookup
+        let peek8 = self.peek(8) as usize;
+        let entry = lut.fast[peek8];
+        if entry != 0 {
+            let len = (entry & 0xFF) as u8;
+            let sym = (entry >> 8) as u8;
+            self.consume(len);
+            return Some(sym);
+        }
+        // Slow path for codes > 8 bits
+        let mut code = self.peek(8) as i32;
+        self.consume(8);
+        for bits in 9..=16u8 {
+            code = (code << 1) | self.get_bits(1);
+            if code <= lut.max_code[bits as usize] {
+                let idx = (code + lut.val_offset[bits as usize]) as usize;
+                return lut.symbols.get(idx).copied();
+            }
+        }
+        None
+    }
+}
+
+/// Decode a baseline JPEG at 1/8 scale using only DC coefficients.
+fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
+    let len = bytes.len();
+    if len < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut pos = 2usize;
+
+    // Parse state
+    let mut qt_tables: [[i32; 64]; 4] = [[0; 64]; 4];
+    let mut dc_huff: [Option<HuffLut>; 4] = [const { None }; 4];
+    let mut ac_huff: [Option<HuffLut>; 4] = [const { None }; 4];
+    let mut components: Vec<JpegComponent> = Vec::new();
+    let mut width = 0u16;
+    let mut height = 0u16;
+    let mut num_components = 0u8;
+    let mut restart_interval: u16 = 0;
+
+    // EXIF orientation (parse from APP1 if present)
+    let mut orientation: u16 = 1;
+
+    while pos + 1 < len {
+        if bytes[pos] != 0xFF {
+            return None;
+        }
+        let marker = bytes[pos + 1];
+        pos += 2;
+
+        match marker {
+            0xD8 => {} // SOI — ignore if repeated
+            0xE1 => {
+                // APP1 — may contain EXIF
+                if pos + 2 > len {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                if pos + seg_len > len {
+                    return None;
+                }
+                // Try to extract orientation from EXIF
+                let seg_data = &bytes[pos + 2..pos + seg_len];
+                if seg_data.starts_with(b"Exif\0\0") {
+                    let tiff_data = &seg_data[6..];
+                    if let Ok(exif_fields) = exif::parse_exif(tiff_data) {
+                        for f in &exif_fields.0 {
+                            if f.tag == exif::Tag::Orientation
+                                && let exif::Value::Short(ref vals) = f.value
+                                && let Some(&v) = vals.first()
+                            {
+                                orientation = v;
+                            }
+                        }
+                    }
+                }
+                pos += seg_len;
+            }
+            0xE0 | 0xE2..=0xEF | 0xFE => {
+                // APPn / COM — skip
+                if pos + 2 > len {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                pos += seg_len;
+            }
+            0xDB => {
+                // DQT — quantization tables
+                if pos + 2 > len {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                let seg_end = pos + seg_len;
+                let mut p = pos + 2;
+                while p < seg_end {
+                    if p >= len {
+                        return None;
+                    }
+                    let pq_tq = bytes[p];
+                    p += 1;
+                    let precision = (pq_tq >> 4) as usize; // 0 = 8-bit, 1 = 16-bit
+                    let table_id = (pq_tq & 0x0F) as usize;
+                    if table_id >= 4 {
+                        return None;
+                    }
+                    if precision == 0 {
+                        if p + 64 > len {
+                            return None;
+                        }
+                        for i in 0..64 {
+                            qt_tables[table_id][i] = bytes[p + i] as i32;
+                        }
+                        p += 64;
+                    } else {
+                        if p + 128 > len {
+                            return None;
+                        }
+                        for i in 0..64 {
+                            qt_tables[table_id][i] =
+                                i32::from(u16::from_be_bytes([bytes[p + i * 2], bytes[p + i * 2 + 1]]));
+                        }
+                        p += 128;
+                    }
+                }
+                pos = seg_end;
+            }
+            0xC4 => {
+                // DHT — Huffman tables
+                if pos + 2 > len {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                let seg_end = pos + seg_len;
+                let mut p = pos + 2;
+                while p < seg_end {
+                    if p >= len {
+                        return None;
+                    }
+                    let tc_th = bytes[p];
+                    p += 1;
+                    let tc = (tc_th >> 4) as usize; // 0=DC, 1=AC
+                    let th = (tc_th & 0x0F) as usize;
+                    if th >= 4 {
+                        return None;
+                    }
+                    if p + 16 > len {
+                        return None;
+                    }
+                    let mut counts = [0u8; 16];
+                    counts.copy_from_slice(&bytes[p..p + 16]);
+                    p += 16;
+                    let total: usize = counts.iter().map(|&c| c as usize).sum();
+                    if p + total > len {
+                        return None;
+                    }
+                    let symbols = bytes[p..p + total].to_vec();
+                    p += total;
+                    let lut = HuffLut::build(&counts, &symbols);
+                    if tc == 0 {
+                        dc_huff[th] = Some(lut);
+                    } else {
+                        ac_huff[th] = Some(lut);
+                    }
+                }
+                pos = seg_end;
+            }
+            0xC0 => {
+                // SOF0 — baseline DCT
+                if pos + 2 > len {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                if pos + seg_len > len {
+                    return None;
+                }
+                let p = pos + 2;
+                let _precision = bytes[p]; // must be 8
+                height = u16::from_be_bytes([bytes[p + 1], bytes[p + 2]]);
+                width = u16::from_be_bytes([bytes[p + 3], bytes[p + 4]]);
+                num_components = bytes[p + 5];
+                if num_components == 0 || num_components > 4 {
+                    return None;
+                }
+                components.clear();
+                for i in 0..num_components as usize {
+                    let off = p + 6 + i * 3;
+                    let _id = bytes[off];
+                    let sampling = bytes[off + 1];
+                    let qt = bytes[off + 2] as usize;
+                    components.push(JpegComponent {
+                        h_samp: (sampling >> 4) as usize,
+                        v_samp: (sampling & 0x0F) as usize,
+                        qt_id: qt,
+                        dc_table: 0,
+                        ac_table: 0,
+                    });
+                }
+                pos += seg_len;
+            }
+            0xC2 => {
+                // SOF2 — progressive, bail out
+                return None;
+            }
+            0xDD => {
+                // DRI — define restart interval
+                if pos + 4 > len {
+                    return None;
+                }
+                restart_interval = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]);
+                pos += 4;
+            }
+            0xDA => {
+                // SOS — start of scan
+                if pos + 2 > len {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                if pos + seg_len > len {
+                    return None;
+                }
+                let p = pos + 2;
+                let ns = bytes[p] as usize;
+                if ns != num_components as usize {
+                    return None; // only handle interleaved scans
+                }
+                for (i, comp) in components.iter_mut().enumerate().take(ns) {
+                    let off = p + 1 + i * 2;
+                    let _cs = bytes[off];
+                    let td_ta = bytes[off + 1];
+                    comp.dc_table = (td_ta >> 4) as usize;
+                    comp.ac_table = (td_ta & 0x0F) as usize;
+                }
+                pos += seg_len;
+                // Now decode entropy data
+                break;
+            }
+            0xD9 => return None, // EOI before SOS
+            _ => {
+                // Unknown marker — try to skip
+                if pos + 2 > len {
+                    return None;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                pos += seg_len;
+            }
+        }
+    }
+
+    if width == 0 || height == 0 || components.is_empty() {
+        return None;
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+    let h_max = components.iter().map(|c| c.h_samp).max().unwrap_or(1);
+    let v_max = components.iter().map(|c| c.v_samp).max().unwrap_or(1);
+    let mcu_w = w.div_ceil(h_max * 8);
+    let mcu_h = h.div_ceil(v_max * 8);
+    // Allocate DC coefficient planes for each component
+    let mut dc_planes: Vec<Vec<f32>> = components
+        .iter()
+        .map(|c| vec![0.0f32; mcu_w * c.h_samp * mcu_h * c.v_samp])
+        .collect();
+
+    let mut reader = BitReader::new(bytes, pos);
+    let mut dc_pred = [0i32; 4];
+    let mut mcu_count = 0u32;
+
+    for mcu_y in 0..mcu_h {
+        for mcu_x in 0..mcu_w {
+            // Handle restart markers
+            if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as u32) {
+                // Align to byte boundary
+                reader.nbits = 0;
+                reader.bits = 0;
+                // Skip RST marker (FF Dn)
+                while reader.pos < reader.data.len() {
+                    if reader.data[reader.pos] == 0xFF
+                        && reader.pos + 1 < reader.data.len()
+                        && (reader.data[reader.pos + 1] & 0xF8) == 0xD0
+                    {
+                        reader.pos += 2;
+                        break;
+                    }
+                    reader.pos += 1;
+                }
+                dc_pred = [0i32; 4];
+            }
+
+            for (ci, comp) in components.iter().enumerate() {
+                let dc_lut = dc_huff[comp.dc_table].as_ref()?;
+                let ac_lut = ac_huff[comp.ac_table].as_ref()?;
+                let qt_dc = qt_tables.get(comp.qt_id).map(|t| t[0]).unwrap_or(1);
+
+                for vy in 0..comp.v_samp {
+                    for hx in 0..comp.h_samp {
+                        // Decode DC coefficient
+                        let cat = reader.decode_huff(dc_lut)?;
+                        let dc_diff = if cat == 0 {
+                            0
+                        } else {
+                            let raw = reader.get_bits(cat);
+                            // Extend sign
+                            if raw < (1 << (cat - 1)) {
+                                raw - (1 << cat) + 1
+                            } else {
+                                raw
+                            }
+                        };
+                        dc_pred[ci] += dc_diff;
+
+                        // Skip AC coefficients (must parse to maintain stream position)
+                        let mut ac_count = 0;
+                        while ac_count < 63 {
+                            let sym = reader.decode_huff(ac_lut)?;
+                            if sym == 0x00 {
+                                break; // EOB
+                            }
+                            let run = (sym >> 4) as usize;
+                            let size = sym & 0x0F;
+                            ac_count += run + 1;
+                            if size > 0 {
+                                reader.get_bits(size);
+                            }
+                            // ZRL (0xF0): run=15, size=0 → skip 16 zeros
+                        }
+
+                        // Store dequantized DC value
+                        let dc_val = (dc_pred[ci] * qt_dc) as f32;
+                        let plane_w = mcu_w * comp.h_samp;
+                        let px = mcu_x * comp.h_samp + hx;
+                        let py = mcu_y * comp.v_samp + vy;
+                        let idx = py * plane_w + px;
+                        if idx < dc_planes[ci].len() {
+                            dc_planes[ci][idx] = dc_val;
+                        }
+                    }
+                }
+            }
+            mcu_count += 1;
+        }
+    }
+
+    // Assemble output image from DC planes
+    // Output dimensions: 1 pixel per 8×8 block (accounting for max sampling)
+    let out_w = mcu_w * h_max;
+    let out_h = mcu_h * v_max;
+    let nc = components.len();
+
+    let mut rgba = vec![0u8; out_w * out_h * 4];
+
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let idx = (y * out_w + x) * 4;
+            if nc == 1 {
+                // Grayscale
+                let luma_w = mcu_w * components[0].h_samp;
+                let lx = x * components[0].h_samp / h_max;
+                let ly = y * components[0].v_samp / v_max;
+                let li = ly * luma_w + lx;
+                let v = (dc_planes[0].get(li).copied().unwrap_or(0.0) / 8.0 + 128.0)
+                    .clamp(0.0, 255.0) as u8;
+                rgba[idx] = v;
+                rgba[idx + 1] = v;
+                rgba[idx + 2] = v;
+                rgba[idx + 3] = 255;
+            } else {
+                // YCbCr → RGB
+                let y_w = mcu_w * components[0].h_samp;
+                let cb_w = mcu_w * components[1].h_samp;
+                let cr_w = mcu_w * components[2].h_samp;
+
+                let yx = x * components[0].h_samp / h_max;
+                let yy_coord = y * components[0].v_samp / v_max;
+                let yi = yy_coord * y_w + yx;
+                let yv = dc_planes[0].get(yi).copied().unwrap_or(0.0) / 8.0 + 128.0;
+
+                let cbx = x * components[1].h_samp / h_max;
+                let cby = y * components[1].v_samp / v_max;
+                let cbi = cby * cb_w + cbx;
+                let cb = dc_planes[1].get(cbi).copied().unwrap_or(0.0) / 8.0 + 128.0;
+
+                let crx = x * components[2].h_samp / h_max;
+                let cry = y * components[2].v_samp / v_max;
+                let cri = cry * cr_w + crx;
+                let cr = dc_planes[2].get(cri).copied().unwrap_or(0.0) / 8.0 + 128.0;
+
+                let r = (yv + 1.402 * (cr - 128.0)).clamp(0.0, 255.0) as u8;
+                let g = (yv - 0.344136 * (cb - 128.0) - 0.714136 * (cr - 128.0))
+                    .clamp(0.0, 255.0) as u8;
+                let b = (yv + 1.772 * (cb - 128.0)).clamp(0.0, 255.0) as u8;
+                rgba[idx] = r;
+                rgba[idx + 1] = g;
+                rgba[idx + 2] = b;
+                rgba[idx + 3] = 255;
+            }
+        }
+    }
+
+    // Trim to actual image dimensions at 1/8 scale
+    let real_w = w.div_ceil(8).min(out_w);
+    let real_h = h.div_ceil(8).min(out_h);
+    if real_w < out_w || real_h < out_h {
+        let mut trimmed = vec![0u8; real_w * real_h * 4];
+        for y in 0..real_h {
+            let src_off = y * out_w * 4;
+            let dst_off = y * real_w * 4;
+            trimmed[dst_off..dst_off + real_w * 4]
+                .copy_from_slice(&rgba[src_off..src_off + real_w * 4]);
+        }
+        rgba = trimmed;
+    }
+    let (final_w, final_h) = (real_w, real_h);
+
+    let (rgba, final_w, final_h) = apply_orientation_rgba(rgba, final_w, final_h, orientation);
+    let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, final_w, final_h, max_side);
+    let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    Some((
+        DecodedImage::Static(color),
+        ImageMeta {
+            width: w,
+            height: h,
+            depth: zune_core::bit_depth::BitDepth::Eight,
         },
     ))
 }
