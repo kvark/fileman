@@ -97,6 +97,8 @@ struct ImageResult {
     key: String,
     image: image_decode::DecodedImage,
     meta: image_decode::ImageMeta,
+    /// When true, a higher-quality version is still being decoded.
+    refining: bool,
 }
 
 enum ImageResponse {
@@ -138,8 +140,14 @@ struct ImageCache {
     meta: HashMap<String, image_decode::ImageMeta>,
     failures: HashMap<String, String>,
     pending: HashSet<String>,
+    /// Keys where a fast preview is shown but full decode is still in progress,
+    /// mapped to when the current tier was first displayed.
+    refining: HashMap<String, std::time::Instant>,
     order: VecDeque<String>,
 }
+
+/// Minimum time a progressive preview tier is shown before being replaced.
+const MIN_REFINING_DISPLAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 fn touch_image(cache: &mut ImageCache, key: &str) {
     if let Some(pos) = cache.order.iter().position(|p| p == key) {
@@ -2149,6 +2157,7 @@ impl Runtime {
         self.image_cache.failures.clear();
         self.image_cache.order.clear();
         self.image_cache.pending.clear();
+        self.image_cache.refining.clear();
         self.highlight_cache.clear();
         self.highlight_pending.clear();
         if let Some(sync) = self.last_sync.take() {
@@ -2277,9 +2286,43 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let (edit_tx, edit_rx) = mpsc::channel::<core::EditLoadRequest>();
         let (edit_res_tx, edit_res_rx) = mpsc::channel::<core::EditLoadResult>();
 
+        // Full-decode thread: handles expensive tier-3 decodes so the
+        // fast preview thread stays responsive for tier 1/2.
+        let (full_decode_tx, full_decode_rx) = mpsc::channel::<(String, Vec<u8>)>();
+        let full_res_tx = image_res_tx.clone();
+        let full_proxy = self.proxy.clone();
+        thread::spawn(move || {
+            while let Ok((mut key, mut data)) = full_decode_rx.recv() {
+                // Drain stale: only decode the latest request
+                while let Ok((newer_key, newer_data)) = full_decode_rx.try_recv() {
+                    key = newer_key;
+                    data = newer_data;
+                }
+                if let Some((decoded, meta)) =
+                    image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)
+                {
+                    let refining = false;
+                    let _ = full_res_tx.send(ImageResponse::Ok(ImageResult {
+                        key,
+                        image: decoded,
+                        meta,
+                        refining,
+                    }));
+                }
+                let _ = full_proxy.send_event(UserEvent::Wake);
+            }
+        });
+
+        // Fast preview thread: reads files, sends tier 1/2 instantly,
+        // then forwards to the full-decode thread for tier 3.
         let proxy = self.proxy.clone();
         thread::spawn(move || {
-            while let Ok(req) = image_req_rx.recv() {
+            while let Ok(mut req) = image_req_rx.recv() {
+                // Skip stale requests
+                while let Ok(newer) = image_req_rx.try_recv() {
+                    req = newer;
+                }
+
                 let raw_bytes: Option<Vec<u8>> = match req.source {
                     ImageSource::Fs(ref path) => std::fs::read(path).ok(),
                     ImageSource::Container {
@@ -2303,8 +2346,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     continue;
                 };
 
-                // For animated GIFs: send the first frame immediately, then
-                // decode all frames and send the full animation as a follow-up.
+                // For animated GIFs: send the first frame immediately,
+                // forward full decode to the dedicated thread.
                 if image_decode::is_gif(&data) {
                     if let Some((first, meta)) =
                         image_decode::decode_gif_first_frame(&data, MAX_TEXTURE_SIDE)
@@ -2313,24 +2356,49 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             key: req.key.clone(),
                             image: image_decode::DecodedImage::Static(first),
                             meta,
+                            refining: true,
                         }));
                         let _ = proxy.send_event(UserEvent::Wake);
                     }
-                    // Now decode all frames (may take a while for large GIFs)
-                    if let Some((decoded, meta)) =
-                        image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)
-                        && matches!(decoded, image_decode::DecodedImage::Animated(_))
-                    {
-                        let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
-                            key: req.key,
-                            image: decoded,
-                            meta,
-                        }));
-                    }
-                    let _ = proxy.send_event(UserEvent::Wake);
+                    let _ = full_decode_tx.send((req.key, data));
                     continue;
                 }
 
+                // For JPEGs: three-tier progressive loading:
+                //   1. EXIF thumbnail (instant, ~160×120)
+                //   2. DC-only 1/8-scale (fast, parses entropy stream)
+                //   3. Full decode (forwarded to dedicated thread)
+                if image_decode::is_jpeg(&data) {
+                    // Tier 1: EXIF thumbnail — near-instant
+                    if let Some((thumb, thumb_meta)) =
+                        image_decode::decode_jpeg_exif_thumbnail(&data, MAX_TEXTURE_SIDE)
+                    {
+                        let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                            key: req.key.clone(),
+                            image: thumb,
+                            meta: thumb_meta,
+                            refining: true,
+                        }));
+                        let _ = proxy.send_event(UserEvent::Wake);
+                    }
+                    // Tier 2: DC-only 1/8 scale — good quality preview
+                    if let Some((dc, dc_meta)) =
+                        image_decode::decode_jpeg_dc_preview(&data, MAX_TEXTURE_SIDE)
+                    {
+                        let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                            key: req.key.clone(),
+                            image: dc,
+                            meta: dc_meta,
+                            refining: true,
+                        }));
+                        let _ = proxy.send_event(UserEvent::Wake);
+                    }
+                    // Tier 3: forward to full-decode thread
+                    let _ = full_decode_tx.send((req.key, data));
+                    continue;
+                }
+
+                // Other formats: decode directly (typically fast)
                 if let Some((decoded, meta)) =
                     image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)
                 {
@@ -2338,6 +2406,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         key: req.key,
                         image: decoded,
                         meta,
+                        refining: false,
                     }));
                 } else {
                     let _ = image_res_tx.send(ImageResponse::Err {
@@ -2519,6 +2588,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             meta: HashMap::new(),
             failures: HashMap::new(),
             pending: HashSet::new(),
+            refining: HashMap::new(),
             order: VecDeque::new(),
         };
         let highlight_cache = HashMap::new();
@@ -2621,8 +2691,19 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     input::handle_keyboard(ctx, &input, &mut runtime.app, &mut runtime.ui_cache);
                     runtime.ui_cache.update_scroll_mode(&runtime.app);
 
+                    // Defer results for keys whose current refining preview
+                    // hasn't been shown long enough yet.
+                    let now = std::time::Instant::now();
                     for decoded in decoded_images.drain(..) {
                         match decoded {
+                            ImageResponse::Ok(ref inner)
+                                if runtime.image_cache.refining.get(&inner.key).is_some_and(
+                                    |t| now.duration_since(*t) < MIN_REFINING_DISPLAY,
+                                ) =>
+                            {
+                                runtime.image_pending.push_back(decoded);
+                                continue;
+                            }
                             ImageResponse::Ok(decoded) => {
                                 let first_frame = match decoded.image {
                                     image_decode::DecodedImage::Static(image) => {
@@ -2665,6 +2746,19 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                     .insert(decoded.key.clone(), decoded.meta);
                                 runtime.image_cache.pending.remove(&decoded.key);
                                 runtime.image_cache.failures.remove(&decoded.key);
+                                if decoded.refining {
+                                    runtime
+                                        .image_cache
+                                        .refining
+                                        .entry(decoded.key.clone())
+                                        .or_insert(now);
+                                } else {
+                                    runtime.image_cache.refining.remove(&decoded.key);
+                                }
+                                // Ensure deferred results get processed soon
+                                if !runtime.image_pending.is_empty() {
+                                    ctx.request_repaint_after(MIN_REFINING_DISPLAY);
+                                }
                                 while runtime.image_cache.order.len() > MAX_IMAGE_TEXTURES {
                                     if let Some(old) = runtime.image_cache.order.pop_front()
                                         && old != decoded.key
@@ -2673,6 +2767,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                         runtime.image_cache.meta.remove(&old);
                                         runtime.image_cache.failures.remove(&old);
                                         runtime.image_cache.animations.remove(&old);
+                                        runtime.image_cache.refining.remove(&old);
                                     }
                                 }
                             }

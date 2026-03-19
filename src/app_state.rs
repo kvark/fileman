@@ -179,6 +179,10 @@ pub struct PreviewState {
     pub bytes_per_row: usize,
     pub bytes_per_row_auto: bool,
     pub loading_since: Option<Instant>,
+    /// Image zoom: 0.0 = fit-to-panel, >0 = percentage (1.0 = 100%).
+    pub image_zoom: f32,
+    /// Image pan offset (x, y) in pixels, used when zoomed image exceeds panel.
+    pub image_pan: [f32; 2],
 }
 
 pub struct EditState {
@@ -960,6 +964,8 @@ impl AppState {
                 bytes_per_row: 16,
                 bytes_per_row_auto: true,
                 loading_since: Some(Instant::now()),
+                image_zoom: 0.0,
+                image_pan: [0.0, 0.0],
             };
             panel.mode = PanelMode::Preview(preview);
         }

@@ -20,6 +20,23 @@ pub fn is_gif(bytes: &[u8]) -> bool {
     bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
 }
 
+pub fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8
+}
+
+/// Extract the EXIF thumbnail — near-instant, ~160×120.
+pub fn decode_jpeg_exif_thumbnail(
+    bytes: &[u8],
+    max_side: u32,
+) -> Option<(DecodedImage, ImageMeta)> {
+    extract_exif_thumbnail(bytes, max_side)
+}
+
+/// DC-only 1/8-scale decode — fast but must parse the entropy stream.
+pub fn decode_jpeg_dc_preview(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
+    decode_jpeg_dc_only(bytes, max_side)
+}
+
 pub fn decode_gif_first_frame(
     bytes: &[u8],
     max_side: u32,
@@ -72,15 +89,6 @@ pub fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
     // Try GIF first (before zune, which only decodes the first frame)
     if is_gif(bytes) {
         return decode_gif_bytes(bytes, max_side);
-    }
-
-    // Try JPEG fast preview path (EXIF thumbnail or DC-only 1/8-scale decode)
-    if bytes.len() >= 3
-        && bytes[0] == 0xFF
-        && bytes[1] == 0xD8
-        && let Some(result) = decode_jpeg_preview(bytes, max_side)
-    {
-        return Some(result);
     }
 
     let options = zune_core::options::DecoderOptions::new_fast();
@@ -692,26 +700,13 @@ fn decode_bmp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
 // JPEG preview fast-path: EXIF thumbnail extraction + DC-only 1/8 decode
 // ---------------------------------------------------------------------------
 
-/// Try to produce a reduced-resolution JPEG preview without decoding the full
-/// image.  Tries two strategies in order:
-///   1. Extract the EXIF thumbnail (tiny embedded JPEG, ~160×120)
-///   2. DC-only decode: one pixel per 8×8 block → 1/8 scale
-///
-/// Returns `None` if neither strategy works (caller falls back to full decode).
-fn decode_jpeg_preview(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
-    // Tier 1: try EXIF thumbnail
-    if let Some(result) = extract_exif_thumbnail(bytes, max_side) {
-        return Some(result);
-    }
-    // Tier 2: DC-only 1/8-scale decode (baseline JPEG only)
-    decode_jpeg_dc_only(bytes, max_side)
-}
-
 /// Extract and decode the EXIF thumbnail JPEG if present and large enough.
 fn extract_exif_thumbnail(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
     let cursor = io::Cursor::new(bytes);
     let mut buf_reader = io::BufReader::new(cursor);
-    let exif = exif::Reader::new().read_from_container(&mut buf_reader).ok()?;
+    let exif = exif::Reader::new()
+        .read_from_container(&mut buf_reader)
+        .ok()?;
     let orientation = exif
         .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|f| match f.value {
@@ -719,6 +714,18 @@ fn extract_exif_thumbnail(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
             _ => None,
         })
         .unwrap_or(1);
+    // Read original image dimensions from EXIF so the preview meta is accurate
+    let orig_width = exif
+        .get_field(exif::Tag::PixelXDimension, exif::In::PRIMARY)
+        .or_else(|| exif.get_field(exif::Tag::ImageWidth, exif::In::PRIMARY))
+        .and_then(|f| f.value.get_uint(0))
+        .map(|v| v as usize);
+    let orig_height = exif
+        .get_field(exif::Tag::PixelYDimension, exif::In::PRIMARY)
+        .or_else(|| exif.get_field(exif::Tag::ImageLength, exif::In::PRIMARY))
+        .and_then(|f| f.value.get_uint(0))
+        .map(|v| v as usize);
+
     let offset = exif
         .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
         .value
@@ -754,11 +761,22 @@ fn extract_exif_thumbnail(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
     let (rgba, width, height) = apply_orientation_rgba(rgba, width, height, orientation);
     let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
     let color = egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], &out_rgba);
+    // Use original image dimensions if available, accounting for orientation swap
+    let (meta_w, meta_h) = match (orig_width, orig_height) {
+        (Some(w), Some(h)) => {
+            if (5..=8).contains(&orientation) {
+                (h, w)
+            } else {
+                (w, h)
+            }
+        }
+        _ => (width, height),
+    };
     Some((
         DecodedImage::Static(color),
         ImageMeta {
-            width,
-            height,
+            width: meta_w,
+            height: meta_h,
             depth,
         },
     ))
@@ -826,6 +844,9 @@ struct BitReader<'a> {
     pos: usize,
     bits: u32,
     nbits: u8,
+    /// Set when `read_byte` encounters a marker (0xFF + non-zero).
+    /// Prevents subsequent `fill` calls from reading past the marker.
+    hit_marker: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -835,12 +856,13 @@ impl<'a> BitReader<'a> {
             pos: start,
             bits: 0,
             nbits: 0,
+            hit_marker: false,
         }
     }
 
     /// Read a single byte from the JPEG entropy stream, handling FF 00 stuffing.
     fn read_byte(&mut self) -> Option<u8> {
-        if self.pos >= self.data.len() {
+        if self.hit_marker || self.pos >= self.data.len() {
             return None;
         }
         let b = self.data[self.pos];
@@ -850,11 +872,34 @@ impl<'a> BitReader<'a> {
             if self.pos < self.data.len() && self.data[self.pos] == 0x00 {
                 self.pos += 1;
             } else {
-                // Marker encountered — signal end
+                // Marker encountered — stop reading; pos is at the marker type byte
+                self.hit_marker = true;
                 return None;
             }
         }
         Some(b)
+    }
+
+    /// Skip past a restart marker (FF Dn) and reset the bit buffer.
+    fn skip_restart_marker(&mut self) {
+        self.nbits = 0;
+        self.bits = 0;
+        if self.hit_marker {
+            // pos is at the marker type byte; skip it
+            if self.pos < self.data.len() && (self.data[self.pos] & 0xF8) == 0xD0 {
+                self.pos += 1;
+            }
+            self.hit_marker = false;
+        } else {
+            // Scan forward for the restart marker
+            while self.pos + 1 < self.data.len() {
+                if self.data[self.pos] == 0xFF && (self.data[self.pos + 1] & 0xF8) == 0xD0 {
+                    self.pos += 2;
+                    break;
+                }
+                self.pos += 1;
+            }
+        }
     }
 
     fn fill(&mut self) {
@@ -1008,8 +1053,10 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                             return None;
                         }
                         for i in 0..64 {
-                            qt_tables[table_id][i] =
-                                i32::from(u16::from_be_bytes([bytes[p + i * 2], bytes[p + i * 2 + 1]]));
+                            qt_tables[table_id][i] = i32::from(u16::from_be_bytes([
+                                bytes[p + i * 2],
+                                bytes[p + i * 2 + 1],
+                            ]));
                         }
                         p += 128;
                     }
@@ -1161,21 +1208,11 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
     for mcu_y in 0..mcu_h {
         for mcu_x in 0..mcu_w {
             // Handle restart markers
-            if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as u32) {
-                // Align to byte boundary
-                reader.nbits = 0;
-                reader.bits = 0;
-                // Skip RST marker (FF Dn)
-                while reader.pos < reader.data.len() {
-                    if reader.data[reader.pos] == 0xFF
-                        && reader.pos + 1 < reader.data.len()
-                        && (reader.data[reader.pos + 1] & 0xF8) == 0xD0
-                    {
-                        reader.pos += 2;
-                        break;
-                    }
-                    reader.pos += 1;
-                }
+            if restart_interval > 0
+                && mcu_count > 0
+                && mcu_count.is_multiple_of(restart_interval as u32)
+            {
+                reader.skip_restart_marker();
                 dc_pred = [0i32; 4];
             }
 
@@ -1278,8 +1315,8 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                 let cr = dc_planes[2].get(cri).copied().unwrap_or(0.0) / 8.0 + 128.0;
 
                 let r = (yv + 1.402 * (cr - 128.0)).clamp(0.0, 255.0) as u8;
-                let g = (yv - 0.344136 * (cb - 128.0) - 0.714136 * (cr - 128.0))
-                    .clamp(0.0, 255.0) as u8;
+                let g = (yv - 0.344136 * (cb - 128.0) - 0.714136 * (cr - 128.0)).clamp(0.0, 255.0)
+                    as u8;
                 let b = (yv + 1.772 * (cb - 128.0)).clamp(0.0, 255.0) as u8;
                 rgba[idx] = r;
                 rgba[idx + 1] = g;
