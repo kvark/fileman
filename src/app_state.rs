@@ -847,7 +847,12 @@ impl AppState {
                     let ext = path
                         .extension()
                         .and_then(|s| s.to_str())
-                        .map(|s| s.to_string());
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            path.file_name()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_ascii_lowercase())
+                        });
                     (path.clone(), ext)
                 }
                 _ => return,
@@ -918,7 +923,15 @@ impl AppState {
             let ext = std::path::Path::new(&entry.name)
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_string());
+                .map(|ext| ext.to_string())
+                .or_else(|| {
+                    // For extensionless files (Makefile, Dockerfile, etc.),
+                    // pass the lowercased filename so syntax can match on it.
+                    std::path::Path::new(&entry.name)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                });
             let key = match entry.location.clone() {
                 EntryLocation::Fs(path) => path.to_string_lossy().into_owned(),
                 EntryLocation::Container {
