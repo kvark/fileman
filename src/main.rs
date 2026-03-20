@@ -282,6 +282,12 @@ fn highlight_text_job(
     if ext.as_deref() == Some("ron") {
         return fileman::syntax::ron::highlight_ron_job(text, theme_kind);
     }
+    if ext.as_deref() == Some("csv") {
+        return fileman::syntax::csv::highlight_csv_job(text, theme_kind, b',');
+    }
+    if ext.as_deref() == Some("tsv") {
+        return fileman::syntax::csv::highlight_csv_job(text, theme_kind, b'\t');
+    }
     let by_name_ci = |name: &str| {
         let needle = name.to_ascii_lowercase();
         SYNTAX_SET
@@ -297,12 +303,23 @@ fn highlight_text_job(
                 "toml" => by_name_ci("toml"),
                 "yml" | "yaml" => by_name_ci("yaml"),
                 "rs" => SYNTAX_SET.find_syntax_by_name("Rust"),
-                "md" => SYNTAX_SET.find_syntax_by_name("Markdown"),
-                "json" | "gltf" => SYNTAX_SET.find_syntax_by_name("JSON"),
-                "js" => SYNTAX_SET.find_syntax_by_name("JavaScript"),
-                "ts" => SYNTAX_SET.find_syntax_by_name("TypeScript"),
+                "md" | "mdown" | "markdown" => SYNTAX_SET.find_syntax_by_name("Markdown"),
+                "json" | "gltf" | "geojson" | "jsonl" | "webmanifest"
+                    => SYNTAX_SET.find_syntax_by_name("JSON"),
+                "js" | "mjs" | "cjs" | "jsx" => SYNTAX_SET.find_syntax_by_name("JavaScript"),
+                "ts" | "mts" | "cts" | "tsx" => SYNTAX_SET.find_syntax_by_name("TypeScript"),
                 "css" => SYNTAX_SET.find_syntax_by_name("CSS"),
-                "html" => SYNTAX_SET.find_syntax_by_name("HTML"),
+                "html" | "htm" | "xhtml" => SYNTAX_SET.find_syntax_by_name("HTML"),
+                "svg" | "plist" | "xsl" | "xslt" => SYNTAX_SET.find_syntax_by_name("XML"),
+                "glsl" | "vert" | "frag" | "hlsl" | "metal" | "wgsl"
+                    => SYNTAX_SET.find_syntax_by_name("C"),
+                "cmake" => SYNTAX_SET.find_syntax_by_name("Makefile"),
+                // Extensionless filenames (lowercased by caller)
+                "makefile" | "gnumakefile" => SYNTAX_SET.find_syntax_by_name("Makefile"),
+                "dockerfile" => by_name_ci("bash"),
+                "vagrantfile" | "rakefile" | "gemfile" | "guardfile" | "fastfile"
+                    => SYNTAX_SET.find_syntax_by_name("Ruby"),
+                "cmakelists.txt" => SYNTAX_SET.find_syntax_by_name("Makefile"),
                 _ => None,
             })
         })
