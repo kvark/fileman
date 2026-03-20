@@ -1570,6 +1570,28 @@ fn load_container_directory_async(
                         return;
                     }
                 };
+                // Pre-scan all entry names to detect root (cheap — central
+                // directory is already parsed, no I/O needed).
+                for raw_name in zip.file_names() {
+                    let name = core::normalize_archive_path(Path::new(raw_name));
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let is_dir = raw_name.ends_with('/');
+                    detect_root_from_entry(
+                        &name,
+                        is_dir,
+                        &mut root_candidate,
+                        &mut seen_root_file,
+                        &mut seen_other_root,
+                    );
+                    if seen_root_file || seen_other_root {
+                        break;
+                    }
+                }
+                decided = true;
+                implicit_root = decide_root(&root_candidate, seen_root_file, seen_other_root);
+
                 for i in 0..zip.len() {
                     let entry = match zip.by_index(i) {
                         Ok(entry) => entry,
@@ -1586,27 +1608,9 @@ fn load_container_directory_async(
                         continue;
                     }
 
-                    if !decided {
-                        buffered.push((name.clone(), entry_is_dir, entry_size));
-                        detect_root_from_entry(
-                            &name,
-                            entry_is_dir,
-                            &mut root_candidate,
-                            &mut seen_root_file,
-                            &mut seen_other_root,
-                        );
-                        if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
-                            decided = true;
-                            implicit_root =
-                                decide_root(&root_candidate, seen_root_file, seen_other_root);
-                            batch_buf.append(&mut buffered);
-                            flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
-                        }
-                    } else {
-                        batch_buf.push((name, entry_is_dir, entry_size));
-                        if batch_buf.len() >= BATCH {
-                            flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
-                        }
+                    batch_buf.push((name, entry_is_dir, entry_size));
+                    if batch_buf.len() >= BATCH {
+                        flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
                     }
                 }
             } else {
