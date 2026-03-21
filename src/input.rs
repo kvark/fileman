@@ -260,8 +260,21 @@ pub(crate) fn handle_keyboard(
     cache: &mut UiCache,
 ) {
     let io_tx = app.io_tx.clone();
+    // Ctrl+letter alternates for F-keys (friendlier on laptops without F-key row)
+    let ctrl_h = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::H));
+    let ctrl_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P));
+    let ctrl_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E));
+    let ctrl_n = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N));
+    let ctrl_c = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+    let ctrl_a = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A));
+    let ctrl_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
+    let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::D));
+    let ctrl_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G));
+    let ctrl_x = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::X));
+    let f2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2));
+
     let f1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1));
-    if f1 {
+    if f1 || ctrl_h {
         app.toggle_help();
         ctx.request_repaint();
         return;
@@ -593,7 +606,7 @@ pub(crate) fn handle_keyboard(
         open_search(app, core::SearchMode::Content);
     }
     let alt_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F7));
-    if alt_f7 {
+    if alt_f7 || ctrl_g {
         open_search(app, core::SearchMode::Name);
     }
     if input.key_pressed(egui::Key::Enter) {
@@ -746,7 +759,7 @@ pub(crate) fn handle_keyboard(
             app.select_entry(browser.entries.len() - 1, window_rows);
         }
     }
-    if input.key_pressed(egui::Key::F3) {
+    if input.key_pressed(egui::Key::F3) || ctrl_p {
         app.toggle_preview();
     }
     if input.key_pressed(egui::Key::Escape) {
@@ -760,38 +773,38 @@ pub(crate) fn handle_keyboard(
         .preview_panel_side()
         .is_some_and(|side| side != app.active_panel);
     let alt_f5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F5));
-    if alt_f5 && !other_panel_preview {
+    if (alt_f5 || ctrl_a) && !other_panel_preview {
         app.prepare_pack_selected();
         ctx.request_repaint();
     }
-    if input.key_pressed(egui::Key::F5) && !other_panel_preview {
+    if (input.key_pressed(egui::Key::F5) || ctrl_c) && !other_panel_preview {
         app.prepare_copy_selected();
         ctx.request_repaint();
     }
     // Modified F-key variants must be consumed before bare variants,
     // because egui's consume_key(NONE, ...) matches regardless of modifiers.
     let shift_f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4));
-    if shift_f4 {
+    if shift_f4 || ctrl_n {
         app.start_inline_new_file();
         ctx.request_repaint();
     }
     let f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F4));
-    if f4 {
+    if f4 || ctrl_e {
         app.prepare_edit_selected();
         ctx.request_repaint();
     }
     let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
-    if shift_f6 {
+    if shift_f6 || f2 {
         app.prepare_rename_selected();
         ctx.request_repaint();
     }
     let f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F6));
-    if f6 && !other_panel_preview {
+    if (f6 || ctrl_m) && !other_panel_preview {
         app.prepare_move_selected();
         ctx.request_repaint();
     }
     let f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F7));
-    if f7 {
+    if f7 || ctrl_d {
         app.start_inline_new_dir();
         ctx.request_repaint();
     }
@@ -803,7 +816,7 @@ pub(crate) fn handle_keyboard(
         app.open_theme_picker();
         ctx.request_repaint();
     }
-    if input.key_pressed(egui::Key::F8) {
+    if input.key_pressed(egui::Key::F8) || ctrl_x {
         app.prepare_delete_selected();
         ctx.request_repaint();
     }

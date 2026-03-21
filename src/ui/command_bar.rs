@@ -12,6 +12,8 @@ pub fn draw_command_bar(
     let other_panel_preview = preview_side
         .as_ref()
         .is_some_and(|side| *side != app.active_panel);
+    // On macOS, show Ctrl+letter combos instead of F-keys (laptops lack a real F-key row).
+    let use_ctrl = cfg!(target_os = "macos");
     egui::TopBottomPanel::bottom("command_bar")
         .exact_height(30.0)
         .show(ctx, |ui| {
@@ -21,7 +23,12 @@ pub fn draw_command_bar(
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         draw_refresh_indicator(ui, app, colors);
-                        draw_key_cap(ui, "F1", "Help", colors);
+                        macro_rules! k {
+                            ($fkey:expr, $ctrl:expr) => {
+                                if use_ctrl { $ctrl } else { $fkey }
+                            };
+                        }
+                        draw_key_cap(ui, k!("F1", "^H"), "Help", colors);
                         let (mut f3, f4, mut f5, mut f6, f7, f8) = if modifiers.alt {
                             ("", "", "Pack", "Unpack", "Search", "Command")
                         } else if modifiers.shift {
@@ -43,12 +50,28 @@ pub fn draw_command_bar(
                                 f5 = "";
                             }
                         }
-                        draw_key_cap(ui, "F3", f3, colors);
-                        draw_key_cap(ui, "F4", f4, colors);
-                        draw_key_cap(ui, "F5", f5, colors);
-                        draw_key_cap(ui, "F6", f6, colors);
-                        draw_key_cap(ui, "F7", f7, colors);
-                        draw_key_cap(ui, "F8", f8, colors);
+                        draw_key_cap(ui, k!("F3", "^P"), f3, colors);
+                        if modifiers.shift {
+                            draw_key_cap(ui, k!("F4", "^N"), f4, colors);
+                        } else {
+                            draw_key_cap(ui, k!("F4", "^E"), f4, colors);
+                        }
+                        if modifiers.alt {
+                            draw_key_cap(ui, k!("F5", "^A"), f5, colors);
+                        } else {
+                            draw_key_cap(ui, k!("F5", "^C"), f5, colors);
+                        }
+                        if modifiers.shift {
+                            draw_key_cap(ui, k!("F6", "F2"), f6, colors);
+                        } else {
+                            draw_key_cap(ui, k!("F6", "^M"), f6, colors);
+                        }
+                        if modifiers.alt {
+                            draw_key_cap(ui, k!("F7", "^G"), f7, colors);
+                        } else {
+                            draw_key_cap(ui, k!("F7", "^D"), f7, colors);
+                        }
+                        draw_key_cap(ui, k!("F8", "^X"), f8, colors);
                     });
                 });
         });
