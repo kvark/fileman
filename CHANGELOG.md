@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 (TBD)
+
+### Features
+- New syntax: Makefile, Dockerfile, CSV, SVG
+
+### Fixes
+- Fix archive navigation
+
 ## 0.2.0 (19 Mar 2026)
 
 ### Features

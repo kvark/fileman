@@ -1,0 +1,38 @@
+(
+  root: "tests/data",
+  keys: [
+    (key: "Wait"),
+    // Navigate to test_archive.zip
+    (key: "End"),
+    (key: "Enter"),
+    (key: "Wait"),
+    (key: "Wait"),
+    (key: "Wait"),
+    // Navigate to Textures
+    (key: "Down"),
+    (key: "Down"),
+    (key: "Enter"),
+    (key: "Wait"),
+    (key: "Wait"),
+    // Navigate into Brick
+    (key: "Down"),
+    (key: "Enter"),
+    (key: "Wait"),
+    (key: "Wait"),
+    // Inside Textures/Brick. Now go back up via ".."
+    (key: "Home"),
+    (key: "Enter"),
+    (key: "Wait"),
+    (key: "Wait"),
+    // Should be back in Textures with Brick selected
+  ],
+  asserts: (
+    left_panel: Some((
+      mode: Contains,
+      entries: ["..", "Brick", "Metal"],
+      selected: Some("Brick"),
+      browser_mode: Some("Container"),
+      panel_mode: Some("Browser"),
+    )),
+  ),
+)
