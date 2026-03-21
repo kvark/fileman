@@ -1,0 +1,35 @@
+(
+  root: "tests/data",
+  keys: [
+    (key: "Wait"),
+    // Entries: .., basic, test_archive.zip
+    // Navigate to test_archive.zip (last entry)
+    (key: "End"),
+    (key: "Enter"),
+    (key: "Wait"),
+    (key: "Wait"),
+    (key: "Wait"),
+    // Inside zip: ..(0), Data(1), Textures(2), app.bin(3), readme.txt(4)
+    // Navigate to Textures
+    (key: "Down"),
+    (key: "Down"),
+    (key: "Enter"),
+    (key: "Wait"),
+    (key: "Wait"),
+    // Inside Textures: ..(0), Brick(1), Metal(2)
+    // Navigate into Brick
+    (key: "Down"),
+    (key: "Enter"),
+    (key: "Wait"),
+    (key: "Wait"),
+    // Inside Textures/Brick: ..(0), bricks.png(1), cobble.png(2)
+  ],
+  asserts: (
+    left_panel: Some((
+      mode: Contains,
+      entries: ["..", "bricks.png", "cobble.png"],
+      browser_mode: Some("Container"),
+      panel_mode: Some("Browser"),
+    )),
+  ),
+)
