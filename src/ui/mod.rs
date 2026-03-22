@@ -6,4 +6,5 @@ pub mod panel;
 pub mod preview;
 #[cfg(unix)]
 pub mod props_dialog;
+pub mod quick_jump;
 pub mod theme_picker;

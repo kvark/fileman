@@ -4,6 +4,8 @@
 
 ### Features
 - New syntax: Makefile, Dockerfile, CSV, SVG
+- Defaulting to Ctrl+? schema on Apple devices
+- Quick navigation menu with Ctrl+G
 
 ### Fixes
 - Fix archive navigation

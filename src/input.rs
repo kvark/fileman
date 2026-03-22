@@ -245,9 +245,65 @@ pub(crate) fn handle_keyboard(
         ctx.request_repaint();
         return;
     }
+    if app.error_message.is_some() {
+        if input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::Enter) {
+            app.error_message = None;
+            ctx.request_repaint();
+        }
+        return;
+    }
     if app.props_dialog.is_some() {
         if input.key_pressed(egui::Key::Escape) {
             app.props_dialog = None;
+            ctx.request_repaint();
+        }
+        return;
+    }
+    if app.quick_jump.is_some() {
+        if input.key_pressed(egui::Key::Escape) {
+            app.close_quick_jump();
+            ctx.request_repaint();
+        } else if input.key_pressed(egui::Key::ArrowDown) {
+            if let Some(ref mut qj) = app.quick_jump
+                && qj.selected + 1 < qj.filtered.len()
+            {
+                qj.selected += 1;
+            }
+            ctx.request_repaint();
+        } else if input.key_pressed(egui::Key::ArrowUp) {
+            if let Some(ref mut qj) = app.quick_jump {
+                qj.selected = qj.selected.saturating_sub(1);
+            }
+            ctx.request_repaint();
+        } else if input.key_pressed(egui::Key::Enter) {
+            let result = app.quick_jump.as_ref().and_then(|qj| {
+                if !qj.filtered.is_empty() {
+                    let entry = &qj.entries[qj.filtered[qj.selected]];
+                    Some(crate::ui::quick_jump::QuickJumpResult {
+                        path: entry.path.clone(),
+                        category: entry.category,
+                    })
+                } else if !qj.input.is_empty() {
+                    let expanded = if qj.input.starts_with("~/") || qj.input == "~" {
+                        std::env::var("HOME")
+                            .map(|h| qj.input.replacen('~', &h, 1))
+                            .unwrap_or_else(|_| qj.input.clone())
+                    } else {
+                        qj.input.clone()
+                    };
+                    Some(crate::ui::quick_jump::QuickJumpResult {
+                        path: std::path::PathBuf::from(expanded),
+                        category: app_state::QuickJumpCategory::Home,
+                    })
+                } else {
+                    None
+                }
+            });
+            let active = app.active_panel;
+            app.close_quick_jump();
+            if let Some(result) = result {
+                crate::navigate_quick_jump(app, result, active);
+            }
             ctx.request_repaint();
         }
         return;
@@ -270,6 +326,11 @@ pub(crate) fn handle_keyboard(
         return;
     }
     if handle_inline_rename(app, input) {
+        ctx.request_repaint();
+        return;
+    }
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G)) {
+        app.open_quick_jump();
         ctx.request_repaint();
         return;
     }

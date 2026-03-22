@@ -39,6 +39,7 @@ pub fn draw_help(
         ("Alt+F7", "Search"),
         ("Alt+Enter", "Properties"),
         ("Ctrl+R", "Refresh"),
+        ("Ctrl+G", "Quick jump"),
         ("F9", "Toggle theme"),
         ("F10", "Theme picker"),
         ("F1", "Help"),

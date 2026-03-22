@@ -50,6 +50,10 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                         .unwrap_or_else(|| "Edit".to_string());
                     ui.colored_label(color32(colors.preview_header_fg), format!("Edit — {title}"));
                 });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut edit.wrap, "Wrap");
+            });
             ui.add_space(4.0);
             if edit.loading {
                 ui.colored_label(color32(colors.row_fg_inactive), "Loading…");
@@ -92,44 +96,62 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                 }
             }
             let mut needs_highlight = false;
+            let editor_wrap = edit.wrap;
             let mut layouter = |ui: &egui::Ui, string: &dyn egui::TextBuffer, wrap_width: f32| {
+                let effective_wrap = if editor_wrap {
+                    wrap_width
+                } else {
+                    f32::INFINITY
+                };
                 if let Some(key) = key_with_hash.as_ref() {
                     let _wrap_changed = (edit.highlight_wrap_width - wrap_width).abs() > 0.5;
                     if let Some(cached) = highlight_cache.get(key) {
                         let mut job = cached.clone();
-                        job.wrap.max_width = wrap_width;
+                        job.wrap.max_width = effective_wrap;
+                        job.wrap.break_anywhere = editor_wrap;
                         return ui.fonts_mut(|f| f.layout_job(job));
                     }
                     needs_highlight = true;
                 }
-                ui.fonts_mut(|f| {
-                    f.layout_job(egui::text::LayoutJob::simple(
-                        string.as_str().to_string(),
-                        egui::TextStyle::Monospace.resolve(ui.style()),
-                        egui::Color32::LIGHT_GRAY,
-                        wrap_width,
-                    ))
-                })
+                let mut job = egui::text::LayoutJob::simple(
+                    string.as_str().to_string(),
+                    egui::TextStyle::Monospace.resolve(ui.style()),
+                    egui::Color32::LIGHT_GRAY,
+                    effective_wrap,
+                );
+                job.wrap.break_anywhere = editor_wrap;
+                ui.fonts_mut(|f| f.layout_job(job))
             };
             let footer_height = ui.text_style_height(&egui::TextStyle::Body).max(1.0) + 8.0;
             let editor_height = (ui.available_height() - footer_height).max(0.0);
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
             let desired_rows = (editor_height / row_height).floor().max(1.0) as usize;
             let mut edit_output: Option<egui::text_edit::TextEditOutput> = None;
-            egui::ScrollArea::vertical()
+            let scroll = if editor_wrap {
+                egui::ScrollArea::vertical()
+            } else {
+                egui::ScrollArea::both()
+            };
+            scroll
                 .id_salt("editor_scroll")
                 .auto_shrink([false, false])
                 .max_height(editor_height)
                 .show(ui, |ui| {
-                    let output = egui::TextEdit::multiline(&mut text)
+                    let mut te = egui::TextEdit::multiline(&mut text)
                         .font(egui::TextStyle::Monospace)
                         .layouter(&mut layouter)
-                        .code_editor()
                         .cursor_at_end(false)
                         .id_source("editor_text")
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(desired_rows)
-                        .show(ui);
+                        .desired_rows(desired_rows);
+                    if editor_wrap {
+                        te = te.desired_width(f32::INFINITY);
+                    } else {
+                        te = te.code_editor();
+                    }
+                    let output = te.show(ui);
+                    if editor_wrap {
+                        paint_newline_markers(ui, &output);
+                    }
                     edit_output = Some(output);
                 });
             let response = edit_output
@@ -192,4 +214,24 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                 );
             });
         });
+}
+
+fn paint_newline_markers(ui: &egui::Ui, output: &egui::text_edit::TextEditOutput) {
+    let galley = &output.galley;
+    let galley_pos = output.galley_pos;
+    let color = egui::Color32::from_white_alpha(40);
+    let font = egui::FontId::monospace(10.0);
+    for placed_row in &galley.rows {
+        if placed_row.row.ends_with_newline {
+            let row_rect = placed_row.rect();
+            let last_x = if let Some(last_glyph) = placed_row.row.glyphs.last() {
+                last_glyph.pos.x + last_glyph.size().x
+            } else {
+                row_rect.left()
+            };
+            let pos = galley_pos + egui::vec2(last_x + 2.0, row_rect.center().y);
+            ui.painter()
+                .text(pos, egui::Align2::LEFT_CENTER, "↵", font.clone(), color);
+        }
+    }
 }

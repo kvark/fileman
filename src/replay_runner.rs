@@ -388,6 +388,8 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         update_status: app_state::UpdateStatus::Disabled,
         update_rx: None,
         gpu_info: String::from("Test"),
+        quick_jump: None,
+        error_message: None,
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));

@@ -6,7 +6,7 @@ use zune_core;
 
 use crate::{
     HighlightRequest, ImageCache, ImageRequest, ImageSource, color32, hash_text, hexdump_job,
-    make_whitespace_visible, touch_image,
+    make_whitespace_visible, mark_line_endings, touch_image,
 };
 
 pub struct PreviewRender<'a> {
@@ -114,6 +114,8 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                 | Some(core::PreviewContent::TextChunk { text, .. }) => {
                                     let display_text = if preview.show_whitespace {
                                         make_whitespace_visible(text)
+                                    } else if preview.wrap {
+                                        mark_line_endings(text)
                                     } else {
                                         text.clone()
                                     };
