@@ -4,7 +4,11 @@ use syntect::util::LinesWithEndings;
 use crate::theme::ThemeKind;
 
 /// Highlight CSV (or TSV) by cycling column colors.
-pub fn highlight_csv_job(text: &str, theme_kind: ThemeKind, separator: u8) -> egui::text::LayoutJob {
+pub fn highlight_csv_job(
+    text: &str,
+    theme_kind: ThemeKind,
+    separator: u8,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let font_id = FontId::monospace(13.0);
     let colors: &[Color32] = match theme_kind {
@@ -101,7 +105,12 @@ pub fn highlight_csv_job(text: &str, theme_kind: ThemeKind, separator: u8) -> eg
 
             // Unquoted field content
             let start = i;
-            while i < bytes.len() && bytes[i] != separator && bytes[i] != b'"' && bytes[i] != b'\n' && bytes[i] != b'\r' {
+            while i < bytes.len()
+                && bytes[i] != separator
+                && bytes[i] != b'"'
+                && bytes[i] != b'\n'
+                && bytes[i] != b'\r'
+            {
                 i += 1;
             }
             let color = colors[col_idx % colors.len()];

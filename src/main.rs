@@ -304,21 +304,24 @@ fn highlight_text_job(
                 "yml" | "yaml" => by_name_ci("yaml"),
                 "rs" => SYNTAX_SET.find_syntax_by_name("Rust"),
                 "md" | "mdown" | "markdown" => SYNTAX_SET.find_syntax_by_name("Markdown"),
-                "json" | "gltf" | "geojson" | "jsonl" | "webmanifest"
-                    => SYNTAX_SET.find_syntax_by_name("JSON"),
+                "json" | "gltf" | "geojson" | "jsonl" | "webmanifest" => {
+                    SYNTAX_SET.find_syntax_by_name("JSON")
+                }
                 "js" | "mjs" | "cjs" | "jsx" => SYNTAX_SET.find_syntax_by_name("JavaScript"),
                 "ts" | "mts" | "cts" | "tsx" => SYNTAX_SET.find_syntax_by_name("TypeScript"),
                 "css" => SYNTAX_SET.find_syntax_by_name("CSS"),
                 "html" | "htm" | "xhtml" => SYNTAX_SET.find_syntax_by_name("HTML"),
                 "svg" | "plist" | "xsl" | "xslt" => SYNTAX_SET.find_syntax_by_name("XML"),
-                "glsl" | "vert" | "frag" | "hlsl" | "metal" | "wgsl"
-                    => SYNTAX_SET.find_syntax_by_name("C"),
+                "glsl" | "vert" | "frag" | "hlsl" | "metal" | "wgsl" => {
+                    SYNTAX_SET.find_syntax_by_name("C")
+                }
                 "cmake" => SYNTAX_SET.find_syntax_by_name("Makefile"),
                 // Extensionless filenames (lowercased by caller)
                 "makefile" | "gnumakefile" => SYNTAX_SET.find_syntax_by_name("Makefile"),
                 "dockerfile" => by_name_ci("bash"),
-                "vagrantfile" | "rakefile" | "gemfile" | "guardfile" | "fastfile"
-                    => SYNTAX_SET.find_syntax_by_name("Ruby"),
+                "vagrantfile" | "rakefile" | "gemfile" | "guardfile" | "fastfile" => {
+                    SYNTAX_SET.find_syntax_by_name("Ruby")
+                }
                 "cmakelists.txt" => SYNTAX_SET.find_syntax_by_name("Makefile"),
                 _ => None,
             })
@@ -962,6 +965,101 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
     app.poll_update_status();
 
     changed
+}
+
+fn draw_error_modal(ctx: &egui::Context, message: &str) {
+    let screen = ctx.available_rect();
+    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "error_overlay".into());
+    ctx.layer_painter(overlay_layer).rect_filled(
+        screen,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_black_alpha(160),
+    );
+    egui::Window::new("Error")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), message);
+            ui.add_space(8.0);
+            if ui
+                .add(egui::Button::new("OK").min_size(egui::vec2(80.0, 0.0)))
+                .clicked()
+            {
+                // Handled via input.rs — this is just for mouse users
+            }
+        });
+}
+
+fn navigate_quick_jump(
+    app: &mut app_state::AppState,
+    result: ui::quick_jump::QuickJumpResult,
+    target_panel: core::ActivePanel,
+) {
+    if result.category == app_state::QuickJumpCategory::Ssh {
+        // Extract hostname from the mount path (~/.cache/fileman/mounts/<host>)
+        let host = result
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if host.is_empty() {
+            return;
+        }
+        // Create mount point if needed
+        if let Err(e) = std::fs::create_dir_all(&result.path) {
+            app.error_message = Some(format!("Failed to create mount point: {e}"));
+            return;
+        }
+        // Check if already mounted
+        let already_mounted = std::fs::read_to_string("/proc/mounts")
+            .unwrap_or_default()
+            .lines()
+            .any(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .is_some_and(|mp| mp == result.path.to_string_lossy())
+            });
+
+        if !already_mounted {
+            let mount_path = result.path.to_string_lossy().to_string();
+
+            let output = std::process::Command::new("sshfs")
+                .arg(format!("{host}:"))
+                .arg(&mount_path)
+                .arg("-o")
+                .arg("reconnect,ServerAliveInterval=15")
+                .output();
+            match output {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let msg = stderr.trim();
+
+                    app.error_message = Some(if msg.is_empty() {
+                        format!("sshfs failed (exit {})", o.status)
+                    } else {
+                        format!("sshfs: {msg}")
+                    });
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    app.error_message =
+                        Some("sshfs is not installed. Install it to connect to SSH hosts.".into());
+                    return;
+                }
+                Err(e) => {
+                    app.error_message = Some(format!("Failed to run sshfs: {e}"));
+                    return;
+                }
+            }
+        }
+
+        load_fs_directory_async(app, result.path, target_panel, None);
+    } else if result.path.is_dir() {
+        load_fs_directory_async(app, result.path, target_panel, None);
+    }
 }
 
 fn load_fs_directory_async(
@@ -2144,6 +2242,10 @@ fn make_whitespace_visible(text: &str) -> String {
         .join("\n")
 }
 
+fn mark_line_endings(text: &str) -> String {
+    text.replace('\n', "↵\n")
+}
+
 struct Runtime {
     window: winit::window::Window,
     window_id: winit::window::WindowId,
@@ -2585,6 +2687,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let dev = context.device_information();
                 format!("{} ({})", dev.device_name, backend)
             },
+            quick_jump: None,
+            error_message: None,
         };
 
         app.theme
@@ -3006,6 +3110,16 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     if runtime.app.io_in_flight > 0 {
                         ui::modals::draw_progress_modal(ctx, &runtime.app);
                     }
+                    if runtime.app.quick_jump.is_some()
+                        && let Some(result) = ui::quick_jump::draw_quick_jump(ctx, &mut runtime.app)
+                    {
+                        let active = runtime.app.active_panel;
+                        runtime.app.close_quick_jump();
+                        navigate_quick_jump(&mut runtime.app, result, active);
+                    }
+                    if let Some(ref msg) = runtime.app.error_message.clone() {
+                        draw_error_modal(ctx, msg);
+                    }
                 });
                 runtime
                     .egui_state
@@ -3421,6 +3535,13 @@ fn draw_root_ui(render: UiRender<'_>) {
     }
     if app.io_in_flight > 0 {
         ui::modals::draw_progress_modal(ctx, app);
+    }
+    if app.quick_jump.is_some()
+        && let Some(result) = ui::quick_jump::draw_quick_jump(ctx, app)
+    {
+        let active = app.active_panel;
+        app.close_quick_jump();
+        navigate_quick_jump(app, result, active);
     }
 
     // Animate loading indicators at ~3fps

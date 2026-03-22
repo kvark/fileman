@@ -144,6 +144,27 @@ pub struct InlineRename {
     pub focus: bool,
 }
 
+pub struct QuickJumpEntry {
+    pub label: String,
+    pub path: path::PathBuf,
+    pub category: QuickJumpCategory,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QuickJumpCategory {
+    Home,
+    Mount,
+    Ssh,
+}
+
+pub struct QuickJumpState {
+    pub input: String,
+    pub entries: Vec<QuickJumpEntry>,
+    pub filtered: Vec<usize>,
+    pub selected: usize,
+    pub focus_input: bool,
+}
+
 pub struct ArchiveFullIndex {
     pub entries: Vec<(String, bool, Option<u64>)>,
     pub root: Option<String>,
@@ -198,6 +219,8 @@ pub struct EditState {
     pub highlight_wrap_width: f32,
     pub highlight_dirty_at: Option<Instant>,
     pub request_id: u64,
+    pub wrap: bool,
+    pub show_whitespace: bool,
 }
 
 pub struct HelpState {
@@ -299,6 +322,8 @@ pub struct AppState {
     pub update_status: UpdateStatus,
     pub update_rx: Option<mpsc::Receiver<UpdateStatus>>,
     pub gpu_info: String,
+    pub quick_jump: Option<QuickJumpState>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Clone)]
@@ -885,6 +910,8 @@ impl AppState {
                 highlight_wrap_width: 0.0,
                 highlight_dirty_at: None,
                 request_id,
+                wrap: true,
+                show_whitespace: false,
             };
             panel.mode = PanelMode::Edit(edit);
             match panel.mode {
@@ -1153,6 +1180,110 @@ impl AppState {
         self.pending_op = None;
         self.rename_input = None;
         self.rename_focus = false;
+    }
+
+    pub fn open_quick_jump(&mut self) {
+        let mut entries = Vec::new();
+
+        // Home directory
+        if let Ok(home) = std::env::var("HOME") {
+            entries.push(QuickJumpEntry {
+                label: format!("~ {}", home),
+                path: path::PathBuf::from(&home),
+                category: QuickJumpCategory::Home,
+            });
+        }
+
+        // Mount points from /proc/mounts
+        #[cfg(target_os = "linux")]
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            let skip_types = [
+                "proc",
+                "sysfs",
+                "devtmpfs",
+                "devpts",
+                "tmpfs",
+                "securityfs",
+                "cgroup",
+                "cgroup2",
+                "pstore",
+                "debugfs",
+                "hugetlbfs",
+                "mqueue",
+                "configfs",
+                "fusectl",
+                "tracefs",
+                "bpf",
+                "autofs",
+                "efivarfs",
+                "binfmt_misc",
+                "ramfs",
+                "nsfs",
+                "overlay",
+            ];
+            let skip_paths = ["/boot", "/efi", "/snap", "/run", "/sys", "/dev", "/proc"];
+            for line in mounts.lines() {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 3 {
+                    continue;
+                }
+                let mount_point = fields[1];
+                let fs_type = fields[2];
+                if skip_types.contains(&fs_type) {
+                    continue;
+                }
+                if skip_paths.iter().any(|p| mount_point.starts_with(p)) {
+                    continue;
+                }
+                let mp = path::PathBuf::from(mount_point);
+                if entries.iter().any(|e| e.path == mp) {
+                    continue;
+                }
+                entries.push(QuickJumpEntry {
+                    label: mount_point.to_string(),
+                    path: mp,
+                    category: QuickJumpCategory::Mount,
+                });
+            }
+        }
+
+        // SSH hosts from ~/.ssh/config
+        if let Ok(home) = std::env::var("HOME") {
+            let config_path = path::Path::new(&home).join(".ssh/config");
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("Host ") {
+                        for host in rest.split_whitespace() {
+                            if host.contains('*') || host.contains('?') {
+                                continue;
+                            }
+                            entries.push(QuickJumpEntry {
+                                label: format!("ssh: {}", host),
+                                path: path::PathBuf::from(format!(
+                                    "{}/.cache/fileman/mounts/{}",
+                                    home, host
+                                )),
+                                category: QuickJumpCategory::Ssh,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let filtered: Vec<usize> = (0..entries.len()).collect();
+        self.quick_jump = Some(QuickJumpState {
+            input: String::new(),
+            entries,
+            filtered,
+            selected: 0,
+            focus_input: true,
+        });
+    }
+
+    pub fn close_quick_jump(&mut self) {
+        self.quick_jump = None;
     }
 
     fn enqueue_io(&mut self, task: IOTask) {
