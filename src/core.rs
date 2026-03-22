@@ -21,6 +21,10 @@ pub enum EntryLocation {
         archive_path: path::PathBuf,
         inner_path: String, // no leading slash, '' means root
     },
+    Remote {
+        host: String,
+        path: String, // absolute path on remote, e.g. "/home/user"
+    },
 }
 
 impl EntryLocation {
@@ -36,6 +40,9 @@ impl EntryLocation {
                 .next()
                 .unwrap_or("<unknown>")
                 .to_string(),
+            EntryLocation::Remote { ref path, .. } => {
+                path.rsplit('/').next().unwrap_or("<unknown>").to_string()
+            }
         }
     }
 }
@@ -80,6 +87,10 @@ pub enum BrowserMode {
         query: String,
         mode: SearchMode,
         case: SearchCase,
+    },
+    Remote {
+        host: String,
+        path: String,
     },
 }
 
@@ -164,6 +175,36 @@ pub enum IOTask {
         archive_path: path::PathBuf,
         kind: crate::archive::ContainerKind,
     },
+    WriteRemoteFile {
+        host: String,
+        path: String,
+        contents: Vec<u8>,
+    },
+    CopyRemoteToLocal {
+        host: String,
+        remote_path: String,
+        dst_dir: path::PathBuf,
+        name: String,
+    },
+    CopyLocalToRemote {
+        src: path::PathBuf,
+        host: String,
+        remote_dir: String,
+    },
+    DeleteRemote {
+        host: String,
+        path: String,
+        is_dir: bool,
+    },
+    RenameRemote {
+        host: String,
+        src: String,
+        new_name: String,
+    },
+    MkdirRemote {
+        host: String,
+        path: String,
+    },
 }
 
 pub enum IOResult {
@@ -181,6 +222,7 @@ pub enum SortMode {
 pub struct EditLoadRequest {
     pub id: u64,
     pub path: path::PathBuf,
+    pub remote: Option<(String, String)>, // (host, remote_path)
 }
 
 pub struct EditLoadResult {
@@ -327,6 +369,7 @@ pub fn format_preview_info(kind: &str, location: &EntryLocation) -> String {
             let display = container_display_path(container_kind, archive_path, inner_path);
             format!("{kind}\n{display}")
         }
+        EntryLocation::Remote { ref host, ref path } => format!("{kind}\n{host}:{path}"),
     }
 }
 
