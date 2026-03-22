@@ -304,6 +304,10 @@ pub fn draw_panel(
                                     let header_color = color32(colors.header_fg);
                                     let mut job = egui::text::LayoutJob::default();
                                     if loading {
+                                        // Keep repainting so the spinner animates
+                                        ui.ctx().request_repaint_after(
+                                            std::time::Duration::from_millis(200),
+                                        );
                                         let t = ui.ctx().input(|i| i.time);
                                         let spinner =
                                             ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];

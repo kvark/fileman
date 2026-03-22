@@ -253,6 +253,7 @@ fn history_key(snapshot: &PanelSnapshot) -> String {
             cwd,
             root.as_deref().unwrap_or_default()
         ),
+        BrowserMode::Remote { ref host, ref path } => format!("remote:{host}:{path}"),
         BrowserMode::Search {
             ref root,
             ref query,
@@ -324,6 +325,16 @@ pub struct AppState {
     pub gpu_info: String,
     pub quick_jump: Option<QuickJumpState>,
     pub error_message: Option<String>,
+    /// Active SFTP sessions keyed by hostname — local reference for quick lookups.
+    pub sftp_sessions: HashMap<String, Arc<Mutex<crate::sftp::SftpSession>>>,
+    /// Shared SFTP sessions for worker threads (IO, preview).
+    pub sftp_sessions_shared: Arc<Mutex<HashMap<String, Arc<Mutex<crate::sftp::SftpSession>>>>>,
+    /// Hostname currently being connected via SFTP.
+    pub sftp_connecting: Option<String>,
+    /// Receives the result of an async SFTP connection.
+    pub sftp_connect_rx: Option<mpsc::Receiver<Result<crate::sftp::SftpSession, String>>>,
+    /// Pending navigation after SFTP connect completes.
+    pub sftp_pending_nav: Option<(String, String, crate::core::ActivePanel)>, // (host, path, panel)
 }
 
 #[derive(Clone)]
@@ -598,7 +609,7 @@ impl AppState {
                     Some((archive_path.clone(), cwd.clone(), kind)),
                     Some(selected_name),
                 ),
-                BrowserMode::Search { .. } => (None, None, None),
+                BrowserMode::Search { .. } | BrowserMode::Remote { .. } => (None, None, None),
             }
         };
         if let Some(selected_name) = selected_name_opt {
@@ -857,7 +868,7 @@ impl AppState {
     }
 
     pub fn prepare_edit_selected(&mut self) {
-        let (path, ext) = {
+        let (path, ext, remote) = {
             let panel = self.get_active_panel();
             let browser = panel.browser();
             if browser.entries.is_empty() {
@@ -878,7 +889,17 @@ impl AppState {
                                 .and_then(|s| s.to_str())
                                 .map(|s| s.to_ascii_lowercase())
                         });
-                    (path.clone(), ext)
+                    (path.clone(), ext, None)
+                }
+                EntryLocation::Remote { ref host, ref path } => {
+                    let remote_name = path.rsplit('/').next().unwrap_or("remote_file");
+                    let ext = std::path::Path::new(remote_name)
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| Some(remote_name.to_ascii_lowercase()));
+                    let synthetic = std::path::PathBuf::from(format!("/sftp/{host}{path}"));
+                    (synthetic, ext, Some((host.clone(), path.clone())))
                 }
                 _ => return,
             }
@@ -925,6 +946,7 @@ impl AppState {
                 .send(EditLoadRequest {
                     id: request_id,
                     path,
+                    remote,
                 })
                 .is_err()
                 && let Some(edit) = self.edit_panel_mut()
@@ -966,6 +988,7 @@ impl AppState {
                     archive_path,
                     inner_path,
                 } => container_display_path(kind, &archive_path, &inner_path),
+                EntryLocation::Remote { host, path } => format!("{host}:{path}"),
             };
             (entry.is_dir, entry.location.clone(), key, ext)
         };
@@ -1089,6 +1112,19 @@ impl AppState {
                         archive_path,
                         inner_path,
                     },
+                    max_bytes,
+                });
+            }
+            EntryLocation::Remote { host, path } => {
+                // No image preview for remote files (would need download first)
+                let max_bytes = if is_text_name(&path) {
+                    Some(64 * 1024)
+                } else {
+                    Some(8 * 1024)
+                };
+                let _ = self.preview_tx.send(PreviewRequest::Read {
+                    id: request_id,
+                    location: EntryLocation::Remote { host, path },
                     max_bytes,
                 });
             }
@@ -1247,29 +1283,13 @@ impl AppState {
             }
         }
 
-        // SSH hosts from ~/.ssh/config
-        if let Ok(home) = std::env::var("HOME") {
-            let config_path = path::Path::new(&home).join(".ssh/config");
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if let Some(rest) = trimmed.strip_prefix("Host ") {
-                        for host in rest.split_whitespace() {
-                            if host.contains('*') || host.contains('?') {
-                                continue;
-                            }
-                            entries.push(QuickJumpEntry {
-                                label: format!("ssh: {}", host),
-                                path: path::PathBuf::from(format!(
-                                    "{}/.cache/fileman/mounts/{}",
-                                    home, host
-                                )),
-                                category: QuickJumpCategory::Ssh,
-                            });
-                        }
-                    }
-                }
-            }
+        // SSH hosts from ~/.ssh/config (cross-platform, native SFTP)
+        for host in crate::sftp::discover_ssh_hosts() {
+            entries.push(QuickJumpEntry {
+                label: format!("ssh: {}", host),
+                path: path::PathBuf::from(&host),
+                category: QuickJumpCategory::Ssh,
+            });
         }
 
         let filtered: Vec<usize> = (0..entries.len()).collect();
@@ -1326,6 +1346,12 @@ impl AppState {
                                 display_name: item.src.display_name(),
                             },
                         },
+                        EntryLocation::Remote { ref host, ref path } => IOTask::CopyRemoteToLocal {
+                            host: host.clone(),
+                            remote_path: path.clone(),
+                            dst_dir: dst_dir.clone(),
+                            name: item.src.display_name(),
+                        },
                     };
                     self.enqueue_io(task);
                 }
@@ -1343,6 +1369,37 @@ impl AppState {
             }
             PendingOp::Delete { ref targets } => {
                 for target in targets {
+                    let target_str = target.to_string_lossy();
+                    if let Some(rest) = target_str.strip_prefix("/sftp/") {
+                        // Remote delete: parse host/path from synthetic path
+                        if let Some(slash) = rest.find('/') {
+                            let host = rest[..slash].to_string();
+                            let path = rest[slash..].to_string();
+                            let is_dir = target.extension().is_none()
+                                && std::path::Path::new(&path).extension().is_none();
+                            // Look up in entries for is_dir
+                            let is_dir = self
+                                .get_active_panel()
+                                .browser()
+                                .entries
+                                .iter()
+                                .find(|e| {
+                                    if let EntryLocation::Remote {
+                                        host: ref h,
+                                        path: ref p,
+                                    } = e.location
+                                    {
+                                        *h == host && *p == path
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .map(|e| e.is_dir)
+                                .unwrap_or(is_dir);
+                            self.enqueue_io(IOTask::DeleteRemote { host, path, is_dir });
+                            continue;
+                        }
+                    }
                     self.enqueue_io(IOTask::Delete {
                         target: target.clone(),
                     });
@@ -1459,7 +1516,7 @@ impl AppState {
             .iter()
             .filter_map(|&i| match browser.entries[i].location {
                 EntryLocation::Fs(ref path) => Some(path.clone()),
-                EntryLocation::Container { .. } => None,
+                EntryLocation::Container { .. } | EntryLocation::Remote { .. } => None,
             })
             .collect();
         if sources.is_empty() {
@@ -1474,10 +1531,14 @@ impl AppState {
             return None;
         }
         let browser = self.get_active_panel().browser();
+        // For remote entries, use the synthetic /sftp/host/path as target
         let targets: Vec<path::PathBuf> = indices
             .iter()
             .filter_map(|&i| match browser.entries[i].location {
                 EntryLocation::Fs(ref path) => Some(path.clone()),
+                EntryLocation::Remote { ref host, ref path } => {
+                    Some(path::PathBuf::from(format!("/sftp/{host}{path}")))
+                }
                 EntryLocation::Container { .. } => None,
             })
             .collect();
@@ -1498,7 +1559,7 @@ impl AppState {
             .iter()
             .filter_map(|&i| match browser.entries[i].location {
                 EntryLocation::Fs(ref path) => Some(path.clone()),
-                EntryLocation::Container { .. } => None,
+                EntryLocation::Container { .. } | EntryLocation::Remote { .. } => None,
             })
             .collect();
         if sources.is_empty() {

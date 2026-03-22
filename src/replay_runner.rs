@@ -268,8 +268,17 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         Some(root) => root,
         None => std::env::current_dir().expect("current_dir"),
     };
-    let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker();
-    let (preview_tx, preview_rx) = workers::start_preview_worker(None);
+    let sftp_sessions_shared: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                std::sync::Arc<std::sync::Mutex<fileman::sftp::SftpSession>>,
+            >,
+        >,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(sftp_sessions_shared.clone());
+    let (preview_tx, preview_rx) =
+        workers::start_preview_worker(None, sftp_sessions_shared.clone());
     let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker();
     let (search_tx, search_rx) = workers::start_search_worker();
     let (edit_tx, edit_rx) = mpsc::channel::<core::EditLoadRequest>();
@@ -390,6 +399,11 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         gpu_info: String::from("Test"),
         quick_jump: None,
         error_message: None,
+        sftp_sessions: std::collections::HashMap::new(),
+        sftp_sessions_shared: sftp_sessions_shared.clone(),
+        sftp_connecting: None,
+        sftp_connect_rx: None,
+        sftp_pending_nav: None,
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));
@@ -691,6 +705,7 @@ fn build_panel_dump(panel: &app_state::PanelState) -> PanelDump {
             }
             .to_string(),
         },
+        core::BrowserMode::Remote { .. } => BrowserModeDump::Fs,
     };
     let sort_mode = match browser.sort_mode {
         core::SortMode::Name => "Name",
@@ -711,6 +726,9 @@ fn build_panel_dump(panel: &app_state::PanelState) -> PanelDump {
                 core::EntryLocation::Container {
                     kind, inner_path, ..
                 } => format!("{}:{inner_path}", container_kind_str(*kind)),
+                core::EntryLocation::Remote { host, path } => {
+                    format!("{host}:{path}")
+                }
             };
             EntryDump {
                 name: e.name.clone(),
@@ -777,6 +795,7 @@ fn browser_mode_str(mode: &core::BrowserMode) -> &'static str {
         core::BrowserMode::Fs => "Fs",
         core::BrowserMode::Container { .. } => "Container",
         core::BrowserMode::Search { .. } => "Search",
+        core::BrowserMode::Remote { .. } => "Remote",
     }
 }
 

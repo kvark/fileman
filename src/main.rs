@@ -374,6 +374,9 @@ fn panel_path_display(panel: &app_state::PanelState) -> String {
     } = *browser;
     match mode {
         core::BrowserMode::Fs => browser.current_path.to_string_lossy().into_owned(),
+        core::BrowserMode::Remote { host, path } => {
+            format!("{host}:{path}")
+        }
         core::BrowserMode::Container {
             kind,
             archive_path,
@@ -645,7 +648,33 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
         }
         core::DirBatch::Error(message) => {
             let mut entries = Vec::new();
-            if let Some(parent) = browser.current_path.parent() {
+            if let core::BrowserMode::Remote { ref host, ref path } = browser.browser_mode {
+                // Produce a remote ".." entry pointing to parent remote dir
+                let parent_path = if path == "/" || path.is_empty() {
+                    "/".to_string()
+                } else {
+                    let trimmed = path.trim_end_matches('/');
+                    match trimmed.rfind('/') {
+                        Some(0) => "/".to_string(),
+                        Some(pos) => trimmed[..pos].to_string(),
+                        None => "/".to_string(),
+                    }
+                };
+                if path != "/" {
+                    entries.push(core::DirEntry {
+                        name: "..".to_string(),
+                        is_dir: true,
+                        is_symlink: false,
+                        link_target: None,
+                        location: core::EntryLocation::Remote {
+                            host: host.clone(),
+                            path: parent_path,
+                        },
+                        size: None,
+                        modified: None,
+                    });
+                }
+            } else if let Some(parent) = browser.current_path.parent() {
                 entries.push(core::DirEntry {
                     name: "..".to_string(),
                     is_dir: true,
@@ -849,6 +878,36 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         changed = true;
     }
 
+    // Poll SFTP connect result
+    if let Some(ref rx) = app.sftp_connect_rx
+        && let Ok(result) = rx.try_recv()
+    {
+        let _host = app.sftp_connecting.take().unwrap_or_default();
+        app.sftp_connect_rx = None;
+        match result {
+            Ok(session) => {
+                let host_key = session.host.clone();
+                let arc_session = Arc::new(std::sync::Mutex::new(session));
+                app.sftp_sessions
+                    .insert(host_key.clone(), arc_session.clone());
+                app.sftp_sessions_shared
+                    .lock()
+                    .unwrap()
+                    .insert(host_key.clone(), arc_session);
+                if let Some((nav_host, nav_path, nav_panel)) = app.sftp_pending_nav.take()
+                    && nav_host == host_key
+                {
+                    load_sftp_directory_async(app, &nav_host, &nav_path, nav_panel, None);
+                }
+            }
+            Err(msg) => {
+                app.sftp_pending_nav = None;
+                app.error_message = Some(msg);
+            }
+        }
+        changed = true;
+    }
+
     while let Ok(result) = app.edit_rx.try_recv() {
         if let Some(edit) = app.edit_panel_mut()
             && result.id == edit.request_id
@@ -967,6 +1026,26 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
     changed
 }
 
+fn draw_connecting_modal(ctx: &egui::Context, host: &str) {
+    let screen = ctx.available_rect();
+    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "connecting_overlay".into());
+    ctx.layer_painter(overlay_layer).rect_filled(
+        screen,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_black_alpha(160),
+    );
+    egui::Window::new("Connecting")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label(format!("Connecting to {host}..."));
+            });
+        });
+}
+
 fn draw_error_modal(ctx: &egui::Context, message: &str) {
     let screen = ctx.available_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "error_overlay".into());
@@ -998,68 +1077,110 @@ fn navigate_quick_jump(
     target_panel: core::ActivePanel,
 ) {
     if result.category == app_state::QuickJumpCategory::Ssh {
-        // Extract hostname from the mount path (~/.cache/fileman/mounts/<host>)
-        let host = result
-            .path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if host.is_empty() {
-            return;
-        }
-        // Create mount point if needed
-        if let Err(e) = std::fs::create_dir_all(&result.path) {
-            app.error_message = Some(format!("Failed to create mount point: {e}"));
-            return;
-        }
-        // Check if already mounted
-        let already_mounted = std::fs::read_to_string("/proc/mounts")
-            .unwrap_or_default()
-            .lines()
-            .any(|line| {
-                line.split_whitespace()
-                    .nth(1)
-                    .is_some_and(|mp| mp == result.path.to_string_lossy())
-            });
-
-        if !already_mounted {
-            let mount_path = result.path.to_string_lossy().to_string();
-
-            let output = std::process::Command::new("sshfs")
-                .arg(format!("{host}:"))
-                .arg(&mount_path)
-                .arg("-o")
-                .arg("reconnect,ServerAliveInterval=15")
-                .output();
-            match output {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    let msg = stderr.trim();
-
-                    app.error_message = Some(if msg.is_empty() {
-                        format!("sshfs failed (exit {})", o.status)
-                    } else {
-                        format!("sshfs: {msg}")
-                    });
-                    return;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    app.error_message =
-                        Some("sshfs is not installed. Install it to connect to SSH hosts.".into());
-                    return;
-                }
-                Err(e) => {
-                    app.error_message = Some(format!("Failed to run sshfs: {e}"));
-                    return;
-                }
-            }
-        }
-
-        load_fs_directory_async(app, result.path, target_panel, None);
-    } else if result.path.is_dir() {
+        let host = result.path.to_string_lossy().to_string();
+        navigate_sftp(app, &host, "/", target_panel);
+        return;
+    }
+    if result.path.is_dir() {
         load_fs_directory_async(app, result.path, target_panel, None);
     }
+}
+
+fn navigate_sftp(
+    app: &mut app_state::AppState,
+    host: &str,
+    remote_path: &str,
+    target_panel: core::ActivePanel,
+) {
+    if host.is_empty() {
+        return;
+    }
+    // Already connected — load directory directly
+    if app.sftp_sessions.contains_key(host) {
+        load_sftp_directory_async(app, host, remote_path, target_panel, None);
+        return;
+    }
+    // Spawn SFTP connection in a background thread
+    let host_owned = host.to_string();
+    let ssh_config = fileman::sftp::load_ssh_config();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wake = app.wake.clone();
+    std::thread::spawn(move || {
+        let result = fileman::sftp::connect(&host_owned, &ssh_config);
+        let _ = tx.send(result);
+        if let Some(ref wake) = wake {
+            wake();
+        }
+    });
+    app.sftp_connecting = Some(host.to_string());
+    app.sftp_connect_rx = Some(rx);
+    app.sftp_pending_nav = Some((host.to_string(), remote_path.to_string(), target_panel));
+}
+
+fn load_sftp_directory_async(
+    app: &mut app_state::AppState,
+    host: &str,
+    remote_path: &str,
+    target_panel: core::ActivePanel,
+    prefer_name: Option<String>,
+) {
+    let session = match app.sftp_sessions.get(host) {
+        Some(s) => Arc::clone(s),
+        None => return,
+    };
+
+    let host_owned = host.to_string();
+    let path_owned = remote_path.to_string();
+
+    let (tx, rx) = mpsc::channel::<core::DirBatch>();
+    let wake = app.wake.clone();
+
+    let panel = app.panel_mut(target_panel);
+    let browser = panel.browser_mut();
+    browser.browser_mode = core::BrowserMode::Remote {
+        host: host.to_string(),
+        path: remote_path.to_string(),
+    };
+    // Use a synthetic path for internal keying
+    let synthetic = PathBuf::from(format!("/sftp/{host}{remote_path}"));
+    browser.current_path = synthetic.clone();
+    browser.entries.clear();
+    // Show a "Loading..." placeholder so the user sees immediate feedback
+    browser.entries.push(core::DirEntry {
+        name: "Loading...".to_string(),
+        is_dir: false,
+        is_symlink: false,
+        link_target: None,
+        location: core::EntryLocation::Remote {
+            host: host.to_string(),
+            path: remote_path.to_string(),
+        },
+        size: None,
+        modified: None,
+    });
+    browser.selected_index = 0;
+    browser.top_index = 0;
+    browser.loading = true;
+    browser.entries_rx = Some(rx);
+    browser.prefer_select_name = prefer_name;
+    browser.dir_token = browser.dir_token.wrapping_add(1);
+    browser.container_root = None;
+    browser.watching_archive = None;
+
+    thread::spawn(move || {
+        let locked = session.lock().unwrap();
+        match fileman::sftp::read_directory(&locked.sftp, &host_owned, &path_owned) {
+            Ok(entries) => {
+                let _ = tx.send(core::DirBatch::Replace(entries));
+            }
+            Err(msg) => {
+                let _ = tx.send(core::DirBatch::Error(msg));
+            }
+        }
+        if let Some(ref wake) = wake {
+            wake();
+        }
+    });
 }
 
 fn load_fs_directory_async(
@@ -1961,6 +2082,9 @@ fn apply_panel_snapshot(
                 ContainerLoadMode::UseCache,
             );
         }
+        core::BrowserMode::Remote { ref host, ref path } => {
+            load_sftp_directory_async(app, host, path, which, snapshot.selected_name);
+        }
         core::BrowserMode::Search { .. } => {
             let results = app.search_results.clone();
             let panel = app.panel_mut(which);
@@ -2088,9 +2212,15 @@ fn refresh_active_panel(app: &mut app_state::AppState) {
     let which = app.active_panel;
     let panel = app.panel(which);
     let browser = panel.browser();
-    let path = browser.current_path.clone();
-    if matches!(browser.browser_mode, core::BrowserMode::Fs) {
-        load_fs_directory_async(app, path, which, None);
+    match browser.browser_mode.clone() {
+        core::BrowserMode::Fs => {
+            let path = browser.current_path.clone();
+            load_fs_directory_async(app, path, which, None);
+        }
+        core::BrowserMode::Remote { host, path } => {
+            load_sftp_directory_async(app, &host, &path, which, None);
+        }
+        _ => {}
     }
 }
 
@@ -2139,6 +2269,9 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
             selected_name,
             ContainerLoadMode::ForceReload,
         ),
+        core::BrowserMode::Remote { host, path } => {
+            load_sftp_directory_async(app, &host, &path, which, selected_name);
+        }
         core::BrowserMode::Search { .. } => {
             let results = app.search_results.clone();
             let panel = app.panel_mut(which);
@@ -2402,13 +2535,19 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             .start_dir
             .take()
             .unwrap_or_else(|| std::env::current_dir().expect("current_dir"));
-        let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker();
-        let (preview_tx, preview_rx) = workers::start_preview_worker(Some(Arc::new({
-            let proxy = self.proxy.clone();
-            move || {
-                let _ = proxy.send_event(UserEvent::Wake);
-            }
-        })));
+        let sftp_sessions_shared: Arc<
+            std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<fileman::sftp::SftpSession>>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(sftp_sessions_shared.clone());
+        let (preview_tx, preview_rx) = workers::start_preview_worker(
+            Some(Arc::new({
+                let proxy = self.proxy.clone();
+                move || {
+                    let _ = proxy.send_event(UserEvent::Wake);
+                }
+            })),
+            sftp_sessions_shared.clone(),
+        );
         let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker();
         let (search_tx, search_rx) = workers::start_search_worker();
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
@@ -2559,22 +2698,47 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             }
         });
 
-        thread::spawn(move || {
-            while let Ok(req) = edit_rx.recv() {
-                let text = match std::fs::read(&req.path) {
-                    Ok(bytes) => match String::from_utf8(bytes) {
-                        Ok(text) => text,
-                        Err(_) => "Refusing to edit binary file.".to_string(),
-                    },
-                    Err(e) => format!("Failed to read file: {e}"),
-                };
-                let _ = edit_res_tx.send(core::EditLoadResult {
-                    id: req.id,
-                    path: req.path,
-                    text,
-                });
-            }
-        });
+        {
+            let sftp_sessions = sftp_sessions_shared.clone();
+            thread::spawn(move || {
+                while let Ok(req) = edit_rx.recv() {
+                    let text = if let Some((host, remote_path)) = req.remote {
+                        // Load via SFTP
+                        let session = sftp_sessions.lock().unwrap().get(&host).cloned();
+                        match session {
+                            Some(session) => {
+                                let locked = session.lock().unwrap();
+                                match fileman::sftp::read_bytes_prefix(
+                                    &locked.sftp,
+                                    &remote_path,
+                                    10 * 1024 * 1024,
+                                ) {
+                                    Ok(bytes) => match String::from_utf8(bytes) {
+                                        Ok(text) => text,
+                                        Err(_) => "Refusing to edit binary file.".to_string(),
+                                    },
+                                    Err(e) => format!("Failed to read remote file: {e}"),
+                                }
+                            }
+                            None => format!("No SFTP session for host: {host}"),
+                        }
+                    } else {
+                        match std::fs::read(&req.path) {
+                            Ok(bytes) => match String::from_utf8(bytes) {
+                                Ok(text) => text,
+                                Err(_) => "Refusing to edit binary file.".to_string(),
+                            },
+                            Err(e) => format!("Failed to read file: {e}"),
+                        }
+                    };
+                    let _ = edit_res_tx.send(core::EditLoadResult {
+                        id: req.id,
+                        path: req.path,
+                        text,
+                    });
+                }
+            });
+        }
 
         let mut app = app_state::AppState {
             left_panel: app_state::PanelState {
@@ -2689,6 +2853,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             },
             quick_jump: None,
             error_message: None,
+            sftp_sessions: HashMap::new(),
+            sftp_sessions_shared: sftp_sessions_shared.clone(),
+            sftp_connecting: None,
+            sftp_connect_rx: None,
+            sftp_pending_nav: None,
         };
 
         app.theme
@@ -3117,6 +3286,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         runtime.app.close_quick_jump();
                         navigate_quick_jump(&mut runtime.app, result, active);
                     }
+                    if let Some(ref host) = runtime.app.sftp_connecting.clone() {
+                        draw_connecting_modal(ctx, host);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    }
                     if let Some(ref msg) = runtime.app.error_message.clone() {
                         draw_error_modal(ctx, msg);
                     }
@@ -3207,7 +3380,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 }
 
                 match other {
-                    winit::event::WindowEvent::CloseRequested => event_loop.exit(),
+                    winit::event::WindowEvent::CloseRequested => {
+                        // SFTP sessions are dropped automatically
+                        event_loop.exit();
+                    }
                     winit::event::WindowEvent::Resized(new_size) => {
                         runtime.size = new_size;
                         runtime.surface_config.size = bg::Extent {

@@ -11,16 +11,21 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use std::sync::{Arc, Mutex};
+
 use crate::core::{
     EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
     SearchMode, SearchProgress, SearchRequest, SearchResult, copy_container_dir,
     copy_container_entry, copy_recursively, create_archive, format_container_listing,
     is_probably_text, is_text_name, is_text_path, read_container_directory,
 };
+use crate::sftp::SftpSession;
 
 const PREVIEW_CHUNK_BYTES: usize = 16 * 1024;
 
-pub fn start_io_worker() -> (
+pub fn start_io_worker(
+    sftp_sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SftpSession>>>>>,
+) -> (
     mpsc::Sender<IOTask>,
     mpsc::Receiver<IOResult>,
     mpsc::Sender<()>,
@@ -157,6 +162,106 @@ pub fn start_io_worker() -> (
                 IOTask::SetProps { .. } => {
                     eprintln!("SetProps is not supported on this platform");
                 }
+                IOTask::WriteRemoteFile {
+                    host,
+                    path,
+                    contents,
+                } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                        let locked = session.lock().unwrap();
+                        if let Err(e) = crate::sftp::write_file(&locked.sftp, &path, &contents) {
+                            eprintln!("Remote write error: {e}");
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                }
+                IOTask::CopyRemoteToLocal {
+                    host,
+                    remote_path,
+                    dst_dir,
+                    name,
+                } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                        let locked = session.lock().unwrap();
+                        let local_path = dst_dir.join(&name);
+                        if let Err(e) = crate::sftp::copy_remote_to_local(
+                            &locked.sftp,
+                            &remote_path,
+                            &local_path,
+                        ) {
+                            eprintln!("Remote-to-local copy error: {e}");
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                }
+                IOTask::CopyLocalToRemote {
+                    src,
+                    host,
+                    remote_dir,
+                } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                        let locked = session.lock().unwrap();
+                        let name = src
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "file".to_string());
+                        let remote_path = format!("{remote_dir}/{name}");
+                        if let Err(e) =
+                            crate::sftp::copy_local_to_remote(&locked.sftp, &src, &remote_path)
+                        {
+                            eprintln!("Local-to-remote copy error: {e}");
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                }
+                IOTask::DeleteRemote { host, path, is_dir } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                        let locked = session.lock().unwrap();
+                        if let Err(e) = crate::sftp::recursive_delete(&locked.sftp, &path, is_dir) {
+                            eprintln!("Remote delete error: {e}");
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                }
+                IOTask::RenameRemote {
+                    host,
+                    src,
+                    new_name,
+                } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                        let locked = session.lock().unwrap();
+                        // Build destination path from src parent + new_name
+                        let parent = if let Some(pos) = src.rfind('/') {
+                            &src[..pos]
+                        } else {
+                            ""
+                        };
+                        let dst = if parent.is_empty() {
+                            format!("/{new_name}")
+                        } else {
+                            format!("{parent}/{new_name}")
+                        };
+                        if let Err(e) = crate::sftp::rename(&locked.sftp, &src, &dst) {
+                            eprintln!("Remote rename error: {e}");
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                }
+                IOTask::MkdirRemote { host, path } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                        let locked = session.lock().unwrap();
+                        if let Err(e) = crate::sftp::mkdir(&locked.sftp, &path) {
+                            eprintln!("Remote mkdir error: {e}");
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                }
             }
             let _ = result_tx.send(IOResult::Completed);
         }
@@ -193,6 +298,7 @@ fn apply_props_recursive(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io:
 
 pub fn start_preview_worker(
     wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    sftp_sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SftpSession>>>>>,
 ) -> (
     mpsc::Sender<PreviewRequest>,
     mpsc::Receiver<(u64, PreviewContent)>,
@@ -215,6 +321,7 @@ pub fn start_preview_worker(
                     max_bytes,
                 } => {
                     let result_tx = result_tx.clone();
+                    let sftp_sessions = sftp_sessions.clone();
                     thread::spawn(move || match location {
                         EntryLocation::Fs(path) => {
                             let force_text = is_text_path(&path);
@@ -263,6 +370,48 @@ pub fn start_preview_worker(
                                     id,
                                     PreviewContent::Text(format!(
                                         "Failed to read archive entry: {err}"
+                                    )),
+                                ));
+                            }
+                        }
+                        EntryLocation::Remote { host, path } => {
+                            let force_text = is_text_name(&path);
+                            let session = sftp_sessions.lock().unwrap().get(&host).cloned();
+                            if let Some(session) = session {
+                                let locked = session.lock().unwrap();
+                                match crate::sftp::open_remote_reader(&locked.sftp, &path) {
+                                    Ok(reader) => {
+                                        if let Err(err) = send_streaming_preview(
+                                            &result_tx,
+                                            &current_id,
+                                            id,
+                                            reader,
+                                            max_bytes,
+                                            force_text,
+                                            wake.as_ref(),
+                                        ) {
+                                            let _ = result_tx.send((
+                                                id,
+                                                PreviewContent::Text(format!(
+                                                    "Failed to read remote file: {err}"
+                                                )),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = result_tx.send((
+                                            id,
+                                            PreviewContent::Text(format!(
+                                                "Failed to open remote file: {err}"
+                                            )),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                let _ = result_tx.send((
+                                    id,
+                                    PreviewContent::Text(format!(
+                                        "No SFTP session for host: {host}"
                                     )),
                                 ));
                             }

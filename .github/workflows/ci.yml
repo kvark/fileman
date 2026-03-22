@@ -55,6 +55,25 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+  sftp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set up local SSH server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo systemctl start ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
+          # Verify connectivity
+          ssh -o BatchMode=yes localhost echo "SSH OK"
+      - name: Run SFTP tests
+        run: cargo test --test sftp_localhost -- --ignored
+
   replay:
     runs-on: ubuntu-latest
     steps:

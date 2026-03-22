@@ -33,6 +33,9 @@ pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
                 eprintln!("{err}");
             }
         }
+        core::EntryLocation::Remote { .. } => {
+            // External open not supported for remote files
+        }
         core::EntryLocation::Container {
             kind,
             archive_path,
@@ -207,6 +210,29 @@ fn open_selected_from_to(
                 }
             }
         }
+        core::EntryLocation::Remote { host, path } => {
+            if selected_entry.is_dir {
+                let prefer_name = if selected_entry.name == ".." {
+                    // Extract last component of current remote path
+                    let browser = app.panel(source).browser();
+                    if let core::BrowserMode::Remote {
+                        path: ref cur_path, ..
+                    } = browser.browser_mode
+                    {
+                        cur_path
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                crate::load_sftp_directory_async(app, &host, &path, target, prefer_name);
+            }
+        }
     }
 
     while let Ok((path, size)) = app.dir_size_rx.try_recv() {
@@ -361,11 +387,32 @@ pub(crate) fn handle_keyboard(
         }
         if ctrl_s {
             if let Some(path) = edit.path.clone() {
-                save_payload = Some((path, edit.text.as_bytes().to_vec()));
-                edit.dirty = false;
-                edit.confirm_discard = false;
-                refresh_after = true;
-                close_editor = true;
+                let contents = edit.text.as_bytes().to_vec();
+                // Check if this is a remote file (synthetic /sftp/host/path)
+                let path_str = path.to_string_lossy();
+                if let Some(rest) = path_str.strip_prefix("/sftp/") {
+                    // Parse host and remote path
+                    if let Some(slash) = rest.find('/') {
+                        let host = rest[..slash].to_string();
+                        let remote_path = rest[slash..].to_string();
+                        save_payload = None; // Don't use the local write path
+                        edit.dirty = false;
+                        edit.confirm_discard = false;
+                        refresh_after = true;
+                        close_editor = true;
+                        let _ = io_tx.send(core::IOTask::WriteRemoteFile {
+                            host,
+                            path: remote_path,
+                            contents,
+                        });
+                    }
+                } else {
+                    save_payload = Some((path, contents));
+                    edit.dirty = false;
+                    edit.confirm_discard = false;
+                    refresh_after = true;
+                    close_editor = true;
+                }
             }
             ctx.request_repaint();
             if let Some((path, contents)) = save_payload {
