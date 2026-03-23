@@ -1231,11 +1231,11 @@ fn load_sftp_directory_async(
                     browser.watching_archive = None;
                     browser.marked.clear();
                     sort_entries(&mut browser.entries, sort_mode, sort_desc);
-                    if let Some(ref name) = prefer_name {
-                        if let Some(idx) = browser.entries.iter().position(|e| e.name == *name) {
-                            browser.selected_index = idx;
-                            browser.top_index = idx.saturating_sub(5);
-                        }
+                    if let Some(ref name) = prefer_name
+                        && let Some(idx) = browser.entries.iter().position(|e| e.name == *name)
+                    {
+                        browser.selected_index = idx;
+                        browser.top_index = idx.saturating_sub(5);
                     }
                     browser.prefer_select_name = prefer_name;
                     return;
@@ -1383,11 +1383,11 @@ fn load_fs_directory_async(
                 browser.marked.clear();
                 // Re-sort since batches accumulated without sorting.
                 sort_entries(&mut browser.entries, sort_mode, sort_desc);
-                if let Some(ref name) = prefer_name {
-                    if let Some(idx) = browser.entries.iter().position(|e| e.name == *name) {
-                        browser.selected_index = idx;
-                        browser.top_index = idx.saturating_sub(5);
-                    }
+                if let Some(ref name) = prefer_name
+                    && let Some(idx) = browser.entries.iter().position(|e| e.name == *name)
+                {
+                    browser.selected_index = idx;
+                    browser.top_index = idx.saturating_sub(5);
                 }
                 browser.prefer_select_name = prefer_name;
                 return;
