@@ -142,7 +142,8 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                         .layouter(&mut layouter)
                         .cursor_at_end(false)
                         .id_source("editor_text")
-                        .desired_rows(desired_rows);
+                        .desired_rows(desired_rows)
+                        .lock_focus(true);
                     if editor_wrap {
                         te = te.desired_width(f32::INFINITY);
                     } else {
@@ -158,6 +159,43 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                 .as_ref()
                 .map(|output| output.response.clone())
                 .unwrap_or_else(|| ui.label(" "));
+            // Auto-indent: if Enter was just pressed, copy leading whitespace
+            // from the previous line and insert it after the newline.
+            // Auto-indent: if Enter was just pressed, copy leading whitespace
+            // from the previous line. CCursor.index is a character offset.
+            let cursor_char = edit_output
+                .as_ref()
+                .and_then(|o| o.cursor_range)
+                .map(|r| r.primary.index);
+            if let Some(char_pos) = cursor_char
+                && char_pos > 0
+            {
+                // Convert character offset to byte offset
+                let byte_pos: usize = text
+                    .char_indices()
+                    .nth(char_pos)
+                    .map(|(i, _)| i)
+                    .unwrap_or(text.len());
+                if byte_pos > 0 && text.as_bytes().get(byte_pos - 1) == Some(&b'\n') {
+                    let before = &text[..byte_pos - 1];
+                    let prev_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let prev_line = &before[prev_line_start..];
+                    let indent: String = prev_line
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .collect();
+                    if !indent.is_empty() {
+                        let indent_chars = indent.chars().count();
+                        text.insert_str(byte_pos, &indent);
+                        if let Some(ref mut output) = edit_output
+                            && let Some(ref mut range) = output.cursor_range
+                        {
+                            range.primary.index += indent_chars;
+                            range.secondary.index += indent_chars;
+                        }
+                    }
+                }
+            }
             edit.text = text;
             if response.changed() {
                 edit.highlight_hash = hash_text(&edit.text);
