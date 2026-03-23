@@ -174,17 +174,31 @@ pub fn connect(
 /// List a remote directory, producing DirEntry items with EntryLocation::Remote.
 /// Does not include ".." when path is "/".
 pub fn read_directory(sftp: &Sftp, host: &str, path: &str) -> Result<Vec<DirEntry>, String> {
+    let mut all = Vec::new();
+    read_directory_streaming(sftp, host, path, |entries| {
+        all.extend(entries);
+    })?;
+    Ok(all)
+}
+
+/// Incrementally list a remote directory, calling `on_batch` for each batch of entries.
+/// The first batch always contains the ".." entry (if applicable).
+/// Entries within each batch are unsorted; the final sort is the caller's responsibility.
+pub fn read_directory_streaming(
+    sftp: &Sftp,
+    host: &str,
+    path: &str,
+    mut on_batch: impl FnMut(Vec<DirEntry>),
+) -> Result<(), String> {
     let remote_path = if path.is_empty() { "/" } else { path };
-    let dir = sftp
-        .readdir(Path::new(remote_path))
-        .map_err(|e| format!("readdir {remote_path}: {e}"))?;
+    let mut handle = sftp
+        .opendir(Path::new(remote_path))
+        .map_err(|e| format!("opendir {remote_path}: {e}"))?;
 
-    let mut entries = Vec::new();
-
-    // ".." entry (unless at root)
+    // First batch: ".." entry if not at root
     if remote_path != "/" {
         let parent = parent_remote_path(remote_path);
-        entries.push(DirEntry {
+        on_batch(vec![DirEntry {
             name: "..".to_string(),
             is_dir: true,
             is_symlink: false,
@@ -195,11 +209,13 @@ pub fn read_directory(sftp: &Sftp, host: &str, path: &str) -> Result<Vec<DirEntr
             },
             size: None,
             modified: None,
-        });
+        }]);
     }
 
-    let mut dir_entries = Vec::new();
-    for (pathbuf, stat) in dir {
+    const BATCH_SIZE: usize = 64;
+    let mut batch = Vec::with_capacity(BATCH_SIZE);
+
+    while let Ok((pathbuf, stat)) = handle.readdir() {
         let name = pathbuf
             .file_name()
             .and_then(|s| s.to_str())
@@ -224,7 +240,7 @@ pub fn read_directory(sftp: &Sftp, host: &str, path: &str) -> Result<Vec<DirEntr
         } else {
             None
         };
-        dir_entries.push(DirEntry {
+        batch.push(DirEntry {
             name,
             is_dir,
             is_symlink,
@@ -236,11 +252,19 @@ pub fn read_directory(sftp: &Sftp, host: &str, path: &str) -> Result<Vec<DirEntr
             size,
             modified,
         });
+        if batch.len() >= BATCH_SIZE {
+            on_batch(std::mem::replace(
+                &mut batch,
+                Vec::with_capacity(BATCH_SIZE),
+            ));
+        }
     }
 
-    dir_entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-    entries.extend(dir_entries);
-    Ok(entries)
+    if !batch.is_empty() {
+        on_batch(batch);
+    }
+
+    Ok(())
 }
 
 /// Read a prefix of a remote file for preview purposes.
