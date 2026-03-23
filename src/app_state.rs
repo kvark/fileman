@@ -50,6 +50,7 @@ impl PanelState {
             watching_archive: None,
             index_last_seen: 0,
             marked: std::collections::HashSet::new(),
+            parent_cache: Vec::new(),
         };
         let new_idx = self.active_tab + 1;
         self.tabs.insert(new_idx, new_browser);
@@ -129,6 +130,10 @@ pub struct BrowserState {
     pub watching_archive: Option<path::PathBuf>,
     pub index_last_seen: usize,
     pub marked: std::collections::HashSet<String>,
+    /// Stack of cached parent directory listings. Pushed when descending into
+    /// a child directory, popped when ascending back. Each entry may still
+    /// carry an active `entries_rx` so its async loading continues.
+    pub parent_cache: Vec<DirListingCache>,
 }
 
 pub enum InlineEditKind {
@@ -181,11 +186,19 @@ pub struct ContainerDirCache {
     pub root: Option<String>,
 }
 
-/// Lightweight cache for a directory listing (used for FS and remote dirs).
+/// Cached parent directory listing. Kept on a per-panel stack so that
+/// async loading of ancestor directories continues while the user browses
+/// deeper into the tree.
 pub struct DirListingCache {
+    pub current_path: path::PathBuf,
     pub entries: Vec<DirEntry>,
     pub selected_index: usize,
     pub top_index: usize,
+    pub loading: bool,
+    pub loading_progress: Option<(usize, Option<usize>)>,
+    pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
+    pub sort_mode: SortMode,
+    pub sort_desc: bool,
 }
 
 pub struct PreviewState {
@@ -305,8 +318,6 @@ pub struct AppState {
     pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
     pub container_dir_cache: HashMap<(path::PathBuf, String, ContainerKind), ContainerDirCache>,
     pub archive_index: HashMap<path::PathBuf, Arc<Mutex<ArchiveFullIndex>>>,
-    /// Cache for directory listings, keyed by (host, path). Host is "" for local FS.
-    pub dir_listing_cache: HashMap<(String, String), DirListingCache>,
     pub props_dialog: Option<PropsDialog>,
     pub theme: Theme,
     pub theme_picker_open: bool,
@@ -633,31 +644,6 @@ impl AppState {
 
     /// Save the current panel's directory listing into a cache so it can be
     /// restored instantly when the user navigates back.
-    pub fn stash_dir_cache(&mut self, which: ActivePanel) {
-        let (key, cache) = {
-            let panel = self.panel_mut(which);
-            let browser = panel.browser_mut();
-            if browser.loading || browser.entries.is_empty() {
-                return;
-            }
-            let key = match browser.browser_mode {
-                BrowserMode::Remote { ref host, ref path } => (host.clone(), path.clone()),
-                BrowserMode::Fs => (
-                    String::new(),
-                    browser.current_path.to_string_lossy().into_owned(),
-                ),
-                _ => return,
-            };
-            let cache = DirListingCache {
-                entries: browser.entries.clone(),
-                selected_index: browser.selected_index,
-                top_index: browser.top_index,
-            };
-            (key, cache)
-        };
-        self.dir_listing_cache.insert(key, cache);
-    }
-
     pub fn stash_container_cache(&mut self, which: ActivePanel) {
         let (key, cache) = {
             let panel = self.panel_mut(which);

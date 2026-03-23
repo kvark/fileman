@@ -761,6 +761,50 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 }
             }
         }
+
+        // Drain receivers for cached parent directories so their background
+        // threads are not blocked and entries accumulate for later restoration.
+        for cached in &mut browser.parent_cache {
+            if let Some(rx) = cached.entries_rx.take() {
+                let mut handled = 0usize;
+                while handled < 8 {
+                    match rx.try_recv() {
+                        Ok(batch) => {
+                            match batch {
+                                core::DirBatch::Append(mut new) => {
+                                    cached.entries.append(&mut new);
+                                }
+                                core::DirBatch::Replace(new) => {
+                                    cached.entries = new;
+                                }
+                                core::DirBatch::Loading => {
+                                    cached.loading = true;
+                                }
+                                core::DirBatch::Progress { loaded, total } => {
+                                    cached.loading_progress = Some((loaded, total));
+                                    cached.loading =
+                                        total.map(|t| loaded < t).unwrap_or(true);
+                                }
+                                core::DirBatch::Error(_) => {
+                                    cached.loading = false;
+                                }
+                                core::DirBatch::ContainerRoot(_) => {}
+                            }
+                            handled += 1;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            cached.entries_rx = Some(rx);
+                            break;
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            cached.loading = false;
+                            cached.loading_progress = None;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Poll shared archive indexes for incremental updates
@@ -1130,45 +1174,74 @@ fn load_sftp_directory_async(
     target_panel: core::ActivePanel,
     prefer_name: Option<String>,
 ) {
-    // Stash the current listing before navigating away
-    app.stash_dir_cache(target_panel);
-
     let session = match app.sftp_sessions.get(host) {
         Some(s) => Arc::clone(s),
         None => return,
     };
 
-    // Check for a cached listing
-    let cache_key = (host.to_string(), remote_path.to_string());
-    if let Some(cached) = app.dir_listing_cache.remove(&cache_key) {
-        let panel = app.panel_mut(target_panel);
-        let browser = panel.browser_mut();
-        browser.browser_mode = core::BrowserMode::Remote {
-            host: host.to_string(),
-            path: remote_path.to_string(),
-        };
-        browser.current_path = PathBuf::from(format!("/sftp/{host}{remote_path}"));
-        browser.entries = cached.entries;
-        browser.loading = false;
-        browser.entries_rx = None;
-        browser.dir_token = browser.dir_token.wrapping_add(1);
-        browser.container_root = None;
-        browser.watching_archive = None;
-        // Restore cursor: prefer_name overrides cached position
-        if let Some(ref name) = prefer_name {
-            if let Some(idx) = browser.entries.iter().position(|e| e.name == *name) {
-                browser.selected_index = idx;
-                browser.top_index = idx.saturating_sub(5);
+    // Use the synthetic path for stack comparisons.
+    let synthetic = PathBuf::from(format!("/sftp/{host}{remote_path}"));
+    {
+        let browser = app.panel_mut(target_panel).browser_mut();
+        let same_dir = browser.current_path == synthetic;
+        if !same_dir {
+            let is_child =
+                synthetic.starts_with(&browser.current_path) && synthetic != browser.current_path;
+            if is_child {
+                // Descending: push current directory (with entries_rx) onto stack.
+                let cache = app_state::DirListingCache {
+                    current_path: browser.current_path.clone(),
+                    entries: std::mem::take(&mut browser.entries),
+                    selected_index: browser.selected_index,
+                    top_index: browser.top_index,
+                    loading: browser.loading,
+                    loading_progress: browser.loading_progress,
+                    entries_rx: browser.entries_rx.take(),
+                    sort_mode: browser.sort_mode,
+                    sort_desc: browser.sort_desc,
+                };
+                browser.parent_cache.push(cache);
             } else {
-                browser.selected_index = cached.selected_index;
-                browser.top_index = cached.top_index;
+                // Ascending or lateral: pop until match or exhaust.
+                let mut restored = None;
+                while let Some(top) = browser.parent_cache.last() {
+                    if top.current_path == synthetic {
+                        restored = browser.parent_cache.pop();
+                        break;
+                    } else {
+                        browser.parent_cache.pop();
+                    }
+                }
+                if let Some(cached) = restored {
+                    let sort_mode = browser.sort_mode;
+                    let sort_desc = browser.sort_desc;
+                    browser.browser_mode = core::BrowserMode::Remote {
+                        host: host.to_string(),
+                        path: remote_path.to_string(),
+                    };
+                    browser.current_path = synthetic;
+                    browser.entries = cached.entries;
+                    browser.selected_index = cached.selected_index;
+                    browser.top_index = cached.top_index;
+                    browser.loading = cached.loading;
+                    browser.loading_progress = cached.loading_progress;
+                    browser.entries_rx = cached.entries_rx;
+                    browser.dir_token = browser.dir_token.wrapping_add(1);
+                    browser.container_root = None;
+                    browser.watching_archive = None;
+                    browser.marked.clear();
+                    sort_entries(&mut browser.entries, sort_mode, sort_desc);
+                    if let Some(ref name) = prefer_name {
+                        if let Some(idx) = browser.entries.iter().position(|e| e.name == *name) {
+                            browser.selected_index = idx;
+                            browser.top_index = idx.saturating_sub(5);
+                        }
+                    }
+                    browser.prefer_select_name = prefer_name;
+                    return;
+                }
             }
-        } else {
-            browser.selected_index = cached.selected_index;
-            browser.top_index = cached.top_index;
         }
-        browser.prefer_select_name = None;
-        return;
     }
 
     let host_owned = host.to_string();
@@ -1183,8 +1256,6 @@ fn load_sftp_directory_async(
         host: host.to_string(),
         path: remote_path.to_string(),
     };
-    // Use a synthetic path for internal keying
-    let synthetic = PathBuf::from(format!("/sftp/{host}{remote_path}"));
     browser.current_path = synthetic.clone();
     browser.entries.clear();
     // Show a "Loading..." placeholder so the user sees immediate feedback
@@ -1261,8 +1332,70 @@ fn load_fs_directory_async(
         has_parent_entry = true;
     }
 
-    app.stash_dir_cache(target_panel);
     app.stash_container_cache(target_panel);
+
+    // Try to restore from the parent cache stack.
+    if !same_dir {
+        let browser = app.panel_mut(target_panel).browser_mut();
+        let is_child = path.starts_with(&browser.current_path) && path != browser.current_path;
+        if is_child {
+            // Descending: push the current directory onto the parent stack
+            // (with its entries_rx so async loading keeps going).
+            let cache = app_state::DirListingCache {
+                current_path: browser.current_path.clone(),
+                entries: std::mem::take(&mut browser.entries),
+                selected_index: browser.selected_index,
+                top_index: browser.top_index,
+                loading: browser.loading,
+                loading_progress: browser.loading_progress,
+                entries_rx: browser.entries_rx.take(),
+                sort_mode: browser.sort_mode,
+                sort_desc: browser.sort_desc,
+            };
+            browser.parent_cache.push(cache);
+        } else {
+            // Ascending or lateral: pop until we find the target or exhaust the stack.
+            let mut restored = None;
+            while let Some(top) = browser.parent_cache.last() {
+                if top.current_path == path {
+                    restored = browser.parent_cache.pop();
+                    break;
+                } else {
+                    browser.parent_cache.pop(); // discard non-ancestor
+                }
+            }
+            if let Some(cached) = restored {
+                // Restore from cache — entries may have grown via background loading.
+                let sort_mode = browser.sort_mode;
+                let sort_desc = browser.sort_desc;
+                browser.current_path = path;
+                browser.browser_mode = core::BrowserMode::Fs;
+                browser.entries = cached.entries;
+                browser.selected_index = cached.selected_index;
+                browser.top_index = cached.top_index;
+                browser.loading = cached.loading;
+                browser.loading_progress = cached.loading_progress;
+                browser.entries_rx = cached.entries_rx;
+                browser.inline_rename = None;
+                browser.dir_token = browser.dir_token.wrapping_add(1);
+                browser.watching_archive = None;
+                browser.index_last_seen = 0;
+                browser.marked.clear();
+                // Re-sort since batches accumulated without sorting.
+                sort_entries(&mut browser.entries, sort_mode, sort_desc);
+                if let Some(ref name) = prefer_name {
+                    if let Some(idx) = browser.entries.iter().position(|e| e.name == *name) {
+                        browser.selected_index = idx;
+                        browser.top_index = idx.saturating_sub(5);
+                    }
+                }
+                browser.prefer_select_name = prefer_name;
+                return;
+            }
+            // Stack exhausted with no match — fall through to fresh load.
+        }
+    }
+
     let (tx, rx) = mpsc::channel::<core::DirBatch>();
     let path_clone = path.clone();
     let wake = app.wake.clone();
@@ -2272,12 +2405,9 @@ fn refresh_active_panel(app: &mut app_state::AppState) {
     match browser.browser_mode.clone() {
         core::BrowserMode::Fs => {
             let path = browser.current_path.clone();
-            app.dir_listing_cache
-                .remove(&(String::new(), path.to_string_lossy().into_owned()));
             load_fs_directory_async(app, path, which, None);
         }
         core::BrowserMode::Remote { ref host, ref path } => {
-            app.dir_listing_cache.remove(&(host.clone(), path.clone()));
             load_sftp_directory_async(app, host, path, which, None);
         }
         _ => {}
@@ -2314,8 +2444,6 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
     };
     match mode {
         core::BrowserMode::Fs => {
-            app.dir_listing_cache
-                .remove(&(String::new(), current_path.to_string_lossy().into_owned()));
             load_fs_directory_async(app, current_path, which, selected_name);
         }
         core::BrowserMode::Container {
@@ -2334,7 +2462,6 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
             ContainerLoadMode::ForceReload,
         ),
         core::BrowserMode::Remote { ref host, ref path } => {
-            app.dir_listing_cache.remove(&(host.clone(), path.clone()));
             load_sftp_directory_async(app, host, path, which, selected_name);
         }
         core::BrowserMode::Search { .. } => {
@@ -2827,6 +2954,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     watching_archive: None,
                     index_last_seen: 0,
                     marked: std::collections::HashSet::new(),
+                    parent_cache: Vec::new(),
                 }],
                 active_tab: 0,
                 mode: app_state::PanelMode::Browser,
@@ -2852,6 +2980,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     watching_archive: None,
                     index_last_seen: 0,
                     marked: std::collections::HashSet::new(),
+                    parent_cache: Vec::new(),
                 }],
                 active_tab: 0,
                 mode: app_state::PanelMode::Browser,
@@ -2881,7 +3010,6 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             container_last_selected_name: Default::default(),
             container_dir_cache: Default::default(),
             archive_index: Default::default(),
-            dir_listing_cache: Default::default(),
             props_dialog: None,
             theme: theme::Theme::dark(),
             theme_picker_open: false,
