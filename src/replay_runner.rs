@@ -372,6 +372,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         container_last_selected_name: Default::default(),
         container_dir_cache: Default::default(),
         archive_index: Default::default(),
+        dir_listing_cache: Default::default(),
         props_dialog: None,
         theme: theme::Theme::dark(),
         theme_picker_open: false,

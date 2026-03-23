@@ -3,6 +3,7 @@
 ## 0.2.1 (TBD)
 
 ### Features
+- Remote browsing via built-in SFTP
 - New syntax: Makefile, Dockerfile, CSV, SVG
 - Defaulting to Ctrl+? schema on Apple devices
 - Quick navigation menu with Ctrl+G

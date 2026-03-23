@@ -181,6 +181,13 @@ pub struct ContainerDirCache {
     pub root: Option<String>,
 }
 
+/// Lightweight cache for a directory listing (used for FS and remote dirs).
+pub struct DirListingCache {
+    pub entries: Vec<DirEntry>,
+    pub selected_index: usize,
+    pub top_index: usize,
+}
+
 pub struct PreviewState {
     pub content: Option<PreviewContent>,
     pub key: Option<String>,
@@ -298,6 +305,8 @@ pub struct AppState {
     pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
     pub container_dir_cache: HashMap<(path::PathBuf, String, ContainerKind), ContainerDirCache>,
     pub archive_index: HashMap<path::PathBuf, Arc<Mutex<ArchiveFullIndex>>>,
+    /// Cache for directory listings, keyed by (host, path). Host is "" for local FS.
+    pub dir_listing_cache: HashMap<(String, String), DirListingCache>,
     pub props_dialog: Option<PropsDialog>,
     pub theme: Theme,
     pub theme_picker_open: bool,
@@ -620,6 +629,33 @@ impl AppState {
                     .insert((ap, cwd, kind), selected_name);
             }
         }
+    }
+
+    /// Save the current panel's directory listing into a cache so it can be
+    /// restored instantly when the user navigates back.
+    pub fn stash_dir_cache(&mut self, which: ActivePanel) {
+        let (key, cache) = {
+            let panel = self.panel_mut(which);
+            let browser = panel.browser_mut();
+            if browser.loading || browser.entries.is_empty() {
+                return;
+            }
+            let key = match browser.browser_mode {
+                BrowserMode::Remote { ref host, ref path } => (host.clone(), path.clone()),
+                BrowserMode::Fs => (
+                    String::new(),
+                    browser.current_path.to_string_lossy().into_owned(),
+                ),
+                _ => return,
+            };
+            let cache = DirListingCache {
+                entries: browser.entries.clone(),
+                selected_index: browser.selected_index,
+                top_index: browser.top_index,
+            };
+            (key, cache)
+        };
+        self.dir_listing_cache.insert(key, cache);
     }
 
     pub fn stash_container_cache(&mut self, which: ActivePanel) {

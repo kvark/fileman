@@ -708,12 +708,12 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
         }
         core::DirBatch::Append(mut new_entries) => {
             browser.entries.append(&mut new_entries);
-            browser.loading = false;
+            // loading flag stays true — cleared when the channel disconnects
         }
         core::DirBatch::Replace(new_entries) => {
             browser.entries = new_entries;
             browser.selected_index = 0;
-            browser.loading = false;
+            // loading flag stays true — cleared when the channel disconnects
         }
     }
 
@@ -751,7 +751,13 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         browser.entries_rx = Some(rx);
                         break;
                     }
-                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        // Sender dropped — all batches received.
+                        browser.loading = false;
+                        browser.loading_progress = None;
+                        changed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1124,10 +1130,46 @@ fn load_sftp_directory_async(
     target_panel: core::ActivePanel,
     prefer_name: Option<String>,
 ) {
+    // Stash the current listing before navigating away
+    app.stash_dir_cache(target_panel);
+
     let session = match app.sftp_sessions.get(host) {
         Some(s) => Arc::clone(s),
         None => return,
     };
+
+    // Check for a cached listing
+    let cache_key = (host.to_string(), remote_path.to_string());
+    if let Some(cached) = app.dir_listing_cache.remove(&cache_key) {
+        let panel = app.panel_mut(target_panel);
+        let browser = panel.browser_mut();
+        browser.browser_mode = core::BrowserMode::Remote {
+            host: host.to_string(),
+            path: remote_path.to_string(),
+        };
+        browser.current_path = PathBuf::from(format!("/sftp/{host}{remote_path}"));
+        browser.entries = cached.entries;
+        browser.loading = false;
+        browser.entries_rx = None;
+        browser.dir_token = browser.dir_token.wrapping_add(1);
+        browser.container_root = None;
+        browser.watching_archive = None;
+        // Restore cursor: prefer_name overrides cached position
+        if let Some(ref name) = prefer_name {
+            if let Some(idx) = browser.entries.iter().position(|e| e.name == *name) {
+                browser.selected_index = idx;
+                browser.top_index = idx.saturating_sub(5);
+            } else {
+                browser.selected_index = cached.selected_index;
+                browser.top_index = cached.top_index;
+            }
+        } else {
+            browser.selected_index = cached.selected_index;
+            browser.top_index = cached.top_index;
+        }
+        browser.prefer_select_name = None;
+        return;
+    }
 
     let host_owned = host.to_string();
     let path_owned = remote_path.to_string();
@@ -1169,13 +1211,27 @@ fn load_sftp_directory_async(
 
     thread::spawn(move || {
         let locked = session.lock().unwrap();
-        match fileman::sftp::read_directory(&locked.sftp, &host_owned, &path_owned) {
-            Ok(entries) => {
-                let _ = tx.send(core::DirBatch::Replace(entries));
-            }
-            Err(msg) => {
-                let _ = tx.send(core::DirBatch::Error(msg));
-            }
+        let mut first = true;
+        let result = fileman::sftp::read_directory_streaming(
+            &locked.sftp,
+            &host_owned,
+            &path_owned,
+            |batch| {
+                // First batch replaces the "Loading..." placeholder; subsequent ones append.
+                let msg = if first {
+                    first = false;
+                    core::DirBatch::Replace(batch)
+                } else {
+                    core::DirBatch::Append(batch)
+                };
+                let _ = tx.send(msg);
+                if let Some(ref wake) = wake {
+                    wake();
+                }
+            },
+        );
+        if let Err(msg) = result {
+            let _ = tx.send(core::DirBatch::Error(msg));
         }
         if let Some(ref wake) = wake {
             wake();
@@ -1205,6 +1261,7 @@ fn load_fs_directory_async(
         has_parent_entry = true;
     }
 
+    app.stash_dir_cache(target_panel);
     app.stash_container_cache(target_panel);
     let (tx, rx) = mpsc::channel::<core::DirBatch>();
     let path_clone = path.clone();
@@ -2215,10 +2272,13 @@ fn refresh_active_panel(app: &mut app_state::AppState) {
     match browser.browser_mode.clone() {
         core::BrowserMode::Fs => {
             let path = browser.current_path.clone();
+            app.dir_listing_cache
+                .remove(&(String::new(), path.to_string_lossy().into_owned()));
             load_fs_directory_async(app, path, which, None);
         }
-        core::BrowserMode::Remote { host, path } => {
-            load_sftp_directory_async(app, &host, &path, which, None);
+        core::BrowserMode::Remote { ref host, ref path } => {
+            app.dir_listing_cache.remove(&(host.clone(), path.clone()));
+            load_sftp_directory_async(app, host, path, which, None);
         }
         _ => {}
     }
@@ -2253,7 +2313,11 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
         )
     };
     match mode {
-        core::BrowserMode::Fs => load_fs_directory_async(app, current_path, which, selected_name),
+        core::BrowserMode::Fs => {
+            app.dir_listing_cache
+                .remove(&(String::new(), current_path.to_string_lossy().into_owned()));
+            load_fs_directory_async(app, current_path, which, selected_name);
+        }
         core::BrowserMode::Container {
             kind,
             archive_path,
@@ -2269,8 +2333,9 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
             selected_name,
             ContainerLoadMode::ForceReload,
         ),
-        core::BrowserMode::Remote { host, path } => {
-            load_sftp_directory_async(app, &host, &path, which, selected_name);
+        core::BrowserMode::Remote { ref host, ref path } => {
+            app.dir_listing_cache.remove(&(host.clone(), path.clone()));
+            load_sftp_directory_async(app, host, path, which, selected_name);
         }
         core::BrowserMode::Search { .. } => {
             let results = app.search_results.clone();
@@ -2816,6 +2881,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             container_last_selected_name: Default::default(),
             container_dir_cache: Default::default(),
             archive_index: Default::default(),
+            dir_listing_cache: Default::default(),
             props_dialog: None,
             theme: theme::Theme::dark(),
             theme_picker_open: false,
