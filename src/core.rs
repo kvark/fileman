@@ -110,6 +110,10 @@ pub enum ImageLocation {
         archive_path: path::PathBuf,
         inner_path: String,
     },
+    Remote {
+        host: String,
+        path: String,
+    },
 }
 
 pub enum PreviewRequest {

@@ -113,6 +113,10 @@ enum ImageSource {
         archive_path: PathBuf,
         inner_path: String,
     },
+    Remote {
+        host: String,
+        path: String,
+    },
 }
 
 struct HighlightRequest {
@@ -782,8 +786,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                                 }
                                 core::DirBatch::Progress { loaded, total } => {
                                     cached.loading_progress = Some((loaded, total));
-                                    cached.loading =
-                                        total.map(|t| loaded < t).unwrap_or(true);
+                                    cached.loading = total.map(|t| loaded < t).unwrap_or(true);
                                 }
                                 core::DirBatch::Error(_) => {
                                     cached.loading = false;
@@ -2417,15 +2420,20 @@ fn refresh_active_panel(app: &mut app_state::AppState) {
 fn refresh_fs_panels(app: &mut app_state::AppState) {
     for which in [core::ActivePanel::Left, core::ActivePanel::Right] {
         let browser = app.panel(which).browser();
-        if !matches!(browser.browser_mode, core::BrowserMode::Fs) {
-            continue;
-        }
-        let path = browser.current_path.clone();
         let current_name = browser
             .entries
             .get(browser.selected_index)
             .map(|e| e.name.clone());
-        load_fs_directory_async(app, path, which, current_name);
+        match browser.browser_mode.clone() {
+            core::BrowserMode::Fs => {
+                let path = browser.current_path.clone();
+                load_fs_directory_async(app, path, which, current_name);
+            }
+            core::BrowserMode::Remote { host, path } => {
+                load_sftp_directory_async(app, &host, &path, which, current_name);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2779,6 +2787,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         // Fast preview thread: reads files, sends tier 1/2 instantly,
         // then forwards to the full-decode thread for tier 3.
         let proxy = self.proxy.clone();
+        let image_sftp = sftp_sessions_shared.clone();
         thread::spawn(move || {
             while let Ok(mut req) = image_req_rx.recv() {
                 // Skip stale requests
@@ -2799,6 +2808,13 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         usize::MAX,
                     )
                     .ok(),
+                    ImageSource::Remote { ref host, ref path } => {
+                        let session = image_sftp.lock().unwrap().get(host).cloned();
+                        session.and_then(|s| {
+                            let locked = s.lock().unwrap();
+                            fileman::sftp::read_file_full(&locked.sftp, path).ok()
+                        })
+                    }
                 };
                 let Some(data) = raw_bytes else {
                     let _ = image_res_tx.send(ImageResponse::Err {
@@ -2895,16 +2911,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             thread::spawn(move || {
                 while let Ok(req) = edit_rx.recv() {
                     let text = if let Some((host, remote_path)) = req.remote {
-                        // Load via SFTP
                         let session = sftp_sessions.lock().unwrap().get(&host).cloned();
                         match session {
                             Some(session) => {
                                 let locked = session.lock().unwrap();
-                                match fileman::sftp::read_bytes_prefix(
-                                    &locked.sftp,
-                                    &remote_path,
-                                    10 * 1024 * 1024,
-                                ) {
+                                match fileman::sftp::read_file_full(&locked.sftp, &remote_path) {
                                     Ok(bytes) => match String::from_utf8(bytes) {
                                         Ok(text) => text,
                                         Err(_) => "Refusing to edit binary file.".to_string(),
@@ -3637,6 +3648,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         },
                         inner_path
                     ),
+                    core::ImageLocation::Remote { host, path } => {
+                        format!("sftp://{host}{path}")
+                    }
                 };
                 if runtime.image_cache.pending.contains(&key)
                     || !runtime.image_cache.textures.contains_key(&key)

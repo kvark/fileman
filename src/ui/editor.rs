@@ -56,12 +56,11 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
             });
             ui.add_space(4.0);
             if edit.loading {
-                ui.colored_label(color32(colors.row_fg_inactive), "Loading…");
+                let t = ui.ctx().input(|i| i.time);
+                let dots = ".".repeat(((t * 2.0) as usize % 4) + 1);
+                ui.colored_label(color32(colors.row_fg_inactive), format!("Loading{dots}"));
                 ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(60));
-                if is_focused {
-                    ui.ctx().request_repaint();
-                }
+                    .request_repaint_after(std::time::Duration::from_millis(300));
                 return;
             }
             let mut text = std::mem::take(&mut edit.text);

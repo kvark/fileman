@@ -309,8 +309,17 @@ pub fn draw_panel(
                                             std::time::Duration::from_millis(200),
                                         );
                                         let t = ui.ctx().input(|i| i.time);
-                                        let spinner =
-                                            ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
+                                        // Use braille dots — all the same width in mono fonts
+                                        let spinner = [
+                                            "\u{2840}", // ⡀
+                                            "\u{2804}", // ⠄
+                                            "\u{2802}", // ⠂
+                                            "\u{2801}", // ⠁
+                                            "\u{2808}", // ⠈
+                                            "\u{2810}", // ⠐
+                                            "\u{2820}", // ⠠
+                                            "\u{2880}", // ⢀
+                                        ][((t * 6.0) as usize) % 8];
                                         job.append(
                                             spinner,
                                             0.0,
@@ -324,7 +333,7 @@ pub fn draw_panel(
                                             " ",
                                             0.0,
                                             egui::text::TextFormat {
-                                                font_id: header_font.clone(),
+                                                font_id: mono_font.clone(),
                                                 color: header_color,
                                                 ..Default::default()
                                             },

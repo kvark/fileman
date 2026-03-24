@@ -251,6 +251,19 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                                 },
                                             )
                                         }
+                                        core::ImageLocation::Remote { host, path } => {
+                                            let key = format!("sftp://{host}{path}");
+                                            (
+                                                key.clone(),
+                                                ImageRequest {
+                                                    key,
+                                                    source: ImageSource::Remote {
+                                                        host: host.clone(),
+                                                        path: path.clone(),
+                                                    },
+                                                },
+                                            )
+                                        }
                                     };
                                     if let Some(message) = image_cache.failures.get(&key) {
                                         ui.colored_label(
