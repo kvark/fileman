@@ -33,8 +33,28 @@ pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
                 eprintln!("{err}");
             }
         }
-        core::EntryLocation::Remote { .. } => {
-            // External open not supported for remote files
+        core::EntryLocation::Remote { host, path } => {
+            if entry.is_dir || entry.name == ".." {
+                return;
+            }
+            let name = path.rsplit('/').next().unwrap_or(&entry.name).to_string();
+            let tmp_dir = std::env::temp_dir().join("fileman_extract");
+            if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+                eprintln!("Failed to create temp dir: {e}");
+                return;
+            }
+            let local_path = tmp_dir.join(&name);
+            if let Some(session) = app.sftp_sessions.get(&host) {
+                let locked = session.lock().unwrap();
+                match fileman::sftp::copy_remote_to_local(&locked.sftp, &path, &local_path) {
+                    Ok(()) => {
+                        if let Err(err) = open_with_default_app(&local_path) {
+                            eprintln!("{err}");
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to download remote file: {e}"),
+                }
+            }
         }
         core::EntryLocation::Container {
             kind,

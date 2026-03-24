@@ -267,6 +267,24 @@ pub fn read_directory_streaming(
     Ok(())
 }
 
+/// Read an entire remote file into memory.
+pub fn read_file_full(sftp: &Sftp, path: &str) -> Result<Vec<u8>, String> {
+    let mut file = sftp
+        .open(Path::new(path))
+        .map_err(|e| format!("open {path}: {e}"))?;
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("read {path}: {e}")),
+        }
+    }
+    Ok(buf)
+}
+
 /// Read a prefix of a remote file for preview purposes.
 pub fn read_bytes_prefix(sftp: &Sftp, path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
     let mut file = sftp

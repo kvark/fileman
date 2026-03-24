@@ -1138,7 +1138,14 @@ impl AppState {
                 });
             }
             EntryLocation::Remote { host, path } => {
-                // No image preview for remote files (would need download first)
+                if is_image_name(&path) {
+                    preview.content = Some(PreviewContent::Image(ImageLocation::Remote {
+                        host: host.clone(),
+                        path: path.clone(),
+                    }));
+                    preview.loading_since = None;
+                    return;
+                }
                 let max_bytes = if is_text_name(&path) {
                     Some(64 * 1024)
                 } else {
