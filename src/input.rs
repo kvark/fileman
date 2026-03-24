@@ -388,7 +388,7 @@ pub(crate) fn handle_keyboard(
         ctx.request_repaint();
         return;
     }
-    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G)) {
+    if ctrl_g {
         app.open_quick_jump();
         ctx.request_repaint();
         return;
@@ -626,7 +626,7 @@ pub(crate) fn handle_keyboard(
         open_search(app, core::SearchMode::Content);
     }
     let alt_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::F7));
-    if alt_f7 || ctrl_g {
+    if alt_f7 {
         open_search(app, core::SearchMode::Name);
     }
     if input.key_pressed(egui::Key::Enter) {
@@ -716,6 +716,8 @@ pub(crate) fn handle_keyboard(
         {
             preview.find_open = true;
             preview.find_focus = true;
+        } else {
+            open_search(app, core::SearchMode::Name);
         }
         ctx.request_repaint();
     }
@@ -937,12 +939,54 @@ pub(crate) fn confirm_pending_op(app: &mut app_state::AppState) {
         }
         app.enqueue_pending_op(&op);
         match op {
-            app_state::PendingOp::Copy { .. }
-            | app_state::PendingOp::Move { .. }
-            | app_state::PendingOp::Rename { .. } => refresh_fs_panels(app),
-            app_state::PendingOp::Delete { .. } => refresh_active_panel(app),
+            app_state::PendingOp::Copy { .. } => {
+                // Only refresh the destination (other) panel — source is unchanged
+                let dst = match app.active_panel {
+                    core::ActivePanel::Left => core::ActivePanel::Right,
+                    core::ActivePanel::Right => core::ActivePanel::Left,
+                };
+                crate::reload_panel(app, dst);
+            }
+            app_state::PendingOp::Move { .. } => {
+                // Store next-neighbor name so cursor stays near the moved item
+                store_neighbor_selection(app);
+                refresh_fs_panels(app);
+            }
+            app_state::PendingOp::Rename { .. } => refresh_fs_panels(app),
+            app_state::PendingOp::Delete { .. } => {
+                store_neighbor_selection(app);
+                refresh_active_panel(app);
+            }
             app_state::PendingOp::Pack { .. } => refresh_active_panel(app),
         }
+    }
+}
+
+/// Store the neighboring entry name so the cursor lands nearby after a
+/// destructive operation (move/delete) removes the current selection.
+fn store_neighbor_selection(app: &mut app_state::AppState) {
+    let panel = app.get_active_panel();
+    let browser = panel.browser();
+    if browser.entries.is_empty() {
+        return;
+    }
+    let idx = browser.selected_index;
+    // Prefer the next entry, fall back to the previous one
+    let neighbor = browser
+        .entries
+        .get(idx + 1)
+        .or_else(|| {
+            if idx > 0 {
+                browser.entries.get(idx - 1)
+            } else {
+                None
+            }
+        })
+        .filter(|e| e.name != "..")
+        .map(|e| e.name.clone());
+    if let Some(name) = neighbor {
+        let dir = browser.current_path.clone();
+        app.fs_last_selected_name.insert(dir, name);
     }
 }
 

@@ -25,6 +25,8 @@ const PREVIEW_CHUNK_BYTES: usize = 16 * 1024;
 
 pub fn start_io_worker(
     sftp_sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SftpSession>>>>>,
+    transfer_progress: Arc<crate::core::TransferProgress>,
+    wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) -> (
     mpsc::Sender<IOTask>,
     mpsc::Receiver<IOResult>,
@@ -185,10 +187,11 @@ pub fn start_io_worker(
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
                         let locked = session.lock().unwrap();
                         let local_path = dst_dir.join(&name);
-                        if let Err(e) = crate::sftp::copy_remote_to_local(
+                        if let Err(e) = crate::sftp::copy_remote_to_local_progress(
                             &locked.sftp,
                             &remote_path,
                             &local_path,
+                            Some(&transfer_progress),
                         ) {
                             eprintln!("Remote-to-local copy error: {e}");
                         }
@@ -208,9 +211,12 @@ pub fn start_io_worker(
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| "file".to_string());
                         let remote_path = format!("{remote_dir}/{name}");
-                        if let Err(e) =
-                            crate::sftp::copy_local_to_remote(&locked.sftp, &src, &remote_path)
-                        {
+                        if let Err(e) = crate::sftp::copy_local_to_remote_progress(
+                            &locked.sftp,
+                            &src,
+                            &remote_path,
+                            Some(&transfer_progress),
+                        ) {
                             eprintln!("Local-to-remote copy error: {e}");
                         }
                     } else {
@@ -264,6 +270,9 @@ pub fn start_io_worker(
                 }
             }
             let _ = result_tx.send(IOResult::Completed);
+            if let Some(ref wake) = wake {
+                wake();
+            }
         }
     });
     (tx, result_rx, cancel_tx)
@@ -299,6 +308,7 @@ fn apply_props_recursive(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io:
 pub fn start_preview_worker(
     wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     sftp_sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SftpSession>>>>>,
+    transfer_progress: Arc<crate::core::TransferProgress>,
 ) -> (
     mpsc::Sender<PreviewRequest>,
     mpsc::Receiver<(u64, PreviewContent)>,
@@ -322,6 +332,7 @@ pub fn start_preview_worker(
                 } => {
                     let result_tx = result_tx.clone();
                     let sftp_sessions = sftp_sessions.clone();
+                    let progress = transfer_progress.clone();
                     thread::spawn(move || match location {
                         EntryLocation::Fs(path) => {
                             let force_text = is_text_path(&path);
@@ -336,6 +347,7 @@ pub fn start_preview_worker(
                                     max_bytes,
                                     force_text,
                                     wake.as_ref(),
+                                    None,
                                 ) {
                                     let _ = result_tx.send((
                                         id,
@@ -365,6 +377,7 @@ pub fn start_preview_worker(
                                 max_bytes,
                                 force_text,
                                 wake.as_ref(),
+                                Some(&progress),
                             ) {
                                 let _ = result_tx.send((
                                     id,
@@ -389,6 +402,7 @@ pub fn start_preview_worker(
                                             max_bytes,
                                             force_text,
                                             wake.as_ref(),
+                                            Some(&progress),
                                         ) {
                                             let _ = result_tx.send((
                                                 id,
@@ -466,6 +480,7 @@ fn is_preview_current(current_id: &std::sync::atomic::AtomicU64, id: u64) -> boo
     current_id.load(std::sync::atomic::Ordering::Relaxed) == id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_streaming_preview<R: Read>(
     tx: &mpsc::Sender<(u64, PreviewContent)>,
     current_id: &std::sync::atomic::AtomicU64,
@@ -474,6 +489,7 @@ fn send_streaming_preview<R: Read>(
     max_bytes: Option<usize>,
     force_text: bool,
     wake: Option<&std::sync::Arc<dyn Fn() + Send + Sync>>,
+    progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), std::io::Error> {
     let mut remaining = max_bytes.unwrap_or(usize::MAX);
     let mut buf = vec![0u8; PREVIEW_CHUNK_BYTES];
@@ -491,6 +507,9 @@ fn send_streaming_preview<R: Read>(
             break;
         }
         remaining = remaining.saturating_sub(read);
+        if let Some(p) = progress {
+            p.add(read as u64);
+        }
         let chunk = &buf[..read];
         if !decided {
             is_text = is_probably_text(chunk);
@@ -539,9 +558,14 @@ fn stream_container_preview(
     max_bytes: Option<usize>,
     force_text: bool,
     wake: Option<&std::sync::Arc<dyn Fn() + Send + Sync>>,
+    progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
     let normalized = inner_path.trim_start_matches('/');
     let file = File::open(archive_path).map_err(|e| e.to_string())?;
+    if let Some(p) = progress {
+        let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+        p.reset(total);
+    }
     match kind {
         crate::core::ContainerKind::Zip => {
             let reader = std::io::BufReader::new(file);
@@ -553,7 +577,7 @@ fn stream_container_preview(
                 let entry = zip.by_index(i).map_err(|e| e.to_string())?;
                 if entry.name() == normalized {
                     return send_streaming_preview(
-                        tx, current_id, id, entry, max_bytes, force_text, wake,
+                        tx, current_id, id, entry, max_bytes, force_text, wake, progress,
                     )
                     .map_err(|e| e.to_string());
                 }
@@ -571,7 +595,7 @@ fn stream_container_preview(
                 let name = crate::core::normalize_archive_path(&path);
                 if name == normalized {
                     return send_streaming_preview(
-                        tx, current_id, id, &mut entry, max_bytes, force_text, wake,
+                        tx, current_id, id, &mut entry, max_bytes, force_text, wake, progress,
                     )
                     .map_err(|e| e.to_string());
                 }
@@ -590,7 +614,7 @@ fn stream_container_preview(
                 let name = crate::core::normalize_archive_path(&path);
                 if name == normalized {
                     return send_streaming_preview(
-                        tx, current_id, id, &mut entry, max_bytes, force_text, wake,
+                        tx, current_id, id, &mut entry, max_bytes, force_text, wake, progress,
                     )
                     .map_err(|e| e.to_string());
                 }
@@ -609,7 +633,7 @@ fn stream_container_preview(
                 let name = crate::core::normalize_archive_path(&path);
                 if name == normalized {
                     return send_streaming_preview(
-                        tx, current_id, id, &mut entry, max_bytes, force_text, wake,
+                        tx, current_id, id, &mut entry, max_bytes, force_text, wake, progress,
                     )
                     .map_err(|e| e.to_string());
                 }

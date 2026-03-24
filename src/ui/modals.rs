@@ -120,7 +120,19 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
             };
             ui.colored_label(color32(colors.row_fg_active), label);
             ui.add_space(8.0);
-            ui.add(egui::ProgressBar::new(0.0).animate(false));
+            let (done, total) = app.transfer_progress.snapshot();
+            if total > 0 {
+                let fraction = (done as f32 / total as f32).clamp(0.0, 1.0);
+                let done_fmt = fileman::core::format_size(done);
+                let total_fmt = fileman::core::format_size(total);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .text(format!("{done_fmt} / {total_fmt}"))
+                        .animate(false),
+                );
+            } else {
+                ui.add(egui::ProgressBar::new(0.0).animate(true));
+            }
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
             ui.add_space(6.0);
             ui.colored_label(color32(colors.row_fg_inactive), "Esc: cancel");
@@ -183,38 +195,35 @@ pub fn draw_discard_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
 
 fn pending_op_text(op: &app_state::PendingOp) -> (&'static str, String) {
     match op {
-        app_state::PendingOp::Copy { items, dst_dir } => {
+        app_state::PendingOp::Copy { items, dst } => {
+            let dst_display = match dst {
+                app_state::CopyDest::Local(dir) => dir.to_string_lossy().into_owned(),
+                app_state::CopyDest::Remote { host, path } => format!("{host}:{path}"),
+            };
             let body = if items.len() == 1 {
                 format!(
                     "Copy \"{}\" to\n{}?",
                     items[0].src.display_name(),
-                    dst_dir.to_string_lossy()
+                    dst_display
                 )
             } else {
-                format!(
-                    "Copy {} items to\n{}?",
-                    items.len(),
-                    dst_dir.to_string_lossy()
-                )
+                format!("Copy {} items to\n{}?", items.len(), dst_display)
             };
             ("Confirm Copy", body)
         }
-        app_state::PendingOp::Move { sources, dst_dir } => {
-            let body = if sources.len() == 1 {
+        app_state::PendingOp::Move { items, dst } => {
+            let dst_display = match dst {
+                app_state::CopyDest::Local(dir) => dir.to_string_lossy().into_owned(),
+                app_state::CopyDest::Remote { host, path } => format!("{host}:{path}"),
+            };
+            let body = if items.len() == 1 {
                 format!(
                     "Move \"{}\" to\n{}?",
-                    sources[0]
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("<unknown>"),
-                    dst_dir.to_string_lossy()
+                    items[0].src.display_name(),
+                    dst_display
                 )
             } else {
-                format!(
-                    "Move {} items to\n{}?",
-                    sources.len(),
-                    dst_dir.to_string_lossy()
-                )
+                format!("Move {} items to\n{}?", items.len(), dst_display)
             };
             ("Confirm Move", body)
         }

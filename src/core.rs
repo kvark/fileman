@@ -2,9 +2,46 @@ use std::{
     fs,
     io::{self, Read},
     path::{self, Path},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::UNIX_EPOCH,
 };
+
+/// Shared transfer progress, updated atomically by worker threads and read by
+/// the UI. One instance lives in AppState behind an Arc.
+pub struct TransferProgress {
+    /// Bytes transferred so far.
+    pub bytes_done: AtomicU64,
+    /// Total bytes expected (0 = unknown).
+    pub bytes_total: AtomicU64,
+}
+
+impl TransferProgress {
+    pub fn new() -> Self {
+        Self {
+            bytes_done: AtomicU64::new(0),
+            bytes_total: AtomicU64::new(0),
+        }
+    }
+
+    pub fn reset(&self, total: u64) {
+        self.bytes_done.store(0, Ordering::Relaxed);
+        self.bytes_total.store(total, Ordering::Relaxed);
+    }
+
+    pub fn add(&self, n: u64) {
+        self.bytes_done.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.bytes_done.load(Ordering::Relaxed),
+            self.bytes_total.load(Ordering::Relaxed),
+        )
+    }
+}
 
 pub use crate::archive::{
     ContainerKind, container_display_path, container_kind_from_path, copy_container_dir,

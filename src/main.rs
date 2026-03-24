@@ -2405,13 +2405,24 @@ fn refresh_active_panel(app: &mut app_state::AppState) {
     let which = app.active_panel;
     let panel = app.panel(which);
     let browser = panel.browser();
+    let current_path = browser.current_path.clone();
+    // Use stored neighbor name (from delete/move), or fall back to current selection
+    let prefer_name = app
+        .fs_last_selected_name
+        .get(&current_path)
+        .cloned()
+        .or_else(|| {
+            browser
+                .entries
+                .get(browser.selected_index)
+                .map(|e| e.name.clone())
+        });
     match browser.browser_mode.clone() {
         core::BrowserMode::Fs => {
-            let path = browser.current_path.clone();
-            load_fs_directory_async(app, path, which, None);
+            load_fs_directory_async(app, current_path, which, prefer_name);
         }
         core::BrowserMode::Remote { ref host, ref path } => {
-            load_sftp_directory_async(app, host, path, which, None);
+            load_sftp_directory_async(app, host, path, which, prefer_name);
         }
         _ => {}
     }
@@ -2420,20 +2431,15 @@ fn refresh_active_panel(app: &mut app_state::AppState) {
 fn refresh_fs_panels(app: &mut app_state::AppState) {
     for which in [core::ActivePanel::Left, core::ActivePanel::Right] {
         let browser = app.panel(which).browser();
+        if !matches!(browser.browser_mode, core::BrowserMode::Fs) {
+            continue;
+        }
+        let path = browser.current_path.clone();
         let current_name = browser
             .entries
             .get(browser.selected_index)
             .map(|e| e.name.clone());
-        match browser.browser_mode.clone() {
-            core::BrowserMode::Fs => {
-                let path = browser.current_path.clone();
-                load_fs_directory_async(app, path, which, current_name);
-            }
-            core::BrowserMode::Remote { host, path } => {
-                load_sftp_directory_async(app, &host, &path, which, current_name);
-            }
-            _ => {}
-        }
+        load_fs_directory_async(app, path, which, current_name);
     }
 }
 
@@ -2738,7 +2744,17 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let sftp_sessions_shared: Arc<
             std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<fileman::sftp::SftpSession>>>>,
         > = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(sftp_sessions_shared.clone());
+        let transfer_progress = Arc::new(core::TransferProgress::new());
+        let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(
+            sftp_sessions_shared.clone(),
+            transfer_progress.clone(),
+            Some(Arc::new({
+                let proxy = self.proxy.clone();
+                move || {
+                    let _ = proxy.send_event(UserEvent::Wake);
+                }
+            })),
+        );
         let (preview_tx, preview_rx) = workers::start_preview_worker(
             Some(Arc::new({
                 let proxy = self.proxy.clone();
@@ -2747,6 +2763,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 }
             })),
             sftp_sessions_shared.clone(),
+            transfer_progress.clone(),
         );
         let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker();
         let (search_tx, search_rx) = workers::start_search_worker();
@@ -2788,6 +2805,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         // then forwards to the full-decode thread for tier 3.
         let proxy = self.proxy.clone();
         let image_sftp = sftp_sessions_shared.clone();
+        let image_progress = transfer_progress.clone();
         thread::spawn(move || {
             while let Ok(mut req) = image_req_rx.recv() {
                 // Skip stale requests
@@ -2812,7 +2830,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         let session = image_sftp.lock().unwrap().get(host).cloned();
                         session.and_then(|s| {
                             let locked = s.lock().unwrap();
-                            fileman::sftp::read_file_full(&locked.sftp, path).ok()
+                            fileman::sftp::read_file_full_progress(
+                                &locked.sftp,
+                                path,
+                                Some(&image_progress),
+                            )
+                            .ok()
                         })
                     }
                 };
@@ -3013,6 +3036,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             io_cancel_tx,
             io_in_flight: 0,
             io_cancel_requested: false,
+            transfer_progress: transfer_progress.clone(),
             dir_size_tx,
             dir_size_rx,
             dir_sizes: Default::default(),
@@ -3154,6 +3178,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
         match event {
             winit::event::WindowEvent::RedrawRequested => {
+                let transfer_progress = runtime.app.transfer_progress.clone();
                 let mut highlight_updated = false;
                 let mut completed = 0usize;
                 while runtime.app.io_rx.try_recv().is_ok() {
@@ -3355,6 +3380,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                             highlight_cache: &runtime.highlight_cache,
                                             highlight_pending: &mut runtime.highlight_pending,
                                             highlight_req_tx: &runtime.highlight_req_tx,
+                                            transfer_progress: &transfer_progress,
                                             min_height: rect.height(),
                                         },
                                     );
@@ -3424,6 +3450,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                             highlight_cache: &runtime.highlight_cache,
                                             highlight_pending: &mut runtime.highlight_pending,
                                             highlight_req_tx: &runtime.highlight_req_tx,
+                                            transfer_progress: &transfer_progress,
                                             min_height: rect.height(),
                                         },
                                     );
@@ -3760,6 +3787,7 @@ fn draw_root_ui(render: UiRender<'_>) {
         highlight_pending,
         highlight_req_tx,
     } = render;
+    let transfer_progress = app.transfer_progress.clone();
     app.refresh_tick = app.refresh_tick.wrapping_add(1);
     apply_theme(ctx, &app.theme.colors());
     ui::command_bar::draw_command_bar(ctx, app, &app.theme.colors());
@@ -3811,6 +3839,7 @@ fn draw_root_ui(render: UiRender<'_>) {
                                 highlight_cache,
                                 highlight_pending,
                                 highlight_req_tx,
+                                transfer_progress: &transfer_progress,
                                 min_height: rect.height(),
                             },
                         );
@@ -3872,6 +3901,7 @@ fn draw_root_ui(render: UiRender<'_>) {
                                 highlight_cache,
                                 highlight_pending,
                                 highlight_req_tx,
+                                transfer_progress: &transfer_progress,
                                 min_height: rect.height(),
                             },
                         );

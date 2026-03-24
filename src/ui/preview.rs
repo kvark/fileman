@@ -18,6 +18,7 @@ pub struct PreviewRender<'a> {
     pub highlight_cache: &'a HashMap<String, egui::text::LayoutJob>,
     pub highlight_pending: &'a mut HashSet<String>,
     pub highlight_req_tx: &'a mpsc::Sender<HighlightRequest>,
+    pub transfer_progress: &'a fileman::core::TransferProgress,
     pub min_height: f32,
 }
 
@@ -31,6 +32,7 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
         highlight_cache,
         highlight_pending,
         highlight_req_tx,
+        transfer_progress,
         min_height,
     } = ctx;
     let colors = theme.colors();
@@ -454,8 +456,10 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                             let _ = image_req_tx.send(request);
                                         }
                                         let t = ui.ctx().input(|i| i.time);
-                                        let spinner =
-                                            ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
+                                        let spinner = [
+                                            "\u{2840}", "\u{2804}", "\u{2802}", "\u{2801}",
+                                            "\u{2808}", "\u{2810}", "\u{2820}", "\u{2880}",
+                                        ][((t * 6.0) as usize) % 8];
                                         let mono = egui::TextStyle::Monospace.resolve(ui.style());
                                         let body = egui::TextStyle::Body.resolve(ui.style());
                                         let mut job = egui::text::LayoutJob::default();
@@ -470,11 +474,17 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                             ..Default::default()
                                         };
                                         job.append(spinner, 0.0, fmt_mono);
-                                        job.append(
-                                            &format!(" Loading image...\n{}", key),
-                                            0.0,
-                                            fmt_body,
-                                        );
+                                        let (done, total) = transfer_progress.snapshot();
+                                        let progress_str = if total > 0 {
+                                            let done_fmt = fileman::core::format_size(done);
+                                            let total_fmt = fileman::core::format_size(total);
+                                            format!(
+                                                " Loading image ({done_fmt}/{total_fmt})...\n{key}"
+                                            )
+                                        } else {
+                                            format!(" Loading image...\n{key}")
+                                        };
+                                        job.append(&progress_str, 0.0, fmt_body);
                                         ui.label(job);
                                         ui.ctx().request_repaint_after(
                                             std::time::Duration::from_millis(333),
@@ -484,8 +494,10 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                 None => {
                                     if preview.loading_since.is_some() {
                                         let t = ui.ctx().input(|i| i.time);
-                                        let spinner =
-                                            ["|", "/", "-", "\\"][((t * 3.0) as usize) % 4];
+                                        let spinner = [
+                                            "\u{2840}", "\u{2804}", "\u{2802}", "\u{2801}",
+                                            "\u{2808}", "\u{2810}", "\u{2820}", "\u{2880}",
+                                        ][((t * 6.0) as usize) % 8];
                                         let mono = egui::TextStyle::Monospace.resolve(ui.style());
                                         let body = egui::TextStyle::Body.resolve(ui.style());
                                         let mut job = egui::text::LayoutJob::default();
