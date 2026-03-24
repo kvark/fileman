@@ -310,6 +310,8 @@ pub struct AppState {
     pub io_cancel_tx: mpsc::Sender<()>,
     pub io_in_flight: usize,
     pub io_cancel_requested: bool,
+    /// Shared transfer progress for IO/preview/edit workers.
+    pub transfer_progress: Arc<crate::core::TransferProgress>,
     pub dir_size_tx: mpsc::Sender<path::PathBuf>,
     pub dir_size_rx: mpsc::Receiver<(path::PathBuf, u64)>,
     pub dir_sizes: HashMap<path::PathBuf, u64>,
@@ -364,14 +366,20 @@ pub struct CopyItem {
 }
 
 #[derive(Clone)]
+pub enum CopyDest {
+    Local(path::PathBuf),
+    Remote { host: String, path: String },
+}
+
+#[derive(Clone)]
 pub enum PendingOp {
     Copy {
         items: Vec<CopyItem>,
-        dst_dir: path::PathBuf,
+        dst: CopyDest,
     },
     Move {
-        sources: Vec<path::PathBuf>,
-        dst_dir: path::PathBuf,
+        items: Vec<CopyItem>,
+        dst: CopyDest,
     },
     Delete {
         targets: Vec<path::PathBuf>,
@@ -1343,57 +1351,111 @@ impl AppState {
         }
     }
 
+    // This rule is misfiring when coupled with "pattern_type_mismatch"
+    #[allow(clippy::needless_borrowed_reference)]
     pub fn enqueue_pending_op(&mut self, op: &PendingOp) {
         match *op {
-            PendingOp::Copy {
-                ref items,
-                ref dst_dir,
-            } => {
+            PendingOp::Copy { ref items, ref dst } => {
                 for item in items {
-                    let task = match item.src {
-                        EntryLocation::Fs(ref path) => IOTask::Copy {
-                            src: path.clone(),
-                            dst_dir: dst_dir.clone(),
-                        },
-                        EntryLocation::Container {
-                            kind: container_kind,
-                            ref archive_path,
-                            ref inner_path,
-                        } => match item.kind {
+                    let task = match (&item.src, dst) {
+                        // Local → Local
+                        (&EntryLocation::Fs(ref src), &CopyDest::Local(ref dst_dir)) => {
+                            IOTask::Copy {
+                                src: src.clone(),
+                                dst_dir: dst_dir.clone(),
+                            }
+                        }
+                        // Local → Remote
+                        (&EntryLocation::Fs(ref src), &CopyDest::Remote { ref host, ref path }) => {
+                            IOTask::CopyLocalToRemote {
+                                src: src.clone(),
+                                host: host.clone(),
+                                remote_dir: path.clone(),
+                            }
+                        }
+                        // Container → Local
+                        (
+                            &EntryLocation::Container {
+                                ref kind,
+                                ref archive_path,
+                                ref inner_path,
+                            },
+                            &CopyDest::Local(ref dst_dir),
+                        ) => match item.kind {
                             CopyKind::File => IOTask::CopyContainer {
-                                kind: container_kind,
+                                kind: *kind,
                                 archive_path: archive_path.clone(),
                                 inner_path: inner_path.clone(),
                                 dst_dir: dst_dir.clone(),
                                 display_name: item.src.display_name(),
                             },
                             CopyKind::Directory => IOTask::CopyContainerDir {
-                                kind: container_kind,
+                                kind: *kind,
                                 archive_path: archive_path.clone(),
                                 inner_path: inner_path.clone(),
                                 dst_dir: dst_dir.clone(),
                                 display_name: item.src.display_name(),
                             },
                         },
-                        EntryLocation::Remote { ref host, ref path } => IOTask::CopyRemoteToLocal {
+                        // Remote → Local
+                        (
+                            &EntryLocation::Remote { ref host, ref path },
+                            &CopyDest::Local(ref dst_dir),
+                        ) => IOTask::CopyRemoteToLocal {
                             host: host.clone(),
                             remote_path: path.clone(),
                             dst_dir: dst_dir.clone(),
                             name: item.src.display_name(),
                         },
+                        // Remote → Remote: not supported yet
+                        (&EntryLocation::Remote { .. }, &CopyDest::Remote { .. }) => continue,
+                        // Container → Remote: not supported yet
+                        (&EntryLocation::Container { .. }, &CopyDest::Remote { .. }) => continue,
                     };
                     self.enqueue_io(task);
                 }
             }
-            PendingOp::Move {
-                ref sources,
-                ref dst_dir,
-            } => {
-                for src in sources {
-                    self.enqueue_io(IOTask::Move {
-                        src: src.clone(),
-                        dst_dir: dst_dir.clone(),
-                    });
+            PendingOp::Move { ref items, ref dst } => {
+                for item in items {
+                    match (&item.src, dst) {
+                        // Local → Local: native rename/move
+                        (&EntryLocation::Fs(ref src), &CopyDest::Local(ref dst_dir)) => {
+                            self.enqueue_io(IOTask::Move {
+                                src: src.clone(),
+                                dst_dir: dst_dir.clone(),
+                            });
+                        }
+                        // Local → Remote: copy + delete local
+                        (&EntryLocation::Fs(ref src), &CopyDest::Remote { ref host, ref path }) => {
+                            self.enqueue_io(IOTask::CopyLocalToRemote {
+                                src: src.clone(),
+                                host: host.clone(),
+                                remote_dir: path.clone(),
+                            });
+                            self.enqueue_io(IOTask::Delete {
+                                target: src.clone(),
+                            });
+                        }
+                        // Remote → Local: copy + delete remote
+                        (
+                            &EntryLocation::Remote { ref host, ref path },
+                            &CopyDest::Local(ref dst_dir),
+                        ) => {
+                            self.enqueue_io(IOTask::CopyRemoteToLocal {
+                                host: host.clone(),
+                                remote_path: path.clone(),
+                                dst_dir: dst_dir.clone(),
+                                name: item.src.display_name(),
+                            });
+                            self.enqueue_io(IOTask::DeleteRemote {
+                                host: host.clone(),
+                                path: path.clone(),
+                                is_dir: item.kind == CopyKind::Directory,
+                            });
+                        }
+                        // Remote → Remote / Container: not supported
+                        _ => {}
+                    }
                 }
             }
             PendingOp::Delete { ref targets } => {
@@ -1499,13 +1561,17 @@ impl AppState {
         }
     }
 
-    fn other_panel_fs_dir(&self) -> Option<path::PathBuf> {
+    fn other_panel_copy_dest(&self) -> Option<CopyDest> {
         let other = match self.active_panel {
             ActivePanel::Left => &self.right_panel,
             ActivePanel::Right => &self.left_panel,
         };
         match other.browser().browser_mode {
-            BrowserMode::Fs => Some(other.browser().current_path.clone()),
+            BrowserMode::Fs => Some(CopyDest::Local(other.browser().current_path.clone())),
+            BrowserMode::Remote { ref host, ref path } => Some(CopyDest::Remote {
+                host: host.clone(),
+                path: path.clone(),
+            }),
             _ => None,
         }
     }
@@ -1515,7 +1581,7 @@ impl AppState {
         if indices.is_empty() {
             return None;
         }
-        let dst_dir = self.other_panel_fs_dir()?;
+        let dst = self.other_panel_copy_dest()?;
         let browser = self.get_active_panel().browser();
         let items: Vec<CopyItem> = indices
             .iter()
@@ -1531,7 +1597,7 @@ impl AppState {
                 }
             })
             .collect();
-        Some(PendingOp::Copy { items, dst_dir })
+        Some(PendingOp::Copy { items, dst })
     }
 
     fn build_move_op(&self) -> Option<PendingOp> {
@@ -1539,19 +1605,29 @@ impl AppState {
         if indices.is_empty() {
             return None;
         }
-        let dst_dir = self.other_panel_fs_dir()?;
+        let dst = self.other_panel_copy_dest()?;
         let browser = self.get_active_panel().browser();
-        let sources: Vec<path::PathBuf> = indices
+        let items: Vec<CopyItem> = indices
             .iter()
-            .filter_map(|&i| match browser.entries[i].location {
-                EntryLocation::Fs(ref path) => Some(path.clone()),
-                EntryLocation::Container { .. } | EntryLocation::Remote { .. } => None,
+            .filter_map(|&i| {
+                let entry = &browser.entries[i];
+                match entry.location {
+                    EntryLocation::Fs(_) | EntryLocation::Remote { .. } => Some(CopyItem {
+                        src: entry.location.clone(),
+                        kind: if entry.is_dir {
+                            CopyKind::Directory
+                        } else {
+                            CopyKind::File
+                        },
+                    }),
+                    EntryLocation::Container { .. } => None,
+                }
             })
             .collect();
-        if sources.is_empty() {
+        if items.is_empty() {
             return None;
         }
-        Some(PendingOp::Move { sources, dst_dir })
+        Some(PendingOp::Move { items, dst })
     }
 
     fn build_delete_op(&self) -> Option<PendingOp> {

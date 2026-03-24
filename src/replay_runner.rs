@@ -276,9 +276,17 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
             >,
         >,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(sftp_sessions_shared.clone());
-    let (preview_tx, preview_rx) =
-        workers::start_preview_worker(None, sftp_sessions_shared.clone());
+    let transfer_progress = std::sync::Arc::new(core::TransferProgress::new());
+    let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(
+        sftp_sessions_shared.clone(),
+        transfer_progress.clone(),
+        None,
+    );
+    let (preview_tx, preview_rx) = workers::start_preview_worker(
+        None,
+        sftp_sessions_shared.clone(),
+        transfer_progress.clone(),
+    );
     let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker();
     let (search_tx, search_rx) = workers::start_search_worker();
     let (edit_tx, edit_rx) = mpsc::channel::<core::EditLoadRequest>();
@@ -366,6 +374,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         io_cancel_tx,
         io_in_flight: 0,
         io_cancel_requested: false,
+        transfer_progress: transfer_progress.clone(),
         dir_size_tx,
         dir_size_rx,
         dir_sizes: Default::default(),

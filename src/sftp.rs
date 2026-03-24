@@ -267,8 +267,21 @@ pub fn read_directory_streaming(
     Ok(())
 }
 
-/// Read an entire remote file into memory.
+/// Read an entire remote file into memory, optionally reporting progress.
 pub fn read_file_full(sftp: &Sftp, path: &str) -> Result<Vec<u8>, String> {
+    read_file_full_progress(sftp, path, None)
+}
+
+/// Read an entire remote file into memory with progress reporting.
+pub fn read_file_full_progress(
+    sftp: &Sftp,
+    path: &str,
+    progress: Option<&crate::core::TransferProgress>,
+) -> Result<Vec<u8>, String> {
+    let stat = sftp.stat(Path::new(path)).ok();
+    if let Some(p) = progress {
+        p.reset(stat.and_then(|s| s.size).unwrap_or(0));
+    }
     let mut file = sftp
         .open(Path::new(path))
         .map_err(|e| format!("open {path}: {e}"))?;
@@ -277,7 +290,12 @@ pub fn read_file_full(sftp: &Sftp, path: &str) -> Result<Vec<u8>, String> {
     loop {
         match file.read(&mut chunk) {
             Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(p) = progress {
+                    p.add(n as u64);
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(format!("read {path}: {e}")),
         }
@@ -364,6 +382,19 @@ pub fn copy_remote_to_local(
     remote_path: &str,
     local_dst: &Path,
 ) -> Result<(), String> {
+    copy_remote_to_local_progress(sftp, remote_path, local_dst, None)
+}
+
+pub fn copy_remote_to_local_progress(
+    sftp: &Sftp,
+    remote_path: &str,
+    local_dst: &Path,
+    progress: Option<&crate::core::TransferProgress>,
+) -> Result<(), String> {
+    let stat = sftp.stat(Path::new(remote_path)).ok();
+    if let Some(p) = progress {
+        p.reset(stat.and_then(|s| s.size).unwrap_or(0));
+    }
     let mut remote_file = sftp
         .open(Path::new(remote_path))
         .map_err(|e| format!("open remote {remote_path}: {e}"))?;
@@ -377,6 +408,9 @@ pub fn copy_remote_to_local(
                 local_file
                     .write_all(&buf[..n])
                     .map_err(|e| format!("write local: {e}"))?;
+                if let Some(p) = progress {
+                    p.add(n as u64);
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(format!("read remote: {e}")),
@@ -391,6 +425,19 @@ pub fn copy_local_to_remote(
     local_src: &Path,
     remote_path: &str,
 ) -> Result<(), String> {
+    copy_local_to_remote_progress(sftp, local_src, remote_path, None)
+}
+
+pub fn copy_local_to_remote_progress(
+    sftp: &Sftp,
+    local_src: &Path,
+    remote_path: &str,
+    progress: Option<&crate::core::TransferProgress>,
+) -> Result<(), String> {
+    if let Some(p) = progress {
+        let size = std::fs::metadata(local_src).map(|m| m.len()).unwrap_or(0);
+        p.reset(size);
+    }
     let mut local_file = std::fs::File::open(local_src)
         .map_err(|e| format!("open local {}: {e}", local_src.display()))?;
     let mut remote_file = sftp
@@ -404,6 +451,9 @@ pub fn copy_local_to_remote(
                 remote_file
                     .write_all(&buf[..n])
                     .map_err(|e| format!("write remote: {e}"))?;
+                if let Some(p) = progress {
+                    p.add(n as u64);
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(format!("read local: {e}")),
