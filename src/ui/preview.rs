@@ -456,10 +456,8 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                             let _ = image_req_tx.send(request);
                                         }
                                         let t = ui.ctx().input(|i| i.time);
-                                        let spinner = [
-                                            "\u{2840}", "\u{2804}", "\u{2802}", "\u{2801}",
-                                            "\u{2808}", "\u{2810}", "\u{2820}", "\u{2880}",
-                                        ][((t * 6.0) as usize) % 8];
+                                        let spinner =
+                                            ["|", "/", "-", "\\"][((t * 6.0) as usize) % 4];
                                         let mono = egui::TextStyle::Monospace.resolve(ui.style());
                                         let body = egui::TextStyle::Body.resolve(ui.style());
                                         let mut job = egui::text::LayoutJob::default();
@@ -494,10 +492,8 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                 None => {
                                     if preview.loading_since.is_some() {
                                         let t = ui.ctx().input(|i| i.time);
-                                        let spinner = [
-                                            "\u{2840}", "\u{2804}", "\u{2802}", "\u{2801}",
-                                            "\u{2808}", "\u{2810}", "\u{2820}", "\u{2880}",
-                                        ][((t * 6.0) as usize) % 8];
+                                        let spinner =
+                                            ["|", "/", "-", "\\"][((t * 6.0) as usize) % 4];
                                         let mono = egui::TextStyle::Monospace.resolve(ui.style());
                                         let body = egui::TextStyle::Body.resolve(ui.style());
                                         let mut job = egui::text::LayoutJob::default();
