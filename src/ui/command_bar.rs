@@ -82,17 +82,7 @@ fn draw_refresh_indicator(
     app: &app_state::AppState,
     colors: &theme::ThemeColors,
 ) {
-    // Single-dot braille — same width in all monospace fonts
-    let spinner = [
-        "\u{2840}", // ⡀
-        "\u{2804}", // ⠄
-        "\u{2802}", // ⠂
-        "\u{2801}", // ⠁
-        "\u{2808}", // ⠈
-        "\u{2810}", // ⠐
-        "\u{2820}", // ⠠
-        "\u{2880}", // ⢀
-    ];
+    let spinner = ["|", "/", "-", "\\"];
     let symbol = spinner[(app.refresh_tick as usize) % spinner.len()];
     let text = egui::RichText::new(symbol)
         .monospace()

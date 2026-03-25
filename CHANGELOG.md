@@ -1,15 +1,17 @@
 # Changelog
 
-## 0.2.1 (TBD)
+## 0.3.0 (25 Mar 2026)
 
 ### Features
 - Remote browsing via built-in SFTP
 - New syntax: Makefile, Dockerfile, CSV, SVG
 - Defaulting to Ctrl+? schema on Apple devices
-- Quick navigation menu with Ctrl+G
+- Quick access menu with Ctrl+G
+- Cache contents of parent folders
 
 ### Fixes
 - Fix archive navigation
+- Avoid terminal in Windows
 
 ## 0.2.0 (19 Mar 2026)
 
