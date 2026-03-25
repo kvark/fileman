@@ -44,17 +44,12 @@ pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
                 return;
             }
             let local_path = tmp_dir.join(&name);
-            if let Some(session) = app.sftp_sessions.get(&host) {
-                let locked = session.lock().unwrap();
-                match fileman::sftp::copy_remote_to_local(&locked.sftp, &path, &local_path) {
-                    Ok(()) => {
-                        if let Err(err) = open_with_default_app(&local_path) {
-                            eprintln!("{err}");
-                        }
-                    }
-                    Err(e) => eprintln!("Failed to download remote file: {e}"),
-                }
-            }
+            let _ = app.io_tx.send(core::IOTask::CopyRemoteToLocalAndOpen {
+                host,
+                remote_path: path,
+                local_path,
+            });
+            app.io_in_flight = app.io_in_flight.saturating_add(1);
         }
         core::EntryLocation::Container {
             kind,
@@ -74,21 +69,14 @@ pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
                 eprintln!("Failed to create temp dir: {e}");
                 return;
             }
-            match archive::copy_container_entry(
+            let _ = app.io_tx.send(core::IOTask::CopyContainerAndOpen {
                 kind,
-                &archive_path,
-                &inner_path,
-                &tmp_dir,
-                &display_name,
-            ) {
-                Ok(()) => {
-                    let extracted = tmp_dir.join(&display_name);
-                    if let Err(err) = open_with_default_app(&extracted) {
-                        eprintln!("{err}");
-                    }
-                }
-                Err(e) => eprintln!("Failed to extract from archive: {e}"),
-            }
+                archive_path,
+                inner_path,
+                dst_dir: tmp_dir,
+                display_name,
+            });
+            app.io_in_flight = app.io_in_flight.saturating_add(1);
         }
     }
 }
@@ -299,9 +287,12 @@ pub(crate) fn handle_keyboard(
         ctx.request_repaint();
         return;
     }
-    if app.io_in_flight > 0 && input.key_pressed(egui::Key::Escape) {
-        app.request_io_cancel();
-        ctx.request_repaint();
+    // While IO is in flight (modal visible): only Escape is processed.
+    if app.io_in_flight > 0 {
+        if input.key_pressed(egui::Key::Escape) {
+            app.request_io_cancel();
+            ctx.request_repaint();
+        }
         return;
     }
     if app.error_message.is_some() {
@@ -400,6 +391,7 @@ pub(crate) fn handle_keyboard(
         let mut refresh_after = false;
         let mut save_payload: Option<(PathBuf, Vec<u8>)> = None;
         let mut close_editor = false;
+        let mut remote_size_update: Option<(String, String, u64)> = None;
         if edit.confirm_discard {
             if enter {
                 close_editor = true;
@@ -428,10 +420,12 @@ pub(crate) fn handle_keyboard(
                     if let Some(slash) = rest.find('/') {
                         let host = rest[..slash].to_string();
                         let remote_path = rest[slash..].to_string();
+                        let size = contents.len() as u64;
+                        remote_size_update = Some((host.clone(), remote_path.clone(), size));
                         save_payload = None; // Don't use the local write path
                         edit.dirty = false;
                         edit.confirm_discard = false;
-                        refresh_after = true;
+                        // Don't refresh the whole panel — just update file size in place
                         close_editor = true;
                         let _ = io_tx.send(core::IOTask::WriteRemoteFile {
                             host,
@@ -456,6 +450,21 @@ pub(crate) fn handle_keyboard(
                 let panel = app.panel_mut(app.active_panel);
                 panel.mode = app_state::PanelMode::Browser;
                 app.active_panel = return_focus;
+            }
+            if let Some((ref host, ref rpath, size)) = remote_size_update {
+                for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
+                    for entry in &mut app.panel_mut(side).browser_mut().entries {
+                        if let core::EntryLocation::Remote {
+                            host: ref h,
+                            path: ref p,
+                        } = entry.location
+                            && h == host
+                            && p == rpath
+                        {
+                            entry.size = Some(size);
+                        }
+                    }
+                }
             }
             if refresh_after {
                 refresh_active_panel(app);
@@ -1040,13 +1049,30 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
                 }
             }
             app_state::InlineEditKind::NewDir => {
-                let dir = browser.current_path.clone();
-                let path = dir.join(new_name);
-                action = Some(fileman::core::IOTask::Mkdir { path: path.clone() });
-                next_selection = Some((dir, new_name.to_string()));
-                if rename.index < browser.entries.len() {
-                    browser.entries[rename.index].name = new_name.to_string();
-                    browser.entries[rename.index].location = core::EntryLocation::Fs(path);
+                if let core::BrowserMode::Remote { ref host, ref path } = browser.browser_mode {
+                    let host = host.clone();
+                    let base_path = path.clone();
+                    let remote_path = format!("{}/{}", base_path.trim_end_matches('/'), new_name);
+                    if rename.index < browser.entries.len() {
+                        browser.entries[rename.index].name = new_name.to_string();
+                        browser.entries[rename.index].location = core::EntryLocation::Remote {
+                            host: host.clone(),
+                            path: remote_path.clone(),
+                        };
+                    }
+                    action = Some(fileman::core::IOTask::MkdirRemote {
+                        host,
+                        path: remote_path,
+                    });
+                } else {
+                    let dir = browser.current_path.clone();
+                    let path = dir.join(new_name);
+                    action = Some(fileman::core::IOTask::Mkdir { path: path.clone() });
+                    next_selection = Some((dir, new_name.to_string()));
+                    if rename.index < browser.entries.len() {
+                        browser.entries[rename.index].name = new_name.to_string();
+                        browser.entries[rename.index].location = core::EntryLocation::Fs(path);
+                    }
                 }
             }
             app_state::InlineEditKind::Rename => {

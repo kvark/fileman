@@ -13,6 +13,8 @@ use std::{
 
 use std::sync::{Arc, Mutex};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::core::{
     EntryLocation, IOResult, IOTask, PreviewContent, PreviewRequest, SearchCase, SearchEvent,
     SearchMode, SearchProgress, SearchRequest, SearchResult, copy_container_dir,
@@ -27,6 +29,7 @@ pub fn start_io_worker(
     sftp_sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SftpSession>>>>>,
     transfer_progress: Arc<crate::core::TransferProgress>,
     wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    cancel_flag: Arc<AtomicBool>,
 ) -> (
     mpsc::Sender<IOTask>,
     mpsc::Receiver<IOResult>,
@@ -40,6 +43,7 @@ pub fn start_io_worker(
         while let Ok(task) = rx.recv() {
             while cancel_rx.try_recv().is_ok() {
                 cancel_requested = true;
+                cancel_flag.store(true, Ordering::Relaxed);
             }
             if cancel_requested {
                 let _ = result_tx.send(IOResult::Completed);
@@ -47,8 +51,13 @@ pub fn start_io_worker(
                     let _ = result_tx.send(IOResult::Completed);
                 }
                 cancel_requested = false;
+                cancel_flag.store(false, Ordering::Relaxed);
                 continue;
             }
+            cancel_flag.store(false, Ordering::Relaxed);
+            transfer_progress.reset(0);
+            // Default: refresh local Fs panels. Remote/silent ops override below.
+            let mut io_result = IOResult::Completed;
             match task {
                 IOTask::Copy { src, dst_dir } => {
                     if let Err(e) = copy_recursively(&src, &dst_dir) {
@@ -169,7 +178,7 @@ pub fn start_io_worker(
                     path,
                     contents,
                 } => {
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         if let Err(e) = crate::sftp::write_file(&locked.sftp, &path, &contents) {
                             eprintln!("Remote write error: {e}");
@@ -177,54 +186,91 @@ pub fn start_io_worker(
                     } else {
                         eprintln!("No SFTP session for host: {host}");
                     }
+                    io_result = IOResult::CompletedRemote(host);
                 }
                 IOTask::CopyRemoteToLocal {
                     host,
                     remote_path,
                     dst_dir,
                     name,
+                    is_dir,
                 } => {
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
-                        let local_path = dst_dir.join(&name);
-                        if let Err(e) = crate::sftp::copy_remote_to_local_progress(
-                            &locked.sftp,
-                            &remote_path,
-                            &local_path,
-                            Some(&transfer_progress),
-                        ) {
+                        let result = if is_dir {
+                            let total =
+                                crate::sftp::count_bytes_via_exec(&locked.session, &remote_path);
+                            transfer_progress.reset(total);
+                            crate::sftp::copy_remote_dir_to_local_via_tar(
+                                &locked.session,
+                                &remote_path,
+                                &dst_dir,
+                                &name,
+                                &cancel_flag,
+                                Some(&transfer_progress),
+                            )
+                        } else {
+                            let local_path = dst_dir.join(&name);
+                            crate::sftp::copy_remote_to_local_progress(
+                                &locked.sftp,
+                                &remote_path,
+                                &local_path,
+                                Some(&transfer_progress),
+                            )
+                        };
+                        if let Err(e) = result
+                            && e != "Cancelled"
+                        {
                             eprintln!("Remote-to-local copy error: {e}");
                         }
                     } else {
                         eprintln!("No SFTP session for host: {host}");
                     }
+                    // io_result stays Completed: content was added to the local dst
                 }
                 IOTask::CopyLocalToRemote {
                     src,
                     host,
                     remote_dir,
+                    is_dir,
                 } => {
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
-                        let name = src
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "file".to_string());
-                        let remote_path = format!("{remote_dir}/{name}");
-                        if let Err(e) = crate::sftp::copy_local_to_remote_progress(
-                            &locked.sftp,
-                            &src,
-                            &remote_path,
-                            Some(&transfer_progress),
-                        ) {
+                        let result = if is_dir {
+                            let total = crate::sftp::count_bytes_local(&src);
+                            transfer_progress.reset(total);
+                            crate::sftp::copy_local_dir_to_remote_via_tar(
+                                &src,
+                                &locked.session,
+                                &remote_dir,
+                                &cancel_flag,
+                                Some(&transfer_progress),
+                            )
+                        } else {
+                            let name = src
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "file".to_string());
+                            let remote_path = format!("{remote_dir}/{name}");
+                            crate::sftp::copy_local_to_remote_progress(
+                                &locked.sftp,
+                                &src,
+                                &remote_path,
+                                Some(&transfer_progress),
+                            )
+                        };
+                        if let Err(e) = result
+                            && e != "Cancelled"
+                        {
                             eprintln!("Local-to-remote copy error: {e}");
                         }
                     } else {
                         eprintln!("No SFTP session for host: {host}");
                     }
+                    io_result = IOResult::CompletedRemote(host);
                 }
                 IOTask::DeleteRemote { host, path, is_dir } => {
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         if let Err(e) = crate::sftp::recursive_delete(&locked.sftp, &path, is_dir) {
                             eprintln!("Remote delete error: {e}");
@@ -232,15 +278,15 @@ pub fn start_io_worker(
                     } else {
                         eprintln!("No SFTP session for host: {host}");
                     }
+                    io_result = IOResult::CompletedRemote(host);
                 }
                 IOTask::RenameRemote {
                     host,
                     src,
                     new_name,
                 } => {
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
-                        // Build destination path from src parent + new_name
                         let parent = if let Some(pos) = src.rfind('/') {
                             &src[..pos]
                         } else {
@@ -257,9 +303,10 @@ pub fn start_io_worker(
                     } else {
                         eprintln!("No SFTP session for host: {host}");
                     }
+                    io_result = IOResult::CompletedRemote(host);
                 }
                 IOTask::MkdirRemote { host, path } => {
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host) {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         if let Err(e) = crate::sftp::mkdir(&locked.sftp, &path) {
                             eprintln!("Remote mkdir error: {e}");
@@ -267,15 +314,148 @@ pub fn start_io_worker(
                     } else {
                         eprintln!("No SFTP session for host: {host}");
                     }
+                    io_result = IOResult::CompletedRemote(host);
+                }
+                IOTask::CopyRemoteToLocalAndOpen {
+                    host,
+                    remote_path,
+                    local_path,
+                } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
+                        let locked = session.lock().unwrap();
+                        match crate::sftp::copy_remote_to_local_progress(
+                            &locked.sftp,
+                            &remote_path,
+                            &local_path,
+                            Some(&transfer_progress),
+                        ) {
+                            Ok(()) => open_with_default_app_bg(&local_path),
+                            Err(e) => eprintln!("Remote-to-local copy error: {e}"),
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                    io_result = IOResult::CompletedSilent;
+                }
+                IOTask::CopyRemoteSameHost {
+                    host,
+                    src_path,
+                    dst_dir,
+                    name,
+                } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
+                        let locked = session.lock().unwrap();
+                        if let Err(e) = crate::sftp::recursive_copy_remote(
+                            &locked.sftp,
+                            &src_path,
+                            &dst_dir,
+                            &name,
+                        ) {
+                            eprintln!("Remote copy error: {e}");
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                    io_result = IOResult::CompletedRemote(host);
+                }
+                IOTask::MoveRemoteSameHost {
+                    host,
+                    src_path,
+                    dst_dir,
+                    name,
+                } => {
+                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
+                        let locked = session.lock().unwrap();
+                        let dst_path = format!("{}/{}", dst_dir.trim_end_matches('/'), name);
+                        if let Err(e) = crate::sftp::rename(&locked.sftp, &src_path, &dst_path) {
+                            eprintln!("Remote move error: {e}");
+                        }
+                    } else {
+                        eprintln!("No SFTP session for host: {host}");
+                    }
+                    io_result = IOResult::CompletedRemote(host);
+                }
+                IOTask::CopyContainerAndOpen {
+                    kind,
+                    archive_path,
+                    inner_path,
+                    dst_dir,
+                    display_name,
+                } => {
+                    match copy_container_entry(
+                        kind,
+                        &archive_path,
+                        &inner_path,
+                        &dst_dir,
+                        &display_name,
+                    ) {
+                        Ok(()) => open_with_default_app_bg(&dst_dir.join(&display_name)),
+                        Err(e) => eprintln!("Extract error: {e}"),
+                    }
+                    io_result = IOResult::CompletedSilent;
+                }
+                IOTask::CopyRemoteCrossHost {
+                    src_host,
+                    src_path,
+                    dst_host,
+                    dst_dir,
+                    name,
+                    is_dir: _,
+                } => {
+                    let sessions = sftp_sessions.lock().unwrap();
+                    let src_session = sessions.get(&src_host).cloned();
+                    let dst_session = sessions.get(&dst_host).cloned();
+                    drop(sessions);
+                    match (src_session, dst_session) {
+                        (Some(src_arc), Some(dst_arc)) => {
+                            let src_locked = src_arc.lock().unwrap();
+                            let dst_locked = dst_arc.lock().unwrap();
+                            let total =
+                                crate::sftp::count_bytes_via_exec(&src_locked.session, &src_path);
+                            transfer_progress.reset(total);
+                            if let Err(e) = crate::sftp::copy_cross_host_via_tar(
+                                &src_locked.session,
+                                &src_path,
+                                &dst_locked.session,
+                                &dst_dir,
+                                &name,
+                                &cancel_flag,
+                                Some(&transfer_progress),
+                            ) && e != "Cancelled"
+                            {
+                                eprintln!("Cross-host copy error: {e}");
+                            }
+                        }
+                        (None, _) => eprintln!("No SFTP session for host: {src_host}"),
+                        (_, None) => eprintln!("No SFTP session for host: {dst_host}"),
+                    }
+                    io_result = IOResult::CompletedRemote(dst_host);
                 }
             }
-            let _ = result_tx.send(IOResult::Completed);
+            let _ = result_tx.send(io_result);
             if let Some(ref wake) = wake {
                 wake();
             }
         }
     });
     (tx, result_rx, cancel_tx)
+}
+
+fn open_with_default_app_bg(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy().to_string()])
+            .spawn();
+    }
 }
 
 #[cfg(unix)]
@@ -464,13 +644,18 @@ fn preview_request_id(request: &PreviewRequest) -> u64 {
     }
 }
 
-pub fn start_dir_size_worker() -> (mpsc::Sender<PathBuf>, mpsc::Receiver<(PathBuf, u64)>) {
+pub fn start_dir_size_worker(
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> (mpsc::Sender<PathBuf>, mpsc::Receiver<(PathBuf, u64)>) {
     let (tx, rx) = mpsc::channel::<PathBuf>();
     let (result_tx, result_rx) = mpsc::channel::<(PathBuf, u64)>();
     thread::spawn(move || {
         while let Ok(path) = rx.recv() {
             let size = compute_dir_size(&path);
             let _ = result_tx.send((path, size));
+            if let Some(ref wake) = wake {
+                wake();
+            }
         }
     });
     (tx, result_rx)
@@ -643,7 +828,9 @@ fn stream_container_preview(
     Err(format!("Entry not found in archive: {inner_path}"))
 }
 
-pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<SearchEvent>) {
+pub fn start_search_worker(
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<SearchEvent>) {
     let (tx, rx) = mpsc::channel::<SearchRequest>();
     let (result_tx, result_rx) = mpsc::channel::<SearchEvent>();
     thread::spawn(move || {
@@ -680,6 +867,9 @@ pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<Sea
                             id: request.id,
                             progress,
                         });
+                        if let Some(ref wake) = wake {
+                            wake();
+                        }
                         continue 'worker;
                     }
                 };
@@ -698,6 +888,9 @@ pub fn start_search_worker() -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<Sea
                             id: request.id,
                             progress,
                         });
+                        if let Some(ref wake) = wake {
+                            wake();
+                        }
                     }
                     progress.scanned = progress.scanned.saturating_add(1);
                     let path = entry.path();

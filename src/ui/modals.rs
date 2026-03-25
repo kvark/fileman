@@ -130,6 +130,13 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
                         .text(format!("{done_fmt} / {total_fmt}"))
                         .animate(false),
                 );
+            } else if done > 0 {
+                let done_fmt = fileman::core::format_size(done);
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .text(format!("{done_fmt}…"))
+                        .animate(true),
+                );
             } else {
                 ui.add(egui::ProgressBar::new(0.0).animate(true));
             }

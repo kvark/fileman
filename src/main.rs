@@ -62,6 +62,40 @@ enum ContainerLoadMode {
     ForceReload,
 }
 
+/// A channel sender that automatically wakes the UI event loop on every send.
+struct WakeSender<T> {
+    tx: mpsc::Sender<T>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl<T> WakeSender<T> {
+    fn send(&self, value: T) -> Result<(), mpsc::SendError<T>> {
+        let result = self.tx.send(value);
+        (self.wake)();
+        result
+    }
+}
+
+impl<T> Clone for WakeSender<T> {
+    fn clone(&self) -> Self {
+        WakeSender {
+            tx: self.tx.clone(),
+            wake: self.wake.clone(),
+        }
+    }
+}
+
+fn wake_channel<T>(
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+) -> (WakeSender<T>, mpsc::Receiver<T>) {
+    let (tx, rx) = mpsc::channel();
+    let proxy = proxy.clone();
+    let wake = Arc::new(move || {
+        let _ = proxy.send_event(UserEvent::Wake);
+    }) as Arc<dyn Fn() + Send + Sync>;
+    (WakeSender { tx, wake }, rx)
+}
+
 impl UiCache {
     fn update_scroll_mode(&mut self, app: &app_state::AppState) {
         let left_selected = app.left_panel.browser().selected_index;
@@ -621,10 +655,8 @@ fn hexdump_job(
 }
 
 fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch) {
-    let prior_selection = browser
-        .entries
-        .get(browser.selected_index)
-        .map(|e| e.name.clone());
+    let prior_index = browser.selected_index;
+    let prior_selection = browser.entries.get(prior_index).map(|e| e.name.clone());
 
     match batch {
         core::DirBatch::Loading => {
@@ -731,6 +763,9 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
         if browser.prefer_select_name.as_deref() == Some(pref.as_str()) {
             browser.prefer_select_name = None;
         }
+    } else if !browser.entries.is_empty() {
+        // Name not found (e.g. item was deleted): clamp to same position
+        browser.selected_index = prior_index.min(browser.entries.len() - 1);
     }
     if browser.selected_index < browser.top_index {
         browser.top_index = browser.selected_index;
@@ -952,10 +987,18 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 {
                     load_sftp_directory_async(app, &nav_host, &nav_path, nav_panel, None);
                 }
+                // Start the next queued connection if any
+                if let Some((next_host, next_path, next_panel)) = app.sftp_nav_queue.pop_front() {
+                    navigate_sftp(app, &next_host, &next_path, next_panel);
+                }
             }
             Err(msg) => {
                 app.sftp_pending_nav = None;
                 app.error_message = Some(msg);
+                // Continue with next queued navigation despite error
+                if let Some((next_host, next_path, next_panel)) = app.sftp_nav_queue.pop_front() {
+                    navigate_sftp(app, &next_host, &next_path, next_panel);
+                }
             }
         }
         changed = true;
@@ -1151,6 +1194,12 @@ fn navigate_sftp(
     // Already connected — load directory directly
     if app.sftp_sessions.contains_key(host) {
         load_sftp_directory_async(app, host, remote_path, target_panel, None);
+        return;
+    }
+    // If another connection is already in progress, queue this one
+    if app.sftp_connecting.is_some() {
+        app.sftp_nav_queue
+            .push_back((host.to_string(), remote_path.to_string(), target_panel));
         return;
     }
     // Spawn SFTP connection in a background thread
@@ -2429,17 +2478,55 @@ fn refresh_active_panel(app: &mut app_state::AppState) {
 }
 
 fn refresh_fs_panels(app: &mut app_state::AppState) {
+    refresh_local_panels(app);
+    // Also refresh any remote panels
+    let hosts: Vec<String> = [core::ActivePanel::Left, core::ActivePanel::Right]
+        .iter()
+        .filter_map(|&which| {
+            if let core::BrowserMode::Remote { ref host, .. } =
+                app.panel(which).browser().browser_mode
+            {
+                Some(host.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for host in hosts {
+        refresh_remote_panels(app, &host);
+    }
+}
+
+fn refresh_local_panels(app: &mut app_state::AppState) {
     for which in [core::ActivePanel::Left, core::ActivePanel::Right] {
         let browser = app.panel(which).browser();
-        if !matches!(browser.browser_mode, core::BrowserMode::Fs) {
-            continue;
+        if matches!(browser.browser_mode, core::BrowserMode::Fs) {
+            let path = browser.current_path.clone();
+            let current_name = browser
+                .entries
+                .get(browser.selected_index)
+                .map(|e| e.name.clone());
+            load_fs_directory_async(app, path, which, current_name);
         }
-        let path = browser.current_path.clone();
-        let current_name = browser
-            .entries
-            .get(browser.selected_index)
-            .map(|e| e.name.clone());
-        load_fs_directory_async(app, path, which, current_name);
+    }
+}
+
+fn refresh_remote_panels(app: &mut app_state::AppState, host: &str) {
+    for which in [core::ActivePanel::Left, core::ActivePanel::Right] {
+        let browser = app.panel(which).browser();
+        if let core::BrowserMode::Remote {
+            host: ref h,
+            ref path,
+        } = browser.browser_mode.clone()
+            && h == host
+        {
+            let path = path.clone();
+            let current_name = browser
+                .entries
+                .get(browser.selected_index)
+                .map(|e| e.name.clone());
+            load_sftp_directory_async(app, host, &path, which, current_name);
+        }
     }
 }
 
@@ -2610,6 +2697,8 @@ struct Runtime {
     image_res_rx: mpsc::Receiver<ImageResponse>,
     image_pending: VecDeque<ImageResponse>,
     needs_redraw: bool,
+    /// Earliest time egui has requested a repaint via `request_repaint_after`.
+    next_repaint: Option<std::time::Instant>,
 }
 
 impl Runtime {
@@ -2635,18 +2724,20 @@ impl Runtime {
 struct App {
     runtime: Option<Runtime>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-    start_dir: Option<PathBuf>,
+    /// Startup paths for left and right panels (local path or "host:path")
+    start_paths: [Option<String>; 2],
 }
 
 impl App {
     fn new(
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-        start_dir: Option<PathBuf>,
+        left: Option<String>,
+        right: Option<String>,
     ) -> Self {
         Self {
             runtime: None,
             proxy,
-            start_dir,
+            start_paths: [left, right],
         }
     }
 }
@@ -2737,14 +2828,34 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             buffer_count: 1,
         });
 
-        let cur_dir = self
-            .start_dir
-            .take()
-            .unwrap_or_else(|| std::env::current_dir().expect("current_dir"));
+        let [left_start, right_start] = std::mem::take(&mut self.start_paths);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        // Resolve local starting dirs for BrowserState initialisation (remote paths use cwd as placeholder)
+        let left_local = left_start
+            .as_deref()
+            .and_then(|s| {
+                if parse_remote_path(s).is_none() {
+                    Some(PathBuf::from(s))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| cwd.clone());
+        let right_local = right_start
+            .as_deref()
+            .and_then(|s| {
+                if parse_remote_path(s).is_none() {
+                    Some(PathBuf::from(s))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| cwd.clone());
         let sftp_sessions_shared: Arc<
             std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<fileman::sftp::SftpSession>>>>,
         > = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let transfer_progress = Arc::new(core::TransferProgress::new());
+        let io_cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(
             sftp_sessions_shared.clone(),
             transfer_progress.clone(),
@@ -2754,6 +2865,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     let _ = proxy.send_event(UserEvent::Wake);
                 }
             })),
+            io_cancel_flag.clone(),
         );
         let (preview_tx, preview_rx) = workers::start_preview_worker(
             Some(Arc::new({
@@ -2765,20 +2877,25 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             sftp_sessions_shared.clone(),
             transfer_progress.clone(),
         );
-        let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker();
-        let (search_tx, search_rx) = workers::start_search_worker();
+        let worker_wake: Arc<dyn Fn() + Send + Sync> = Arc::new({
+            let proxy = self.proxy.clone();
+            move || {
+                let _ = proxy.send_event(UserEvent::Wake);
+            }
+        });
+        let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker(Some(worker_wake.clone()));
+        let (search_tx, search_rx) = workers::start_search_worker(Some(worker_wake));
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
-        let (image_res_tx, image_res_rx) = mpsc::channel::<ImageResponse>();
+        let (image_res_tx, image_res_rx) = wake_channel::<ImageResponse>(&self.proxy);
         let (highlight_req_tx, highlight_req_rx) = mpsc::channel::<HighlightRequest>();
-        let (highlight_res_tx, highlight_res_rx) = mpsc::channel::<HighlightResult>();
+        let (highlight_res_tx, highlight_res_rx) = wake_channel::<HighlightResult>(&self.proxy);
         let (edit_tx, edit_rx) = mpsc::channel::<core::EditLoadRequest>();
-        let (edit_res_tx, edit_res_rx) = mpsc::channel::<core::EditLoadResult>();
+        let (edit_res_tx, edit_res_rx) = wake_channel::<core::EditLoadResult>(&self.proxy);
 
         // Full-decode thread: handles expensive tier-3 decodes so the
         // fast preview thread stays responsive for tier 1/2.
         let (full_decode_tx, full_decode_rx) = mpsc::channel::<(String, Vec<u8>)>();
         let full_res_tx = image_res_tx.clone();
-        let full_proxy = self.proxy.clone();
         thread::spawn(move || {
             while let Ok((mut key, mut data)) = full_decode_rx.recv() {
                 // Drain stale: only decode the latest request
@@ -2797,13 +2914,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         refining,
                     }));
                 }
-                let _ = full_proxy.send_event(UserEvent::Wake);
             }
         });
 
         // Fast preview thread: reads files, sends tier 1/2 instantly,
         // then forwards to the full-decode thread for tier 3.
-        let proxy = self.proxy.clone();
         let image_sftp = sftp_sessions_shared.clone();
         let image_progress = transfer_progress.clone();
         thread::spawn(move || {
@@ -2844,7 +2959,6 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         key: req.key,
                         message: "Failed to read image data".to_string(),
                     });
-                    let _ = proxy.send_event(UserEvent::Wake);
                     continue;
                 };
 
@@ -2860,7 +2974,6 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             meta,
                             refining: true,
                         }));
-                        let _ = proxy.send_event(UserEvent::Wake);
                     }
                     let _ = full_decode_tx.send((req.key, data));
                     continue;
@@ -2881,7 +2994,6 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             meta: thumb_meta,
                             refining: true,
                         }));
-                        let _ = proxy.send_event(UserEvent::Wake);
                     }
                     // Tier 2: DC-only 1/8 scale — good quality preview
                     if let Some((dc, dc_meta)) =
@@ -2893,7 +3005,6 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             meta: dc_meta,
                             refining: true,
                         }));
-                        let _ = proxy.send_event(UserEvent::Wake);
                     }
                     // Tier 3: forward to full-decode thread
                     let _ = full_decode_tx.send((req.key, data));
@@ -2916,16 +3027,13 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         message: "Unsupported image format".to_string(),
                     });
                 }
-                let _ = proxy.send_event(UserEvent::Wake);
             }
         });
 
-        let proxy = self.proxy.clone();
         thread::spawn(move || {
             while let Ok(req) = highlight_req_rx.recv() {
                 let job = highlight_text_job(&req.text, req.ext.as_deref(), req.theme_kind);
                 let _ = highlight_res_tx.send(HighlightResult { key: req.key, job });
-                let _ = proxy.send_event(UserEvent::Wake);
             }
         });
 
@@ -2970,7 +3078,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             left_panel: app_state::PanelState {
                 tabs: vec![app_state::BrowserState {
                     browser_mode: core::BrowserMode::Fs,
-                    current_path: cur_dir.clone(),
+                    current_path: left_local.clone(),
                     selected_index: 0,
                     entries: Vec::new(),
                     entries_rx: None,
@@ -2996,7 +3104,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             right_panel: app_state::PanelState {
                 tabs: vec![app_state::BrowserState {
                     browser_mode: core::BrowserMode::Fs,
-                    current_path: cur_dir.clone(),
+                    current_path: right_local.clone(),
                     selected_index: 0,
                     entries: Vec::new(),
                     entries_rx: None,
@@ -3034,6 +3142,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             io_tx,
             io_rx,
             io_cancel_tx,
+            io_cancel_flag,
             io_in_flight: 0,
             io_cancel_requested: false,
             transfer_progress: transfer_progress.clone(),
@@ -3087,12 +3196,22 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             sftp_connecting: None,
             sftp_connect_rx: None,
             sftp_pending_nav: None,
+            sftp_nav_queue: std::collections::VecDeque::new(),
         };
 
         app.theme
             .load_external_from_dir(std::path::Path::new("./themes"));
-        load_fs_directory_async(&mut app, cur_dir.clone(), core::ActivePanel::Left, None);
-        load_fs_directory_async(&mut app, cur_dir, core::ActivePanel::Right, None);
+
+        // Navigate each panel to its startup path (local or remote)
+        for (path_str, panel, local_path) in [
+            (left_start, core::ActivePanel::Left, left_local),
+            (right_start, core::ActivePanel::Right, right_local),
+        ] {
+            match path_str.as_deref().and_then(parse_remote_path) {
+                Some((host, rpath)) => navigate_sftp(&mut app, &host, &rpath, panel),
+                None => load_fs_directory_async(&mut app, local_path, panel, None),
+            }
+        }
 
         #[cfg(feature = "self-update")]
         {
@@ -3162,6 +3281,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             image_res_rx,
             image_pending: VecDeque::new(),
             needs_redraw: true,
+            next_repaint: None,
         });
     }
 
@@ -3181,12 +3301,24 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let transfer_progress = runtime.app.transfer_progress.clone();
                 let mut highlight_updated = false;
                 let mut completed = 0usize;
-                while runtime.app.io_rx.try_recv().is_ok() {
+                let mut local_refresh = false;
+                let mut remote_hosts: Vec<String> = Vec::new();
+                while let Ok(result) = runtime.app.io_rx.try_recv() {
+                    match result {
+                        core::IOResult::Completed => local_refresh = true,
+                        core::IOResult::CompletedRemote(host) => remote_hosts.push(host),
+                        core::IOResult::CompletedSilent => {}
+                    }
                     completed += 1;
                 }
                 if completed > 0 {
                     runtime.app.on_io_completed(completed);
-                    refresh_fs_panels(&mut runtime.app);
+                    if local_refresh {
+                        refresh_local_panels(&mut runtime.app);
+                    }
+                    for host in &remote_hosts {
+                        refresh_remote_panels(&mut runtime.app, host);
+                    }
                 }
                 let _ = pump_async(&mut runtime.app);
                 let mut decoded_images = Vec::new();
@@ -3532,6 +3664,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 for vo in output.viewport_output.values() {
                     if vo.repaint_delay.is_zero() {
                         runtime.needs_redraw = true;
+                    } else if let Some(t) = std::time::Instant::now().checked_add(vo.repaint_delay)
+                    {
+                        runtime.next_repaint = Some(match runtime.next_repaint {
+                            Some(prev) => prev.min(t),
+                            None => t,
+                        });
                     }
                 }
 
@@ -3688,6 +3826,14 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             if pump_async(&mut runtime.app) {
                 runtime.needs_redraw = true;
             }
+            if let Some(t) = runtime.next_repaint {
+                if t <= std::time::Instant::now() {
+                    runtime.next_repaint = None;
+                    runtime.needs_redraw = true;
+                } else {
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(t));
+                }
+            }
             if runtime.needs_redraw {
                 runtime.window.request_redraw();
                 runtime.needs_redraw = false;
@@ -3706,9 +3852,27 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 struct CliArgs {
     snapshot: Option<PathBuf>,
     replay: Option<PathBuf>,
-    start_dir: Option<PathBuf>,
+    /// First positional arg (left panel path, local or "host:path")
+    left: Option<String>,
+    /// Second positional arg (right panel path, local or "host:path")
+    right: Option<String>,
     #[cfg(feature = "self-update")]
     update: bool,
+}
+
+/// Detect `host:path` format where the host part contains no slashes.
+/// Returns `(host, path)` or `None` for local paths.
+fn parse_remote_path(s: &str) -> Option<(String, String)> {
+    let colon = s.find(':')?;
+    if colon == 0 {
+        return None;
+    }
+    let host = &s[..colon];
+    let path = &s[colon + 1..];
+    if host.contains('/') || host.contains('\\') {
+        return None;
+    }
+    Some((host.to_string(), path.to_string()))
 }
 
 fn parse_cli_args() -> anyhow::Result<CliArgs> {
@@ -3719,7 +3883,9 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
             "--help" | "-h" => {
                 eprintln!("fileman - a two-panel file manager");
                 eprintln!();
-                eprintln!("Usage: fileman [OPTIONS] [DIRECTORY]");
+                eprintln!("Usage: fileman [OPTIONS] [LEFT] [RIGHT]");
+                eprintln!();
+                eprintln!("  LEFT/RIGHT: local path or host:path for remote (e.g. k6:/home/user)");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -h, --help         Show this help message");
@@ -3749,13 +3915,24 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
                 parsed.update = true;
             }
             other if !other.starts_with('-') => {
-                let path = PathBuf::from(other);
-                let path = if path.is_relative() {
-                    std::env::current_dir()?.join(path)
+                let slot = if parsed.left.is_none() {
+                    &mut parsed.left
                 } else {
-                    path
+                    &mut parsed.right
                 };
-                parsed.start_dir = Some(path);
+                // Resolve relative local paths; leave remote "host:path" strings as-is
+                let resolved = if parse_remote_path(other).is_none() {
+                    let p = PathBuf::from(other);
+                    let p = if p.is_relative() {
+                        std::env::current_dir()?.join(p)
+                    } else {
+                        p
+                    };
+                    p.to_string_lossy().into_owned()
+                } else {
+                    other.to_string()
+                };
+                *slot = Some(resolved);
             }
             other => {
                 anyhow::bail!("Unknown option: {other}\nRun with --help for usage.");
@@ -4039,7 +4216,7 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy, args.start_dir);
+    let mut app = App::new(proxy, args.left, args.right);
     event_loop
         .run_app(&mut app)
         .map_err(|e| anyhow::anyhow!(e))?;

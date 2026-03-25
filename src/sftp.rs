@@ -3,6 +3,7 @@ use std::{
     io::{self, Read, Write},
     net::TcpStream,
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use ssh2::{self, Session, Sftp};
@@ -368,6 +369,380 @@ pub fn write_file(sftp: &Sftp, path: &str, contents: &[u8]) -> Result<(), String
 pub fn mkdir(sftp: &Sftp, path: &str) -> Result<(), String> {
     sftp.mkdir(Path::new(path), 0o755)
         .map_err(|e| format!("mkdir {path}: {e}"))
+}
+
+/// Copy a file within the same remote host (read then write).
+pub fn copy_remote_remote(sftp: &Sftp, src_path: &str, dst_path: &str) -> Result<(), String> {
+    let data = read_file_full(sftp, src_path)?;
+    write_file(sftp, dst_path, &data)
+}
+
+/// Recursively copy a file or directory within the same remote host.
+pub fn recursive_copy_remote(
+    sftp: &Sftp,
+    src_path: &str,
+    dst_dir: &str,
+    name: &str,
+) -> Result<(), String> {
+    let dst_path = format!("{}/{}", dst_dir.trim_end_matches('/'), name);
+    let stat = sftp
+        .stat(Path::new(src_path))
+        .map_err(|e| format!("stat {src_path}: {e}"))?;
+    if stat.is_dir() {
+        sftp.mkdir(Path::new(&dst_path), 0o755)
+            .map_err(|e| format!("mkdir {dst_path}: {e}"))?;
+        let children = sftp
+            .readdir(Path::new(src_path))
+            .map_err(|e| format!("readdir {src_path}: {e}"))?;
+        for (child_path, _) in children {
+            let child_name = child_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if child_name == "." || child_name == ".." {
+                continue;
+            }
+            let child_src = format!("{}/{}", src_path.trim_end_matches('/'), child_name);
+            recursive_copy_remote(sftp, &child_src, &dst_path, child_name)?;
+        }
+    } else {
+        copy_remote_remote(sftp, src_path, &dst_path)?;
+    }
+    Ok(())
+}
+
+/// A `Read` wrapper that tracks transferred bytes and checks a cancel flag.
+struct TrackedReader<'a, R: Read> {
+    inner: R,
+    cancel: &'a AtomicBool,
+    progress: Option<&'a crate::core::TransferProgress>,
+}
+impl<R: Read> Read for TrackedReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("Cancelled"));
+        }
+        let n = self.inner.read(buf)?;
+        if let Some(p) = self.progress {
+            p.add(n as u64);
+        }
+        Ok(n)
+    }
+}
+
+/// A `Write` wrapper that tracks transferred bytes and checks a cancel flag.
+struct TrackedWriter<'a, W: Write> {
+    inner: W,
+    cancel: &'a AtomicBool,
+    progress: Option<&'a crate::core::TransferProgress>,
+}
+impl<W: Write> Write for TrackedWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("Cancelled"));
+        }
+        let n = self.inner.write(buf)?;
+        if let Some(p) = self.progress {
+            p.add(n as u64);
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn is_cancel_err(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Other && e.to_string() == "Cancelled"
+}
+
+/// Copy a remote directory tree to a local path.
+/// Runs `tar cf -` on the remote via SSH exec, extracts locally with the Rust `tar` crate.
+pub fn copy_remote_dir_to_local_via_tar(
+    src_session: &Session,
+    src_path: &str,
+    dst_dir: &std::path::Path,
+    name: &str,
+    cancel: &AtomicBool,
+    progress: Option<&crate::core::TransferProgress>,
+) -> Result<(), String> {
+    let (src_parent, src_name) = match src_path.rfind('/') {
+        Some(pos) => (&src_path[..pos], &src_path[pos + 1..]),
+        None => (".", src_path),
+    };
+    let src_parent = if src_parent.is_empty() {
+        "/"
+    } else {
+        src_parent
+    };
+
+    let src_cmd = format!(
+        "tar cf - -C {} {}",
+        sh_quote(src_parent),
+        sh_quote(src_name)
+    );
+    let mut src_ch = src_session
+        .channel_session()
+        .map_err(|e| format!("src channel_session: {e}"))?;
+    src_ch
+        .exec(&src_cmd)
+        .map_err(|e| format!("src exec: {e}"))?;
+
+    let buf = io::BufReader::with_capacity(1 << 20, &mut src_ch);
+    let reader = TrackedReader {
+        inner: buf,
+        cancel,
+        progress,
+    };
+    let mut archive = tar::Archive::new(reader);
+    archive.unpack(dst_dir).map_err(|e| {
+        if e.get_ref().is_some_and(|s| {
+            is_cancel_err(
+                s.downcast_ref::<io::Error>()
+                    .unwrap_or(&io::Error::other("")),
+            )
+        }) {
+            "Cancelled".to_string()
+        } else {
+            format!("tar extract: {e}")
+        }
+    })?;
+
+    if name != src_name {
+        std::fs::rename(dst_dir.join(src_name), dst_dir.join(name))
+            .map_err(|e| format!("rename: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Copy a local directory tree to a remote path.
+/// Creates the tar archive with the Rust `tar` crate, extracts remotely via SSH exec `tar xf -`.
+pub fn copy_local_dir_to_remote_via_tar(
+    src_path: &std::path::Path,
+    dst_session: &Session,
+    dst_dir: &str,
+    cancel: &AtomicBool,
+    progress: Option<&crate::core::TransferProgress>,
+) -> Result<(), String> {
+    let src_name = src_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dir");
+
+    let dst_cmd = format!("tar xf - -C {}", sh_quote(dst_dir));
+    let mut dst_ch = dst_session
+        .channel_session()
+        .map_err(|e| format!("dst channel_session: {e}"))?;
+    dst_ch
+        .exec(&dst_cmd)
+        .map_err(|e| format!("dst exec: {e}"))?;
+
+    let buf = io::BufWriter::with_capacity(1 << 20, &mut dst_ch);
+    let mut writer = TrackedWriter {
+        inner: buf,
+        cancel,
+        progress,
+    };
+    let result = (|| -> io::Result<()> {
+        let mut ar = tar::Builder::new(&mut writer);
+        ar.append_dir_all(src_name, src_path)?;
+        ar.finish()
+    })();
+
+    // Drop writer (and its BufWriter) to flush remaining data and release the &mut dst_ch borrow.
+    drop(writer);
+
+    match result {
+        Ok(()) => {}
+        Err(e) if is_cancel_err(&e) => return Err("Cancelled".to_string()),
+        Err(e) => return Err(format!("tar create: {e}")),
+    }
+
+    dst_ch.send_eof().map_err(|e| format!("send_eof: {e}"))?;
+    dst_ch
+        .wait_close()
+        .map_err(|e| format!("dst wait_close: {e}"))?;
+    let exit = dst_ch.exit_status().unwrap_or(-1);
+    if exit != 0 {
+        return Err(format!("remote tar xf exited with status {exit}"));
+    }
+    Ok(())
+}
+
+/// Shell-quote a string with single quotes, escaping any internal single quotes.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Return the total byte size of a remote path via SSH exec.
+/// Far faster than recursive SFTP readdir for large trees (one round-trip vs O(dirs)).
+///
+/// Strategy (in order):
+///   1. `du -sb`  — Linux/GNU coreutils: exact bytes.
+///   2. `du -sk`  — macOS/BSD POSIX du: 1 KiB blocks → multiply by 1024.
+///   3. Return 0  — Windows SSH or other exotic remote; progress bar shows animated form.
+pub fn count_bytes_via_exec(session: &Session, path: &str) -> u64 {
+    let quoted = sh_quote(path);
+    for (cmd, scale) in [
+        (format!("du -sb {quoted} 2>/dev/null"), 1u64),
+        (format!("du -sk {quoted} 2>/dev/null"), 1024u64),
+    ] {
+        let mut ch = match session.channel_session() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if ch.exec(&cmd).is_err() {
+            let _ = ch.wait_close();
+            continue;
+        }
+        let mut out = String::new();
+        let _ = ch.read_to_string(&mut out);
+        let ok = ch.exit_status().unwrap_or(1) == 0;
+        let _ = ch.wait_close();
+        if ok {
+            // du output: "12345\t/path/name\n" — first token is the numeric value
+            if let Some(n) = out
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                return n * scale;
+            }
+        }
+    }
+    0
+}
+
+/// Return the total byte size of all regular files under `path` on the local filesystem.
+pub fn count_bytes_local(path: &std::path::Path) -> u64 {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| count_bytes_local(&e.path()))
+                    .sum()
+            })
+            .unwrap_or(0),
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    }
+}
+
+/// Copy a file or directory tree between two different remote hosts using a single
+/// `tar cf -` → relay → `tar xf -` stream.  This avoids per-file SFTP round-trips.
+pub fn copy_cross_host_via_tar(
+    src_session: &Session,
+    src_path: &str,
+    dst_session: &Session,
+    dst_dir: &str,
+    name: &str,
+    cancel: &AtomicBool,
+    progress: Option<&crate::core::TransferProgress>,
+) -> Result<(), String> {
+    let (src_parent, src_name) = match src_path.rfind('/') {
+        Some(pos) => (&src_path[..pos], &src_path[pos + 1..]),
+        None => (".", src_path),
+    };
+    let src_parent = if src_parent.is_empty() {
+        "/"
+    } else {
+        src_parent
+    };
+
+    let src_cmd = format!(
+        "tar cf - -C {} {}",
+        sh_quote(src_parent),
+        sh_quote(src_name)
+    );
+    let dst_cmd = format!("tar xf - -C {}", sh_quote(dst_dir));
+
+    let mut src_ch = src_session
+        .channel_session()
+        .map_err(|e| format!("src channel_session: {e}"))?;
+    src_ch
+        .exec(&src_cmd)
+        .map_err(|e| format!("src exec '{src_cmd}': {e}"))?;
+
+    let mut dst_ch = dst_session
+        .channel_session()
+        .map_err(|e| format!("dst channel_session: {e}"))?;
+    dst_ch
+        .exec(&dst_cmd)
+        .map_err(|e| format!("dst exec '{dst_cmd}': {e}"))?;
+
+    // Relay compressed tar stream from source to destination.
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Cancelled".to_string());
+        }
+        match src_ch.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                dst_ch
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("relay write: {e}"))?;
+                if let Some(p) = progress {
+                    p.add(n as u64);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("relay read: {e}")),
+        }
+    }
+
+    dst_ch.send_eof().map_err(|e| format!("send_eof: {e}"))?;
+    dst_ch
+        .wait_close()
+        .map_err(|e| format!("dst wait_close: {e}"))?;
+    let exit = dst_ch.exit_status().unwrap_or(-1);
+    if exit != 0 {
+        return Err(format!("tar xzf exited with status {exit}"));
+    }
+
+    // Rename on destination if the target name differs from the source name.
+    if name != src_name {
+        let mv_cmd = format!(
+            "mv {} {}",
+            sh_quote(&format!("{}/{}", dst_dir.trim_end_matches('/'), src_name)),
+            sh_quote(&format!("{}/{}", dst_dir.trim_end_matches('/'), name)),
+        );
+        let mut mv_ch = dst_session
+            .channel_session()
+            .map_err(|e| format!("mv channel: {e}"))?;
+        mv_ch.exec(&mv_cmd).map_err(|e| format!("mv exec: {e}"))?;
+        mv_ch
+            .wait_close()
+            .map_err(|e| format!("mv wait_close: {e}"))?;
+        let mv_exit = mv_ch.exit_status().unwrap_or(-1);
+        if mv_exit != 0 {
+            return Err(format!("mv exited with status {mv_exit}"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Count the total byte size of a remote path (file or directory tree).
+pub fn count_bytes_remote(sftp: &Sftp, path: &str) -> u64 {
+    match sftp.stat(Path::new(path)) {
+        Ok(stat) if stat.is_dir() => {
+            let children = sftp.readdir(Path::new(path)).unwrap_or_default();
+            children
+                .into_iter()
+                .filter_map(|(child_path, _)| {
+                    let name = child_path.file_name().and_then(|s| s.to_str())?;
+                    if name == "." || name == ".." {
+                        return None;
+                    }
+                    Some(count_bytes_remote(sftp, &child_path.to_string_lossy()))
+                })
+                .sum()
+        }
+        Ok(stat) => stat.size.unwrap_or(0),
+        Err(_) => 0,
+    }
 }
 
 /// Rename a remote file or directory.
