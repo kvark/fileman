@@ -452,9 +452,36 @@ fn open_with_default_app_bg(path: &Path) {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy().to_string()])
-            .spawn();
+        // Use ShellExecuteW directly — no process spawning, no console flash.
+        // `cmd /C start` spawns a console-subsystem process which causes a
+        // brief terminal window to appear when the parent has no console.
+        use std::os::windows::ffi::OsStrExt as _;
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                operation: *const u16,
+                file: *const u16,
+                parameters: *const u16,
+                directory: *const u16,
+                show_cmd: i32,
+            ) -> isize;
+        }
+        let file: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let verb: Vec<u16> = std::ffi::OsStr::new("open")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1, // SW_SHOWNORMAL
+            );
+        }
     }
 }
 
