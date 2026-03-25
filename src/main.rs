@@ -2,6 +2,7 @@
     // No need for harsh threshold here.
     clippy::too_many_arguments,
 )]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use blade_egui as be;
 use blade_graphics as bg;

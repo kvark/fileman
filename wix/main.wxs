@@ -1,0 +1,126 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  Copyright (C) 2017 Christopher R. Field.
+  Licensed under the Apache License, Version 2.0 ...
+-->
+
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='FileMan'
+        UpgradeCode='D223B1DB-2CE9-45F1-BB25-89D7ACE50E48'
+        Manufacturer='Dzmitry Malyshau'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Two-panel file manager'
+            Manufacturer='Dzmitry Malyshau'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252' />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='FileMan Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='FileMan'>
+                    <Component Id='License' Guid='*'>
+                        <File Id='LicenseFile'
+                            DiskId='1'
+                            Source='wix\License.rtf'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='binary0' Guid='*'>
+                            <File
+                                Id='exe0'
+                                Name='FileMan.exe'
+                                DiskId='1'
+                                Source='target/release/fileman.exe'
+                                KeyPath='yes'/>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+
+            <!-- Start Menu directory structure -->
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="FileMan" />
+            </Directory>
+        </Directory>
+
+        <Icon Id="FileManIcon" SourceFile="etc\windows\icon.ico" />
+        <!-- Icon in Add/Remove Programs -->
+        <Property Id='ARPPRODUCTICON' Value='FileManIcon' />
+
+        <!-- Icon in installer dialog banner -->
+        <WixVariable Id="WixUIDialogBmp" Value="etc\windows\dialog.bmp" />
+        <WixVariable Id="WixUIBannerBmp" Value="etc\windows\banner.bmp" />
+
+        <!-- Start Menu shortcut and cleanup -->
+        <DirectoryRef Id="ApplicationProgramsFolder">
+            <Component Id="StartMenuShortcut" Guid="*">
+                <Shortcut Id="FileManStartMenuShortcut"
+                          Name="FileMan"
+                          Description="Two-panel file manager"
+                          Target="[Bin]FileMan.exe"
+                          Icon="FileManIcon"
+                          WorkingDirectory="Bin" />
+                <RemoveFolder Id="RemoveApplicationProgramsFolder"
+                              Directory="ApplicationProgramsFolder"
+                              On="uninstall" />
+                <RegistryValue Root="HKCU"
+                               Key="Software\Dzmitry Malyshau\FileMan"
+                               Name="installed"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+            </Component>
+        </DirectoryRef>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs all binaries and the license.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='License'/>
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id="StartMenuShortcut"/>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <Property Id='ARPHELPLINK' Value='https://github.com/kvark/fileman'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+        </UI>
+
+        <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
+
+    </Product>
+
+</Wix>
