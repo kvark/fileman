@@ -2929,6 +2929,111 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     req = newer;
                 }
 
+                // Remote sources: stream in two phases so the EXIF thumbnail
+                // can be sent before the full file has downloaded.
+                if let ImageSource::Remote { ref host, ref path } = req.source {
+                    let key = req.key.clone();
+                    let session = image_sftp.lock().unwrap().get(host).cloned();
+                    let data = session.and_then(|s| {
+                        let locked = s.lock().unwrap();
+                        let stat = locked.sftp.stat(std::path::Path::new(path)).ok();
+                        image_progress.reset(stat.and_then(|s| s.size).unwrap_or(0));
+                        let mut file =
+                            fileman::sftp::open_remote_reader(&locked.sftp, path).ok()?;
+                        let mut buf = Vec::new();
+                        let mut chunk = vec![0u8; 32 * 1024];
+                        // Phase 1: read header prefix; fire EXIF thumbnail immediately
+                        const EXIF_PREFIX: usize = 128 * 1024;
+                        while buf.len() < EXIF_PREFIX {
+                            match file.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    image_progress.add(n as u64);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(_) => break,
+                            }
+                        }
+                        if image_decode::is_jpeg(&buf)
+                            && let Some((thumb, meta)) =
+                                image_decode::decode_jpeg_exif_thumbnail(&buf, MAX_TEXTURE_SIDE)
+                        {
+                            let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                                key: key.clone(),
+                                image: thumb,
+                                meta,
+                                refining: true,
+                            }));
+                        }
+                        // Phase 2: read the rest of the file
+                        loop {
+                            match file.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    image_progress.add(n as u64);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(_) => break,
+                            }
+                        }
+                        Some(buf)
+                    });
+                    let Some(data) = data else {
+                        let _ = image_res_tx.send(ImageResponse::Err {
+                            key: req.key,
+                            message: "Failed to read image data".to_string(),
+                        });
+                        continue;
+                    };
+                    // Tier 1 (EXIF) already sent above for JPEGs; dispatch tiers 2 & 3
+                    if image_decode::is_jpeg(&data) {
+                        if let Some((dc, dc_meta)) =
+                            image_decode::decode_jpeg_dc_preview(&data, MAX_TEXTURE_SIDE)
+                        {
+                            let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                                key: key.clone(),
+                                image: dc,
+                                meta: dc_meta,
+                                refining: true,
+                            }));
+                        }
+                        let _ = full_decode_tx.send((req.key, data));
+                        continue;
+                    }
+                    if image_decode::is_gif(&data) {
+                        if let Some((first, meta)) =
+                            image_decode::decode_gif_first_frame(&data, MAX_TEXTURE_SIDE)
+                        {
+                            let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                                key: key.clone(),
+                                image: image_decode::DecodedImage::Static(first),
+                                meta,
+                                refining: true,
+                            }));
+                        }
+                        let _ = full_decode_tx.send((req.key, data));
+                        continue;
+                    }
+                    if let Some((decoded, meta)) =
+                        image_decode::decode_image_bytes(&data, MAX_TEXTURE_SIDE)
+                    {
+                        let _ = image_res_tx.send(ImageResponse::Ok(ImageResult {
+                            key: req.key,
+                            image: decoded,
+                            meta,
+                            refining: false,
+                        }));
+                    } else {
+                        let _ = image_res_tx.send(ImageResponse::Err {
+                            key: req.key,
+                            message: "Unsupported image format".to_string(),
+                        });
+                    }
+                    continue;
+                }
+
                 let raw_bytes: Option<Vec<u8>> = match req.source {
                     ImageSource::Fs(ref path) => std::fs::read(path).ok(),
                     ImageSource::Container {
@@ -2942,18 +3047,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         usize::MAX,
                     )
                     .ok(),
-                    ImageSource::Remote { ref host, ref path } => {
-                        let session = image_sftp.lock().unwrap().get(host).cloned();
-                        session.and_then(|s| {
-                            let locked = s.lock().unwrap();
-                            fileman::sftp::read_file_full_progress(
-                                &locked.sftp,
-                                path,
-                                Some(&image_progress),
-                            )
-                            .ok()
-                        })
-                    }
+                    ImageSource::Remote { .. } => unreachable!(),
                 };
                 let Some(data) = raw_bytes else {
                     let _ = image_res_tx.send(ImageResponse::Err {
