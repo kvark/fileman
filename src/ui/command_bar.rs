@@ -82,9 +82,21 @@ fn draw_refresh_indicator(
     app: &app_state::AppState,
     colors: &theme::ThemeColors,
 ) {
-    let frames = ["|", "/", "-", "\\"];
-    let symbol = frames[(app.refresh_tick as usize) % frames.len()];
-    let text = egui::RichText::new(symbol).color(color32(colors.footer_fg));
+    // Single-dot braille — same width in all monospace fonts
+    let spinner = [
+        "\u{2840}", // ⡀
+        "\u{2804}", // ⠄
+        "\u{2802}", // ⠂
+        "\u{2801}", // ⠁
+        "\u{2808}", // ⠈
+        "\u{2810}", // ⠐
+        "\u{2820}", // ⠠
+        "\u{2880}", // ⢀
+    ];
+    let symbol = spinner[(app.refresh_tick as usize) % spinner.len()];
+    let text = egui::RichText::new(symbol)
+        .monospace()
+        .color(color32(colors.footer_fg));
     egui::Frame::NONE
         .fill(color32(colors.preview_header_bg))
         .corner_radius(egui::CornerRadius::same(4))

@@ -277,18 +277,20 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         >,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let transfer_progress = std::sync::Arc::new(core::TransferProgress::new());
+    let io_cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(
         sftp_sessions_shared.clone(),
         transfer_progress.clone(),
         None,
+        io_cancel_flag.clone(),
     );
     let (preview_tx, preview_rx) = workers::start_preview_worker(
         None,
         sftp_sessions_shared.clone(),
         transfer_progress.clone(),
     );
-    let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker();
-    let (search_tx, search_rx) = workers::start_search_worker();
+    let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker(None);
+    let (search_tx, search_rx) = workers::start_search_worker(None);
     let (edit_tx, edit_rx) = mpsc::channel::<core::EditLoadRequest>();
     let (edit_res_tx, edit_res_rx) = mpsc::channel::<core::EditLoadResult>();
 
@@ -372,6 +374,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         io_tx,
         io_rx,
         io_cancel_tx,
+        io_cancel_flag,
         io_in_flight: 0,
         io_cancel_requested: false,
         transfer_progress: transfer_progress.clone(),
@@ -415,6 +418,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         sftp_connecting: None,
         sftp_connect_rx: None,
         sftp_pending_nav: None,
+        sftp_nav_queue: std::collections::VecDeque::new(),
     };
     app.theme
         .load_external_from_dir(std::path::Path::new("./themes"));

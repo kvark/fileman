@@ -226,11 +226,13 @@ pub enum IOTask {
         remote_path: String,
         dst_dir: path::PathBuf,
         name: String,
+        is_dir: bool,
     },
     CopyLocalToRemote {
         src: path::PathBuf,
         host: String,
         remote_dir: String,
+        is_dir: bool,
     },
     DeleteRemote {
         host: String,
@@ -246,10 +248,47 @@ pub enum IOTask {
         host: String,
         path: String,
     },
+    CopyRemoteToLocalAndOpen {
+        host: String,
+        remote_path: String,
+        local_path: path::PathBuf,
+    },
+    CopyRemoteSameHost {
+        host: String,
+        src_path: String,
+        dst_dir: String,
+        name: String,
+    },
+    MoveRemoteSameHost {
+        host: String,
+        src_path: String,
+        dst_dir: String,
+        name: String,
+    },
+    CopyContainerAndOpen {
+        kind: crate::archive::ContainerKind,
+        archive_path: path::PathBuf,
+        inner_path: String,
+        dst_dir: path::PathBuf,
+        display_name: String,
+    },
+    CopyRemoteCrossHost {
+        src_host: String,
+        src_path: String,
+        dst_host: String,
+        dst_dir: String,
+        name: String,
+        is_dir: bool,
+    },
 }
 
 pub enum IOResult {
+    /// Refresh all local (Fs) panels — default for local ops.
     Completed,
+    /// Refresh only remote panels browsing this host.
+    CompletedRemote(String),
+    /// No panel refresh needed (open-only / read-only ops).
+    CompletedSilent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

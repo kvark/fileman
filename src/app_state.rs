@@ -308,6 +308,7 @@ pub struct AppState {
     pub io_tx: mpsc::Sender<IOTask>,
     pub io_rx: mpsc::Receiver<IOResult>,
     pub io_cancel_tx: mpsc::Sender<()>,
+    pub io_cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     pub io_in_flight: usize,
     pub io_cancel_requested: bool,
     /// Shared transfer progress for IO/preview/edit workers.
@@ -357,6 +358,8 @@ pub struct AppState {
     pub sftp_connect_rx: Option<mpsc::Receiver<Result<crate::sftp::SftpSession, String>>>,
     /// Pending navigation after SFTP connect completes.
     pub sftp_pending_nav: Option<(String, String, crate::core::ActivePanel)>, // (host, path, panel)
+    /// Queued navigations waiting for prior SFTP connection to finish.
+    pub sftp_nav_queue: std::collections::VecDeque<(String, String, crate::core::ActivePanel)>,
 }
 
 #[derive(Clone)]
@@ -852,13 +855,27 @@ impl AppState {
     }
 
     pub fn start_inline_new_dir(&mut self) {
-        let target_dir = {
+        enum InsertMode {
+            Fs(path::PathBuf),
+            Remote { host: String, path: String },
+        }
+
+        let mode = {
             let panel = self.get_active_panel();
             let browser = panel.browser();
-            if !matches!(browser.browser_mode, BrowserMode::Fs) {
-                return;
+            match browser.browser_mode {
+                BrowserMode::Fs => InsertMode::Fs(browser.current_path.clone()),
+                BrowserMode::Remote { ref host, ref path } => InsertMode::Remote {
+                    host: host.clone(),
+                    path: path.clone(),
+                },
+                _ => {
+                    self.error_message = Some(
+                        "Cannot create directories inside archives or search results.".to_string(),
+                    );
+                    return;
+                }
             }
-            browser.current_path.clone()
         };
         let panel = self.get_active_panel_mut();
         let browser = panel.browser_mut();
@@ -875,7 +892,13 @@ impl AppState {
             .iter()
             .position(|e| !e.is_dir)
             .unwrap_or(browser.entries.len());
-        let new_path = target_dir.join(&candidate);
+        let location = match mode {
+            InsertMode::Fs(ref dir) => EntryLocation::Fs(dir.join(&candidate)),
+            InsertMode::Remote { ref host, ref path } => EntryLocation::Remote {
+                host: host.clone(),
+                path: format!("{}/{}", path.trim_end_matches('/'), candidate),
+            },
+        };
         browser.entries.insert(
             insert_at,
             DirEntry {
@@ -883,7 +906,7 @@ impl AppState {
                 is_dir: true,
                 is_symlink: false,
                 link_target: None,
-                location: EntryLocation::Fs(new_path),
+                location,
                 size: None,
                 modified: None,
             },
@@ -1371,6 +1394,7 @@ impl AppState {
                                 src: src.clone(),
                                 host: host.clone(),
                                 remote_dir: path.clone(),
+                                is_dir: item.kind == CopyKind::Directory,
                             }
                         }
                         // Container → Local
@@ -1406,9 +1430,34 @@ impl AppState {
                             remote_path: path.clone(),
                             dst_dir: dst_dir.clone(),
                             name: item.src.display_name(),
+                            is_dir: item.kind == CopyKind::Directory,
                         },
-                        // Remote → Remote: not supported yet
-                        (&EntryLocation::Remote { .. }, &CopyDest::Remote { .. }) => continue,
+                        // Remote → Remote
+                        (
+                            &EntryLocation::Remote { ref host, ref path },
+                            &CopyDest::Remote {
+                                host: ref dst_host,
+                                path: ref dst_dir,
+                            },
+                        ) => {
+                            if host == dst_host {
+                                IOTask::CopyRemoteSameHost {
+                                    host: host.clone(),
+                                    src_path: path.clone(),
+                                    dst_dir: dst_dir.clone(),
+                                    name: item.src.display_name(),
+                                }
+                            } else {
+                                IOTask::CopyRemoteCrossHost {
+                                    src_host: host.clone(),
+                                    src_path: path.clone(),
+                                    dst_host: dst_host.clone(),
+                                    dst_dir: dst_dir.clone(),
+                                    name: item.src.display_name(),
+                                    is_dir: item.kind == CopyKind::Directory,
+                                }
+                            }
+                        }
                         // Container → Remote: not supported yet
                         (&EntryLocation::Container { .. }, &CopyDest::Remote { .. }) => continue,
                     };
@@ -1431,6 +1480,7 @@ impl AppState {
                                 src: src.clone(),
                                 host: host.clone(),
                                 remote_dir: path.clone(),
+                                is_dir: item.kind == CopyKind::Directory,
                             });
                             self.enqueue_io(IOTask::Delete {
                                 target: src.clone(),
@@ -1446,6 +1496,7 @@ impl AppState {
                                 remote_path: path.clone(),
                                 dst_dir: dst_dir.clone(),
                                 name: item.src.display_name(),
+                                is_dir: item.kind == CopyKind::Directory,
                             });
                             self.enqueue_io(IOTask::DeleteRemote {
                                 host: host.clone(),
@@ -1453,7 +1504,28 @@ impl AppState {
                                 is_dir: item.kind == CopyKind::Directory,
                             });
                         }
-                        // Remote → Remote / Container: not supported
+                        // Remote → Remote same host: use SFTP rename
+                        (
+                            &EntryLocation::Remote { ref host, ref path },
+                            &CopyDest::Remote {
+                                host: ref dst_host,
+                                path: ref dst_dir,
+                            },
+                        ) => {
+                            if host != dst_host {
+                                self.error_message =
+                                    Some("Cross-host move is not supported.".to_string());
+                                continue;
+                            }
+                            self.enqueue_io(IOTask::MoveRemoteSameHost {
+                                host: host.clone(),
+                                src_path: path.clone(),
+                                dst_dir: dst_dir.clone(),
+                                name: item.src.display_name(),
+                            });
+                            continue;
+                        }
+                        // Container → Remote / other unsupported combinations
                         _ => {}
                     }
                 }
@@ -1528,6 +1600,8 @@ impl AppState {
         self.io_in_flight = self.io_in_flight.saturating_sub(count);
         if self.io_in_flight == 0 {
             self.io_cancel_requested = false;
+            self.io_cancel_flag
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1536,7 +1610,15 @@ impl AppState {
             return;
         }
         self.io_cancel_requested = true;
-        let _ = self.io_cancel_tx.send(());
+        self.io_cancel_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Only signal the worker channel when there are queued tasks to skip.
+        // A single in-flight task is cancelled via the AtomicBool above; sending
+        // the channel message would leave it in the queue and wrongly skip the
+        // next independent task dispatched after the cancel completes.
+        if self.io_in_flight > 1 {
+            let _ = self.io_cancel_tx.send(());
+        }
     }
 
     /// Returns indices of marked entries, or just the cursor entry if nothing is marked.
