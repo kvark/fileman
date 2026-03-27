@@ -110,6 +110,7 @@ pub enum DirBatch {
     Loading,
     Progress { loaded: usize, total: Option<usize> },
     Error(String),
+    ConnectionError(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

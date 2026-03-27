@@ -752,6 +752,12 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
             browser.selected_index = 0;
             // loading flag stays true — cleared when the channel disconnects
         }
+        core::DirBatch::ConnectionError(message) => {
+            // Treat identically to Error for display purposes; session eviction is
+            // handled separately in pump_async.
+            apply_dir_batch(browser, core::DirBatch::Error(message));
+            return;
+        }
     }
 
     let restore_name = browser.prefer_select_name.clone().or(prior_selection);
@@ -784,7 +790,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
             while handled < 8 {
                 match rx.try_recv() {
                     Ok(batch) => {
-                        if let core::DirBatch::Error(_) = &batch
+                        if let core::DirBatch::ConnectionError(_) = &batch
                             && let core::BrowserMode::Remote { ref host, .. } = browser.browser_mode
                         {
                             stale_sessions.push(host.clone());
@@ -830,7 +836,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                                     cached.loading_progress = Some((loaded, total));
                                     cached.loading = total.map(|t| loaded < t).unwrap_or(true);
                                 }
-                                core::DirBatch::Error(_) => {
+                                core::DirBatch::Error(_) | core::DirBatch::ConnectionError(_) => {
                                     cached.loading = false;
                                 }
                                 core::DirBatch::ContainerRoot(_) => {}
@@ -1274,7 +1280,10 @@ fn load_sftp_directory_async(
 ) {
     let session = match app.sftp_sessions.get(host) {
         Some(s) => Arc::clone(s),
-        None => return,
+        None => {
+            navigate_sftp(app, host, remote_path, target_panel);
+            return;
+        }
     };
 
     // Use the synthetic path for stack comparisons.
@@ -1399,8 +1408,13 @@ fn load_sftp_directory_async(
                 }
             },
         );
-        if let Err(msg) = result {
-            let _ = tx.send(core::DirBatch::Error(msg));
+        if let Err((msg, is_connection_error)) = result {
+            let batch = if is_connection_error {
+                core::DirBatch::ConnectionError(msg)
+            } else {
+                core::DirBatch::Error(msg)
+            };
+            let _ = tx.send(batch);
         }
         if let Some(ref wake) = wake {
             wake();
