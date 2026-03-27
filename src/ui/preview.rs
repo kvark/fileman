@@ -9,6 +9,83 @@ use crate::{
     make_whitespace_visible, mark_line_endings, touch_image,
 };
 
+/// Post-process a `LayoutJob` to add background highlights for all find-query matches.
+/// `current` is the index of the "active" match (shown in a brighter color).
+fn apply_find_highlights(
+    job: &mut egui::text::LayoutJob,
+    display_text: &str,
+    query: &str,
+    current: usize,
+) {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return;
+    }
+    let lower = display_text.to_ascii_lowercase();
+    let qlen = q.len();
+
+    // Collect all match byte ranges
+    let mut ranges: Vec<(std::ops::Range<usize>, egui::Color32)> = Vec::new();
+    let mut pos = 0;
+    let mut idx = 0;
+    while let Some(offset) = lower[pos..].find(q.as_str()) {
+        let abs = pos + offset;
+        let color = if idx == current {
+            egui::Color32::from_rgb(255, 165, 0) // orange for active
+        } else {
+            egui::Color32::from_rgb(180, 140, 0) // dim gold for others
+        };
+        ranges.push((abs..abs + qlen, color));
+        pos = abs + qlen;
+        idx += 1;
+    }
+    if ranges.is_empty() {
+        return;
+    }
+
+    // Rebuild sections with highlight backgrounds inserted at match boundaries
+    let old = std::mem::take(&mut job.sections);
+    let mut new = Vec::with_capacity(old.len() + ranges.len() * 2);
+
+    for sec in old {
+        let sec_start = sec.byte_range.start;
+        let sec_end = sec.byte_range.end;
+
+        // Collect split points within this section
+        let mut events: Vec<usize> = vec![sec_start, sec_end];
+        for (range, _) in &ranges {
+            if range.end > sec_start && range.start < sec_end {
+                events.push(range.start.max(sec_start));
+                events.push(range.end.min(sec_end));
+            }
+        }
+        events.sort_unstable();
+        events.dedup();
+
+        let mut i = 0;
+        while i + 1 < events.len() {
+            let s = events[i];
+            let e = events[i + 1];
+            let mut fmt = sec.format.clone();
+            // Check if [s, e) falls inside any match range
+            for (range, color) in &ranges {
+                if range.start <= s && range.end >= e {
+                    fmt.background = *color;
+                    break;
+                }
+            }
+            new.push(egui::text::LayoutSection {
+                leading_space: 0.0,
+                byte_range: s..e,
+                format: fmt,
+            });
+            i += 1;
+        }
+    }
+
+    job.sections = new;
+}
+
 pub struct PreviewRender<'a> {
     pub theme: &'a theme::Theme,
     pub is_focused: bool,
@@ -69,6 +146,22 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                         if preview.find_focus {
                             response.request_focus();
                             preview.find_focus = false;
+                        }
+                        if preview.find_matches.is_empty() {
+                            if !preview.find_query.trim().is_empty() {
+                                ui.colored_label(color32(colors.row_fg_inactive), "No matches");
+                            }
+                        } else {
+                            let label = format!(
+                                "{}/{}",
+                                preview.find_match_num + 1,
+                                preview.find_matches.len()
+                            );
+                            ui.colored_label(color32(colors.row_fg_inactive), label);
+                            ui.colored_label(
+                                color32(colors.row_fg_inactive),
+                                "↵ next  ⇧↵ prev  Esc close",
+                            );
                         }
                     });
                     ui.add_space(4.0);
@@ -133,10 +226,20 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                     } else {
                                         f32::INFINITY
                                     };
+                                    let find_active =
+                                        preview.find_open && !preview.find_query.trim().is_empty();
                                     if let Some(job) = highlight_cache.get(&key) {
                                         let mut job = job.clone();
                                         job.wrap.max_width = wrap_width;
                                         job.wrap.break_anywhere = preview.wrap;
+                                        if find_active {
+                                            apply_find_highlights(
+                                                &mut job,
+                                                &display_text,
+                                                &preview.find_query,
+                                                preview.find_match_num,
+                                            );
+                                        }
                                         let label = egui::Label::new(job)
                                             .selectable(true)
                                             .wrap_mode(if preview.wrap {
@@ -166,6 +269,14 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                             wrap_width,
                                         );
                                         job.wrap.break_anywhere = preview.wrap;
+                                        if find_active {
+                                            apply_find_highlights(
+                                                &mut job,
+                                                &display_text,
+                                                &preview.find_query,
+                                                preview.find_match_num,
+                                            );
+                                        }
                                         let label = egui::Label::new(job)
                                             .selectable(true)
                                             .wrap_mode(if preview.wrap {
