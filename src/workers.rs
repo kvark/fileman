@@ -23,10 +23,16 @@ use crate::core::{
 };
 use crate::sftp::SftpSession;
 
+type SftpSessions = Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SftpSession>>>>>;
+type RemoteDirSizeChannels = (
+    mpsc::Sender<(String, String)>,
+    mpsc::Receiver<(String, String, u64)>,
+);
+
 const PREVIEW_CHUNK_BYTES: usize = 16 * 1024;
 
 pub fn start_io_worker(
-    sftp_sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SftpSession>>>>>,
+    sftp_sessions: SftpSessions,
     transfer_progress: Arc<crate::core::TransferProgress>,
     wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     cancel_flag: Arc<AtomicBool>,
@@ -519,7 +525,7 @@ fn apply_props_recursive(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io:
 
 pub fn start_preview_worker(
     wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-    sftp_sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SftpSession>>>>>,
+    sftp_sessions: SftpSessions,
     transfer_progress: Arc<crate::core::TransferProgress>,
 ) -> (
     mpsc::Sender<PreviewRequest>,
@@ -862,6 +868,7 @@ fn stream_container_preview(
 
 pub fn start_search_worker(
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    sftp_sessions: SftpSessions,
 ) -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<SearchEvent>) {
     let (tx, rx) = mpsc::channel::<SearchRequest>();
     let (result_tx, result_rx) = mpsc::channel::<SearchEvent>();
@@ -875,6 +882,18 @@ pub fn start_search_worker(
                     Err(_) => break,
                 },
             };
+            if let Some((ref host, ref remote_root)) = request.remote {
+                pending = run_remote_search(
+                    &request,
+                    host,
+                    remote_root,
+                    &sftp_sessions,
+                    &result_tx,
+                    &rx,
+                    &wake,
+                );
+                continue;
+            }
             let mut progress = SearchProgress {
                 scanned: 0,
                 matched: 0,
@@ -962,6 +981,7 @@ pub fn start_search_worker(
                                         is_dir: file_type.is_dir(),
                                         size,
                                         modified,
+                                        remote_path: None,
                                     },
                                 });
                                 progress.matched = progress.matched.saturating_add(1);
@@ -987,6 +1007,7 @@ pub fn start_search_worker(
                                         is_dir: false,
                                         size,
                                         modified,
+                                        remote_path: None,
                                     },
                                 });
                                 progress.matched = progress.matched.saturating_add(1);
@@ -1079,6 +1100,216 @@ fn wildcard_match(text: &str, pattern: &str) -> bool {
         p += 1;
     }
     p == pat_bytes.len()
+}
+
+/// Shell-quote `s` with single quotes, escaping any embedded single quotes.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Build the SSH command for remote search.
+fn build_remote_search_cmd(root: &str, needle: &str, case: SearchCase, mode: SearchMode) -> String {
+    let quoted_root = sh_quote(root);
+    match mode {
+        SearchMode::Name => {
+            let use_wildcard = needle.contains('*') || needle.contains('?');
+            let pattern = if use_wildcard {
+                needle.to_string()
+            } else {
+                format!("*{needle}*")
+            };
+            let flag = if case == SearchCase::Insensitive {
+                "-iname"
+            } else {
+                "-name"
+            };
+            let pattern_q = sh_quote(&pattern);
+            // GNU / busybox find: -printf with %y (type char) and %p (path)
+            format!("find {quoted_root} {flag} {pattern_q} -printf '%y\\t%p\\n' 2>/dev/null")
+        }
+        SearchMode::Content => {
+            let case_flag = if case == SearchCase::Insensitive {
+                "i"
+            } else {
+                ""
+            };
+            let needle_q = sh_quote(needle);
+            // -F = fixed string (not regex), -I = skip binaries, -l = filenames only, -r = recursive
+            format!("grep -rI{case_flag}l -F {needle_q} {quoted_root} 2>/dev/null")
+        }
+    }
+}
+
+/// Parse one output line from the remote search command.
+/// Returns (is_dir, remote_path).
+fn parse_remote_search_line(line: &str, mode: SearchMode) -> (bool, &str) {
+    match mode {
+        SearchMode::Content => (false, line),
+        SearchMode::Name => {
+            // Expected format: "<type_char>\t<path>"
+            if let Some(rest) = line.strip_prefix("d\t") {
+                (true, rest)
+            } else if let Some(rest) = line
+                .strip_prefix("f\t")
+                .or_else(|| line.strip_prefix("l\t"))
+            {
+                (false, rest)
+            } else {
+                // Fallback: no type prefix (non-GNU find)
+                (false, line)
+            }
+        }
+    }
+}
+
+/// Run a remote search (find / grep) over SSH, streaming results back.
+/// Returns `Some(new_request)` if a new search request arrived (cancellation), `None` on completion.
+fn run_remote_search(
+    request: &SearchRequest,
+    host: &str,
+    remote_root: &str,
+    sftp_sessions: &SftpSessions,
+    result_tx: &mpsc::Sender<SearchEvent>,
+    cancel_rx: &mpsc::Receiver<SearchRequest>,
+    wake: &Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Option<SearchRequest> {
+    use std::io::BufRead as _;
+
+    let emit_done = |progress: SearchProgress| {
+        let _ = result_tx.send(SearchEvent::Done {
+            id: request.id,
+            progress,
+        });
+        if let Some(w) = wake.as_ref() {
+            w();
+        }
+    };
+
+    let session_arc = match sftp_sessions.lock().unwrap().get(host).cloned() {
+        Some(arc) => arc,
+        None => {
+            let _ = result_tx.send(SearchEvent::Error {
+                id: request.id,
+                message: format!("No SFTP session for host: {host}"),
+            });
+            emit_done(SearchProgress {
+                scanned: 0,
+                matched: 0,
+            });
+            return None;
+        }
+    };
+
+    let cmd = build_remote_search_cmd(remote_root, &request.needle, request.case, request.mode);
+    let locked = session_arc.lock().unwrap();
+
+    let mut channel = match locked.session.channel_session() {
+        Ok(ch) => ch,
+        Err(e) => {
+            let _ = result_tx.send(SearchEvent::Error {
+                id: request.id,
+                message: format!("SSH channel: {e}"),
+            });
+            emit_done(SearchProgress {
+                scanned: 0,
+                matched: 0,
+            });
+            return None;
+        }
+    };
+    if let Err(e) = channel.exec(&cmd) {
+        let _ = result_tx.send(SearchEvent::Error {
+            id: request.id,
+            message: format!("exec: {e}"),
+        });
+        emit_done(SearchProgress {
+            scanned: 0,
+            matched: 0,
+        });
+        return None;
+    }
+
+    let mut progress = SearchProgress {
+        scanned: 0,
+        matched: 0,
+    };
+    let mut tick = 0usize;
+    let reader = std::io::BufReader::new(&mut channel);
+
+    for line_result in reader.lines() {
+        tick = tick.wrapping_add(1);
+        if tick.is_multiple_of(32) {
+            if let Ok(new_req) = cancel_rx.try_recv() {
+                // Dropping the reader/channel sends SIGPIPE to the remote process.
+                return Some(new_req);
+            }
+            let _ = result_tx.send(SearchEvent::Progress {
+                id: request.id,
+                progress,
+            });
+            if let Some(w) = wake.as_ref() {
+                w();
+            }
+        }
+
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if line.is_empty() {
+            continue;
+        }
+
+        let (is_dir, remote_path) = parse_remote_search_line(&line, request.mode);
+        progress.scanned = progress.scanned.saturating_add(1);
+        progress.matched = progress.matched.saturating_add(1);
+
+        let synthetic = std::path::PathBuf::from(format!("/sftp/{host}{remote_path}"));
+        let _ = result_tx.send(SearchEvent::Match {
+            id: request.id,
+            result: SearchResult {
+                path: synthetic,
+                is_dir,
+                size: None,
+                modified: None,
+                remote_path: Some(remote_path.to_string()),
+            },
+        });
+        if let Some(w) = wake.as_ref() {
+            w();
+        }
+    }
+
+    emit_done(progress);
+    None
+}
+
+/// Worker that computes remote directory sizes via `du` over SSH exec.
+/// Receives `(host, remote_path)` pairs, sends `(host, remote_path, byte_count)` back.
+pub fn start_remote_dir_size_worker(
+    sftp_sessions: SftpSessions,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> RemoteDirSizeChannels {
+    let (tx, rx) = mpsc::channel::<(String, String)>();
+    let (result_tx, result_rx) = mpsc::channel::<(String, String, u64)>();
+    thread::spawn(move || {
+        while let Ok((host, path)) = rx.recv() {
+            let size = {
+                let session_arc = sftp_sessions.lock().unwrap().get(&host).cloned();
+                if let Some(arc) = session_arc {
+                    let locked = arc.lock().unwrap();
+                    crate::sftp::count_bytes_via_exec(&locked.session, &path)
+                } else {
+                    0
+                }
+            };
+            let _ = result_tx.send((host, path, size));
+            if let Some(ref w) = wake {
+                w();
+            }
+        }
+    });
+    (tx, result_rx)
 }
 
 fn compute_dir_size(root: &Path) -> u64 {

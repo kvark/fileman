@@ -5,18 +5,16 @@ FileMan is a fast, responsive two-panel file manager built with Rust, egui, and 
 ![FileMan screenshot](etc/snapshots/tests/preview.png)
 
 ## Features
-- **Dual-panel layout** with independent navigation, history (Alt+Left/Right), and panel swap (Ctrl+U).
-- **Async directory loading** with streaming batches and virtualized list rendering.
-- **Archive navigation** for zip, tar, tar.gz, and tar.bz2 — browse like regular folders, copy files out, or open with system apps. Shared streaming index means only one decompression pass per archive.
-- **Preview** (F3) for text files with syntax highlighting, images (including animated GIF), and archive content listings.
-- **Inline editor** (F4) with syntax highlighting.
-- **File operations**: copy (F5), move (F6), delete (F8), rename (Shift+F6), new file (Shift+F4), new directory (F7).
-- **Multi-file selection**: Insert to mark/unmark, operations work on marked set.
-- **Search** (Alt+F7) with results displayed as a virtual folder.
-- **Symlink display**: shows link targets, broken symlinks highlighted in red.
-- **File properties** (Alt+Enter): permissions, ownership, size, timestamps.
+- **Dual-panel layout** with independent navigation, history (Alt+Left/Right), panel swap (Ctrl+U), and tab support.
+- **Async I/O** — directory loading streams in batches; all I/O runs off the UI thread so navigation never stalls.
+- **SFTP remote browsing** — connect to any SSH host (reads `~/.ssh/config`), navigate and operate on remote files as naturally as local ones.
+- **Remote search** (Alt+F7 on a remote panel) — runs `find` or `grep` over SSH; results stream back and open directly.
+- **Archive navigation** for zip, tar, tar.gz, and tar.bz2 — browse like regular folders, copy files out, or open with system apps.
+- **Preview** (F3): text with syntax highlighting, images (JPEG, PNG, GIF, WebP, BMP, TGA, HDR, DDS) including animated GIF, and archive listings.
+- **Inline editor** (F4) with syntax highlighting; create new files with Shift+F4.
+- **File operations**: copy (F5), move (F6), delete (F8), rename (Shift+F6), new directory (F7) — all work on local and remote panels, with a progress bar for large transfers.
+- **Search** (Alt+F7) by name or content, with wildcard and case-insensitive options; results displayed as a virtual folder you can navigate and operate on.
 - **Theming**: external theme files in `themes/` (JSON, YAML, or TOML), toggle with F9, pick with F10.
-- **CLI**: optional start directory argument, `--help` for usage.
 
 ## Keyboard Shortcuts
 | Key | Action |
