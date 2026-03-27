@@ -7,7 +7,8 @@ use crate::open_props_dialog;
 use crate::{
     ContainerLoadMode, UiCache, active_window_rows, apply_panel_snapshot, cancel_search,
     load_container_directory_async, load_fs_directory_async, open_search, preview_find_next,
-    refresh_active_panel, refresh_fs_panels, start_search,
+    preview_find_prev, preview_rebuild_matches, refresh_active_panel, refresh_fs_panels,
+    start_search,
 };
 
 pub(crate) fn open_selected(app: &mut app_state::AppState) {
@@ -510,6 +511,24 @@ pub(crate) fn handle_keyboard(
             return;
         }
     }
+    // Preview find bar: handle Escape (close), Enter (next), Shift+Enter (prev) before
+    // the global Shift+Enter handler steals the event.
+    if let app_state::PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode {
+        if preview.find_open {
+            if input.key_pressed(egui::Key::Escape) {
+                preview.find_open = false;
+                ctx.request_repaint();
+                return;
+            }
+            let shift_enter =
+                ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
+            if shift_enter {
+                preview_find_prev(app);
+                ctx.request_repaint();
+                return;
+            }
+        }
+    }
     let shift_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
     if shift_enter {
         open_selected_external(app);
@@ -708,7 +727,7 @@ pub(crate) fn handle_keyboard(
             consumed = true;
         }
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        if enter && preview.find_open {
+        if preview.find_open && enter {
             preview_find_next(app);
             consumed = true;
         }
@@ -727,6 +746,16 @@ pub(crate) fn handle_keyboard(
             open_search(app, core::SearchMode::Name);
         }
         ctx.request_repaint();
+    }
+    // Rebuild matches every frame when find bar is open (picks up query edits)
+    if let app_state::PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode {
+        if preview.find_open {
+            let prev_count = preview.find_matches.len();
+            preview_rebuild_matches(preview);
+            if preview.find_matches.len() != prev_count {
+                ctx.request_repaint();
+            }
+        }
     }
     let app_state::PanelState {
         mode: active_mode, ..

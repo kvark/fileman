@@ -2332,30 +2332,74 @@ fn open_search(app: &mut app_state::AppState, mode: core::SearchMode) {
     app.search_mode = mode;
 }
 
-fn preview_find_next(app: &mut app_state::AppState) {
+pub(crate) fn preview_rebuild_matches(preview: &mut app_state::PreviewState) {
+    if preview.find_query == preview.find_query_built {
+        return;
+    }
+    preview.find_query_built = preview.find_query.clone();
+    let text = match preview.content.as_ref() {
+        Some(core::PreviewContent::Text(t)) => t,
+        _ => {
+            preview.find_matches.clear();
+            return;
+        }
+    };
+    let query = preview.find_query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        preview.find_matches.clear();
+        return;
+    }
+    let lower = text.to_ascii_lowercase();
+    let qlen = query.len();
+    let mut matches = Vec::new();
+    let mut pos = 0;
+    while let Some(offset) = lower[pos..].find(query.as_str()) {
+        let abs = pos + offset;
+        matches.push(abs);
+        pos = abs + qlen;
+    }
+    preview.find_matches = matches;
+    preview.find_match_num = preview
+        .find_match_num
+        .min(preview.find_matches.len().saturating_sub(1));
+}
+
+fn preview_scroll_to_match(preview: &mut app_state::PreviewState) {
+    let Some(&idx) = preview.find_matches.get(preview.find_match_num) else {
+        return;
+    };
+    let text = match preview.content.as_ref() {
+        Some(core::PreviewContent::Text(t)) => t,
+        _ => return,
+    };
+    let line = text[..idx].bytes().filter(|b| *b == b'\n').count();
+    let line_height = preview.line_height.max(14.0);
+    preview.scroll = line as f32 * line_height;
+}
+
+pub(crate) fn preview_find_next(app: &mut app_state::AppState) {
     let Some(preview) = app.preview_panel_mut() else {
         return;
     };
-    let Some(core::PreviewContent::Text(text)) = preview.content.as_ref() else {
+    preview_rebuild_matches(preview);
+    if preview.find_matches.is_empty() {
+        return;
+    }
+    preview.find_match_num = (preview.find_match_num + 1) % preview.find_matches.len();
+    preview_scroll_to_match(preview);
+}
+
+pub(crate) fn preview_find_prev(app: &mut app_state::AppState) {
+    let Some(preview) = app.preview_panel_mut() else {
         return;
     };
-    let query = preview.find_query.trim();
-    if query.is_empty() {
+    preview_rebuild_matches(preview);
+    if preview.find_matches.is_empty() {
         return;
     }
-    let lower_text = text.to_ascii_lowercase();
-    let lower_query = query.to_ascii_lowercase();
-    let start = preview.find_index.min(lower_text.len());
-    let mut found = lower_text[start..].find(&lower_query).map(|i| i + start);
-    if found.is_none() && start > 0 {
-        found = lower_text.find(&lower_query);
-    }
-    if let Some(idx) = found {
-        preview.find_index = idx + lower_query.len();
-        let line = text[..idx].bytes().filter(|b| *b == b'\n').count();
-        let line_height = preview.line_height.max(14.0);
-        preview.scroll = line as f32 * line_height;
-    }
+    let n = preview.find_matches.len();
+    preview.find_match_num = (preview.find_match_num + n - 1) % n;
+    preview_scroll_to_match(preview);
 }
 
 fn apply_panel_snapshot(
