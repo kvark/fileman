@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- Remote search (Alt+F7 on a remote panel) using `find` / `grep` over SSH; results stream back and behave like a normal search folder
+- Space key computes folder size on remote panels (via `du` over SSH)
+
+### Fixes
+- Fix `du` byte count: `exit_status()` was read before `wait_close()`, making the result unreliable
+
 ## 0.3.0 (25 Mar 2026)
 
 ### Features

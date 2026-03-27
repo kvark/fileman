@@ -338,6 +338,8 @@ pub struct SearchRequest {
     pub needle: String,
     pub case: SearchCase,
     pub mode: SearchMode,
+    /// Set for remote searches: (host, remote_root_path).
+    pub remote: Option<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -346,6 +348,9 @@ pub struct SearchResult {
     pub is_dir: bool,
     pub size: Option<u64>,
     pub modified: Option<u64>,
+    /// For remote searches: the actual remote path (e.g. `/home/user/file.rs`).
+    /// `path` in that case is the synthetic `/sftp/<host>/…` path used for display.
+    pub remote_path: Option<String>,
 }
 
 #[derive(Clone, Copy)]

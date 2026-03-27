@@ -72,7 +72,7 @@ fn sftp_write_read_delete() {
     assert_eq!(data, contents);
 
     // Delete
-    sftp::recursive_delete(&session.sftp, test_path, false).expect("delete file");
+    sftp::recursive_delete(&session.sftp, test_path, false, None).expect("delete file");
 
     // Verify gone
     let result = sftp::read_bytes_prefix(&session.sftp, test_path, 1024);
@@ -86,7 +86,7 @@ fn sftp_mkdir_and_delete() {
     let dir_path = "/tmp/fileman_sftp_test_dir";
 
     // Clean up in case of prior failed run
-    let _ = sftp::recursive_delete(&session.sftp, dir_path, true);
+    let _ = sftp::recursive_delete(&session.sftp, dir_path, true, None);
 
     // Create directory
     sftp::mkdir(&session.sftp, dir_path).expect("mkdir");
@@ -104,7 +104,7 @@ fn sftp_mkdir_and_delete() {
     );
 
     // Recursive delete
-    sftp::recursive_delete(&session.sftp, dir_path, true).expect("recursive delete");
+    sftp::recursive_delete(&session.sftp, dir_path, true, None).expect("recursive delete");
 
     // Verify gone
     let result = sftp::read_directory(&session.sftp, "localhost", dir_path);
@@ -119,8 +119,8 @@ fn sftp_rename() {
     let dst = "/tmp/fileman_sftp_test_rename_dst";
 
     // Clean up
-    let _ = sftp::recursive_delete(&session.sftp, src, false);
-    let _ = sftp::recursive_delete(&session.sftp, dst, false);
+    let _ = sftp::recursive_delete(&session.sftp, src, false, None);
+    let _ = sftp::recursive_delete(&session.sftp, dst, false, None);
 
     sftp::write_file(&session.sftp, src, b"rename me").expect("write");
     sftp::rename(&session.sftp, src, dst).expect("rename");
@@ -132,7 +132,7 @@ fn sftp_rename() {
     let result = sftp::read_bytes_prefix(&session.sftp, src, 1024);
     assert!(result.is_err(), "old path should not exist");
 
-    sftp::recursive_delete(&session.sftp, dst, false).expect("cleanup");
+    sftp::recursive_delete(&session.sftp, dst, false, None).expect("cleanup");
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn sftp_copy_remote_to_local() {
     assert_eq!(local_data, b"copy me locally");
 
     // Cleanup
-    sftp::recursive_delete(&session.sftp, remote_path, false).ok();
+    sftp::recursive_delete(&session.sftp, remote_path, false, None).ok();
     std::fs::remove_dir_all(&local_dir).ok();
 }
 
@@ -165,7 +165,7 @@ fn sftp_copy_local_to_remote() {
     std::fs::write(&local_file, b"upload me").expect("write local");
 
     let remote_path = "/tmp/fileman_sftp_test_l2r_uploaded";
-    let _ = sftp::recursive_delete(&session.sftp, remote_path, false);
+    let _ = sftp::recursive_delete(&session.sftp, remote_path, false, None);
 
     sftp::copy_local_to_remote(&session.sftp, &local_file, remote_path).expect("copy l2r");
 
@@ -173,7 +173,7 @@ fn sftp_copy_local_to_remote() {
     assert_eq!(data, b"upload me");
 
     // Cleanup
-    sftp::recursive_delete(&session.sftp, remote_path, false).ok();
+    sftp::recursive_delete(&session.sftp, remote_path, false, None).ok();
     std::fs::remove_dir_all(&local_dir).ok();
 }
 
@@ -212,7 +212,7 @@ fn sftp_open_remote_reader() {
     reader.read_to_end(&mut buf).expect("read_to_end");
     assert_eq!(buf, content);
 
-    sftp::recursive_delete(&session.sftp, remote_path, false).ok();
+    sftp::recursive_delete(&session.sftp, remote_path, false, None).ok();
 }
 
 #[test]

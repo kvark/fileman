@@ -612,8 +612,8 @@ pub fn count_bytes_via_exec(session: &Session, path: &str) -> u64 {
         }
         let mut out = String::new();
         let _ = ch.read_to_string(&mut out);
-        let ok = ch.exit_status().unwrap_or(1) == 0;
         let _ = ch.wait_close();
+        let ok = ch.exit_status().unwrap_or(1) == 0;
         if ok {
             // du output: "12345\t/path/name\n" — first token is the numeric value
             if let Some(n) = out

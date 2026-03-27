@@ -290,7 +290,9 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         transfer_progress.clone(),
     );
     let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker(None);
-    let (search_tx, search_rx) = workers::start_search_worker(None);
+    let (remote_dir_size_tx, remote_dir_size_rx) =
+        workers::start_remote_dir_size_worker(sftp_sessions_shared.clone(), None);
+    let (search_tx, search_rx) = workers::start_search_worker(None, sftp_sessions_shared.clone());
     let (edit_tx, edit_rx) = mpsc::channel::<core::EditLoadRequest>();
     let (edit_res_tx, edit_res_rx) = mpsc::channel::<core::EditLoadResult>();
 
@@ -382,6 +384,10 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         dir_size_rx,
         dir_sizes: Default::default(),
         dir_size_pending: Default::default(),
+        remote_dir_size_tx,
+        remote_dir_size_rx,
+        remote_dir_sizes: Default::default(),
+        remote_dir_size_pending: Default::default(),
         fs_last_selected_name: Default::default(),
         container_last_selected_name: Default::default(),
         container_dir_cache: Default::default(),
@@ -407,6 +413,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         search_ui: app_state::SearchUiState::Closed,
         search_tx,
         search_rx,
+        search_remote_host: None,
         refresh_tick: 0,
         update_status: app_state::UpdateStatus::Disabled,
         update_rx: None,

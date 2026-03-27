@@ -513,20 +513,20 @@ pub(crate) fn handle_keyboard(
     }
     // Preview find bar: handle Escape (close), Enter (next), Shift+Enter (prev) before
     // the global Shift+Enter handler steals the event.
-    if let app_state::PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode {
-        if preview.find_open {
-            if input.key_pressed(egui::Key::Escape) {
-                preview.find_open = false;
-                ctx.request_repaint();
-                return;
-            }
-            let shift_enter =
-                ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
-            if shift_enter {
-                preview_find_prev(app);
-                ctx.request_repaint();
-                return;
-            }
+    if let app_state::PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode
+        && preview.find_open
+    {
+        if input.key_pressed(egui::Key::Escape) {
+            preview.find_open = false;
+            ctx.request_repaint();
+            return;
+        }
+        let shift_enter =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
+        if shift_enter {
+            preview_find_prev(app);
+            ctx.request_repaint();
+            return;
         }
     }
     let shift_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
@@ -606,26 +606,30 @@ pub(crate) fn handle_keyboard(
     }
     let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
     if space {
-        let target_path = {
+        let selected = {
             let panel = app.get_active_panel();
             let browser = panel.browser();
-            browser
-                .entries
-                .get(browser.selected_index)
-                .and_then(|entry| {
-                    if entry.is_dir
-                        && let core::EntryLocation::Fs(path) = &entry.location
-                    {
-                        return Some(path.clone());
-                    }
-                    None
-                })
+            browser.entries.get(browser.selected_index).cloned()
         };
-        if let Some(path) = target_path
-            && !app.dir_size_pending.contains(&path)
+        if let Some(entry) = selected
+            && entry.is_dir
         {
-            app.dir_size_pending.insert(path.clone());
-            let _ = app.dir_size_tx.send(path);
+            match entry.location {
+                core::EntryLocation::Fs(path) => {
+                    if !app.dir_size_pending.contains(&path) {
+                        app.dir_size_pending.insert(path.clone());
+                        let _ = app.dir_size_tx.send(path);
+                    }
+                }
+                core::EntryLocation::Remote { host, path } => {
+                    let key = (host.clone(), path.clone());
+                    if !app.remote_dir_size_pending.contains(&key) {
+                        app.remote_dir_size_pending.insert(key);
+                        let _ = app.remote_dir_size_tx.send((host, path));
+                    }
+                }
+                core::EntryLocation::Container { .. } => {}
+            }
         }
     }
     let ctrl_left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
@@ -676,17 +680,47 @@ pub(crate) fn handle_keyboard(
             let panel = app.get_active_panel();
             let browser = panel.browser();
             let entry = browser.entries.get(browser.selected_index).cloned();
-            if let Some(entry) = entry
-                && let core::EntryLocation::Fs(path) = entry.location
-            {
-                if entry.is_dir {
-                    load_fs_directory_async(app, path, app.active_panel, None);
-                } else if let Some(parent) = path.parent() {
-                    let name = path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string());
-                    load_fs_directory_async(app, parent.to_path_buf(), app.active_panel, name);
+            if let Some(entry) = entry {
+                match entry.location {
+                    core::EntryLocation::Fs(path) => {
+                        if entry.is_dir {
+                            load_fs_directory_async(app, path, app.active_panel, None);
+                        } else if let Some(parent) = path.parent() {
+                            let name = path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string());
+                            load_fs_directory_async(
+                                app,
+                                parent.to_path_buf(),
+                                app.active_panel,
+                                name,
+                            );
+                        }
+                    }
+                    core::EntryLocation::Remote { host, path } => {
+                        if entry.is_dir {
+                            crate::load_sftp_directory_async(
+                                app,
+                                &host,
+                                &path,
+                                app.active_panel,
+                                None,
+                            );
+                        } else {
+                            let slash = path.rfind('/').unwrap_or(0);
+                            let parent = if slash == 0 { "/" } else { &path[..slash] };
+                            let name = path[slash + 1..].to_string();
+                            crate::load_sftp_directory_async(
+                                app,
+                                &host,
+                                parent,
+                                app.active_panel,
+                                Some(name),
+                            );
+                        }
+                    }
+                    core::EntryLocation::Container { .. } => {}
                 }
             }
             app.search_ui = app_state::SearchUiState::Closed;
@@ -748,13 +782,13 @@ pub(crate) fn handle_keyboard(
         ctx.request_repaint();
     }
     // Rebuild matches every frame when find bar is open (picks up query edits)
-    if let app_state::PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode {
-        if preview.find_open {
-            let prev_count = preview.find_matches.len();
-            preview_rebuild_matches(preview);
-            if preview.find_matches.len() != prev_count {
-                ctx.request_repaint();
-            }
+    if let app_state::PanelMode::Preview(ref mut preview) = app.panel_mut(app.active_panel).mode
+        && preview.find_open
+    {
+        let prev_count = preview.find_matches.len();
+        preview_rebuild_matches(preview);
+        if preview.find_matches.len() != prev_count {
+            ctx.request_repaint();
         }
     }
     let app_state::PanelState {

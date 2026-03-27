@@ -985,6 +985,33 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         }
         changed = true;
     }
+    while let Ok((host, path, size)) = app.remote_dir_size_rx.try_recv() {
+        let key = (host.clone(), path.clone());
+        app.remote_dir_size_pending.remove(&key);
+        app.remote_dir_sizes.insert(key, size);
+        for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
+            let panel = app.panel_mut(side);
+            let browser = panel.browser_mut();
+            let mut updated = false;
+            for entry in &mut browser.entries {
+                if entry.is_dir
+                    && let core::EntryLocation::Remote {
+                        host: ref h,
+                        path: ref p,
+                    } = entry.location
+                    && *h == host
+                    && *p == path
+                {
+                    entry.size = Some(size);
+                    updated = true;
+                }
+            }
+            if updated && browser.sort_mode == core::SortMode::Size {
+                resort_browser_entries(browser);
+            }
+        }
+        changed = true;
+    }
 
     // Poll SFTP connect result
     if let Some(ref rx) = app.sftp_connect_rx
@@ -1059,6 +1086,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         }
                         app_state::SearchStatus::Idle => None,
                     };
+                    let search_host = app.search_remote_host.clone();
                     let panel = app.get_active_panel_mut();
                     let browser = panel.browser_mut();
                     let app_state::BrowserState {
@@ -1087,12 +1115,19 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                             .unwrap_or("<unknown>")
                             .to_string(),
                     };
+                    let location = match result.remote_path {
+                        Some(ref rp) => core::EntryLocation::Remote {
+                            host: search_host.unwrap_or_default(),
+                            path: rp.clone(),
+                        },
+                        None => core::EntryLocation::Fs(result.path.clone()),
+                    };
                     browser.entries.push(core::DirEntry {
                         name: display_name,
                         is_dir: result.is_dir,
                         is_symlink: false,
                         link_target: None,
-                        location: core::EntryLocation::Fs(result.path),
+                        location,
                         size: result.size,
                         modified: result.modified,
                     });
@@ -1189,7 +1224,10 @@ fn draw_error_modal(ctx: &egui::Context, message: &str) {
 
 fn draw_async_indicator(ctx: &egui::Context, app: &app_state::AppState) {
     let search_running = matches!(app.search_status, app_state::SearchStatus::Running(_));
-    let is_busy = app.io_in_flight > 0 || search_running || !app.dir_size_pending.is_empty();
+    let is_busy = app.io_in_flight > 0
+        || search_running
+        || !app.dir_size_pending.is_empty()
+        || !app.remote_dir_size_pending.is_empty();
     if !is_busy {
         return;
     }
@@ -1202,8 +1240,9 @@ fn draw_async_indicator(ctx: &egui::Context, app: &app_state::AppState) {
     if search_running {
         label += " scan";
     }
-    if !app.dir_size_pending.is_empty() {
-        label += &format!(" {}sz", app.dir_size_pending.len());
+    let sz_pending = app.dir_size_pending.len() + app.remote_dir_size_pending.len();
+    if sz_pending > 0 {
+        label += &format!(" {sz_pending}sz");
     }
     let colors = app.theme.colors();
     egui::Area::new(egui::Id::new("async_indicator"))
@@ -2520,11 +2559,18 @@ fn start_search(app: &mut app_state::AppState) {
         scanned: 0,
         matched: 0,
     });
-    let root = {
+    let (root, remote) = {
         let panel = app.get_active_panel();
         let browser = panel.browser();
-        browser.current_path.clone()
+        let remote = if let core::BrowserMode::Remote { ref host, ref path } = browser.browser_mode
+        {
+            Some((host.clone(), path.clone()))
+        } else {
+            None
+        };
+        (browser.current_path.clone(), remote)
     };
+    app.search_remote_host = remote.as_ref().map(|(h, _)| h.clone());
     {
         app.push_history(app.active_panel);
         let panel = app.get_active_panel_mut();
@@ -2551,6 +2597,7 @@ fn start_search(app: &mut app_state::AppState) {
         needle,
         case: search_case,
         mode: search_mode,
+        remote,
     });
 }
 
@@ -2988,7 +3035,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             }
         });
         let (dir_size_tx, dir_size_rx) = workers::start_dir_size_worker(Some(worker_wake.clone()));
-        let (search_tx, search_rx) = workers::start_search_worker(Some(worker_wake));
+        let (remote_dir_size_tx, remote_dir_size_rx) = workers::start_remote_dir_size_worker(
+            sftp_sessions_shared.clone(),
+            Some(worker_wake.clone()),
+        );
+        let (search_tx, search_rx) =
+            workers::start_search_worker(Some(worker_wake), sftp_sessions_shared.clone());
         let (image_req_tx, image_req_rx) = mpsc::channel::<ImageRequest>();
         let (image_res_tx, image_res_rx) = wake_channel::<ImageResponse>(&self.proxy);
         let (highlight_req_tx, highlight_req_rx) = mpsc::channel::<HighlightRequest>();
@@ -3352,6 +3404,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             dir_size_rx,
             dir_sizes: Default::default(),
             dir_size_pending: Default::default(),
+            remote_dir_size_tx,
+            remote_dir_size_rx,
+            remote_dir_sizes: Default::default(),
+            remote_dir_size_pending: Default::default(),
             fs_last_selected_name: Default::default(),
             container_last_selected_name: Default::default(),
             container_dir_cache: Default::default(),
@@ -3377,6 +3433,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             search_ui: app_state::SearchUiState::Closed,
             search_tx,
             search_rx,
+            search_remote_host: None,
             refresh_tick: 0,
             update_status: app_state::UpdateStatus::Disabled,
             update_rx: None,
