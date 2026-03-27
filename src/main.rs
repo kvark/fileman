@@ -775,6 +775,7 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
 
 fn pump_async(app: &mut app_state::AppState) -> bool {
     let mut changed = false;
+    let mut stale_sessions: Vec<String> = Vec::new();
     for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
         let panel = app.panel_mut(side);
         let browser = panel.browser_mut();
@@ -783,6 +784,11 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
             while handled < 8 {
                 match rx.try_recv() {
                     Ok(batch) => {
+                        if let core::DirBatch::Error(_) = &batch
+                            && let core::BrowserMode::Remote { ref host, .. } = browser.browser_mode
+                        {
+                            stale_sessions.push(host.clone());
+                        }
                         apply_dir_batch(browser, batch);
                         handled += 1;
                         changed = true;
@@ -844,6 +850,13 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 }
             }
         }
+    }
+
+    // Evict stale SFTP sessions that failed during directory listing.
+    // The next navigation will trigger a fresh reconnect.
+    for host in stale_sessions {
+        app.sftp_sessions.remove(&host);
+        app.sftp_sessions_shared.lock().unwrap().remove(&host);
     }
 
     // Poll shared archive indexes for incremental updates
@@ -1166,6 +1179,38 @@ fn draw_error_modal(ctx: &egui::Context, message: &str) {
                 // Handled via input.rs — this is just for mouse users
             }
         });
+}
+
+fn draw_async_indicator(ctx: &egui::Context, app: &app_state::AppState) {
+    let search_running = matches!(app.search_status, app_state::SearchStatus::Running(_));
+    let is_busy = app.io_in_flight > 0 || search_running || !app.dir_size_pending.is_empty();
+    if !is_busy {
+        return;
+    }
+    let t = ctx.input(|i| i.time);
+    let spinner = ["|", "/", "-", "\\"][((t * 6.0) as usize) % 4];
+    let mut label = spinner.to_string();
+    if app.io_in_flight > 0 {
+        label += &format!(" {}io", app.io_in_flight);
+    }
+    if search_running {
+        label += " scan";
+    }
+    if !app.dir_size_pending.is_empty() {
+        label += &format!(" {}sz", app.dir_size_pending.len());
+    }
+    let colors = app.theme.colors();
+    egui::Area::new(egui::Id::new("async_indicator"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::Vec2::new(-8.0, -8.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(label)
+                    .small()
+                    .color(color32(colors.row_fg_inactive)),
+            );
+        });
+    ctx.request_repaint_after(std::time::Duration::from_millis(160));
 }
 
 fn navigate_quick_jump(
@@ -2924,8 +2969,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let image_progress = transfer_progress.clone();
         thread::spawn(move || {
             while let Ok(mut req) = image_req_rx.recv() {
-                // Skip stale requests
+                // Skip stale requests; send cancellation so their pending state clears.
                 while let Ok(newer) = image_req_rx.try_recv() {
+                    let _ = image_res_tx.send(ImageResponse::Err {
+                        key: req.key,
+                        message: String::new(), // empty = cancelled, not a real decode failure
+                    });
                     req = newer;
                 }
 
@@ -3544,7 +3593,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             }
                             ImageResponse::Err { key, message } => {
                                 runtime.image_cache.pending.remove(&key);
-                                runtime.image_cache.failures.insert(key, message);
+                                // Empty message = cancelled (stale skip), not a real failure.
+                                if !message.is_empty() {
+                                    runtime.image_cache.failures.insert(key, message);
+                                }
                             }
                         }
                         runtime.needs_redraw = true;
@@ -3752,6 +3804,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     if let Some(ref msg) = runtime.app.error_message.clone() {
                         draw_error_modal(ctx, msg);
                     }
+                    draw_async_indicator(ctx, &runtime.app);
                 });
                 runtime
                     .egui_state

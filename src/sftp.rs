@@ -129,6 +129,7 @@ pub fn connect(
     session
         .handshake()
         .map_err(|e| format!("SSH handshake with {actual_host}: {e}"))?;
+    session.set_timeout(30_000);
 
     // Try ssh-agent first
     if session.userauth_agent(&user).is_ok() && session.authenticated() {
@@ -330,7 +331,13 @@ pub fn open_remote_reader(sftp: &Sftp, path: &str) -> Result<ssh2::File, String>
 }
 
 /// Recursively delete a remote path (file or directory).
-pub fn recursive_delete(sftp: &Sftp, path: &str, is_dir: bool) -> Result<(), String> {
+/// Reports each deleted item via `progress.add_item()` when provided.
+pub fn recursive_delete(
+    sftp: &Sftp,
+    path: &str,
+    is_dir: bool,
+    progress: Option<&crate::core::TransferProgress>,
+) -> Result<(), String> {
     if is_dir {
         let children = sftp
             .readdir(Path::new(path))
@@ -344,13 +351,16 @@ pub fn recursive_delete(sftp: &Sftp, path: &str, is_dir: bool) -> Result<(), Str
                 continue;
             }
             let child_str = child_path.to_string_lossy().to_string();
-            recursive_delete(sftp, &child_str, stat.is_dir())?;
+            recursive_delete(sftp, &child_str, stat.is_dir(), progress)?;
         }
         sftp.rmdir(Path::new(path))
             .map_err(|e| format!("rmdir {path}: {e}"))?;
     } else {
         sftp.unlink(Path::new(path))
             .map_err(|e| format!("unlink {path}: {e}"))?;
+    }
+    if let Some(p) = progress {
+        p.add_item();
     }
     Ok(())
 }

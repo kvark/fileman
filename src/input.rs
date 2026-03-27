@@ -574,9 +574,7 @@ pub(crate) fn handle_keyboard(
     let ctrl_pgup = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
     let backspace = input.key_pressed(egui::Key::Backspace);
     let typing_in_ui = ctx.wants_keyboard_input();
-    if (ctrl_pgup || backspace)
-        && !(app.search_ui == app_state::SearchUiState::Open && typing_in_ui)
-    {
+    if ctrl_pgup || (backspace && !typing_in_ui) {
         open_parent(app, window_rows);
     }
     let ctrl_pgdn = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));

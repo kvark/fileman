@@ -121,6 +121,10 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
             ui.colored_label(color32(colors.row_fg_active), label);
             ui.add_space(8.0);
             let (done, total) = app.transfer_progress.snapshot();
+            let items = app
+                .transfer_progress
+                .items_done
+                .load(std::sync::atomic::Ordering::Relaxed);
             if total > 0 {
                 let fraction = (done as f32 / total as f32).clamp(0.0, 1.0);
                 let done_fmt = fileman::core::format_size(done);
@@ -135,6 +139,12 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
                 ui.add(
                     egui::ProgressBar::new(0.0)
                         .text(format!("{done_fmt}…"))
+                        .animate(true),
+                );
+            } else if items > 0 {
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .text(format!("Deleted {items}…"))
                         .animate(true),
                 );
             } else {

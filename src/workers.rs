@@ -272,7 +272,12 @@ pub fn start_io_worker(
                 IOTask::DeleteRemote { host, path, is_dir } => {
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
-                        if let Err(e) = crate::sftp::recursive_delete(&locked.sftp, &path, is_dir) {
+                        if let Err(e) = crate::sftp::recursive_delete(
+                            &locked.sftp,
+                            &path,
+                            is_dir,
+                            Some(&transfer_progress),
+                        ) {
                             eprintln!("Remote delete error: {e}");
                         }
                     } else {
