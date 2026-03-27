@@ -179,23 +179,28 @@ pub fn read_directory(sftp: &Sftp, host: &str, path: &str) -> Result<Vec<DirEntr
     let mut all = Vec::new();
     read_directory_streaming(sftp, host, path, |entries| {
         all.extend(entries);
-    })?;
+    })
+    .map_err(|(msg, _)| msg)?;
     Ok(all)
 }
 
 /// Incrementally list a remote directory, calling `on_batch` for each batch of entries.
 /// The first batch always contains the ".." entry (if applicable).
 /// Entries within each batch are unsorted; the final sort is the caller's responsibility.
+/// Returns `Err((message, is_connection_error))`.
+/// `is_connection_error = true` means the SSH session is likely dead (timeout, disconnect).
+/// `is_connection_error = false` means an SFTP-level error (permission denied, etc.)
 pub fn read_directory_streaming(
     sftp: &Sftp,
     host: &str,
     path: &str,
     mut on_batch: impl FnMut(Vec<DirEntry>),
-) -> Result<(), String> {
+) -> Result<(), (String, bool)> {
     let remote_path = if path.is_empty() { "/" } else { path };
-    let mut handle = sftp
-        .opendir(Path::new(remote_path))
-        .map_err(|e| format!("opendir {remote_path}: {e}"))?;
+    let mut handle = sftp.opendir(Path::new(remote_path)).map_err(|e| {
+        let is_connection_error = !matches!(e.code(), ssh2::ErrorCode::SFTP(_));
+        (format!("opendir {remote_path}: {e}"), is_connection_error)
+    })?;
 
     // First batch: ".." entry if not at root
     if remote_path != "/" {
