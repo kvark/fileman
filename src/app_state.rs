@@ -1510,8 +1510,7 @@ impl AppState {
                             });
                             self.enqueue_io(IOTask::DeleteRemote {
                                 host: host.clone(),
-                                path: path.clone(),
-                                is_dir: item.kind == CopyKind::Directory,
+                                items: vec![(path.clone(), item.kind == CopyKind::Directory)],
                             });
                         }
                         // Remote → Remote same host: use SFTP rename
@@ -1541,41 +1540,44 @@ impl AppState {
                 }
             }
             PendingOp::Delete { ref targets } => {
+                // Collect remote items by host so they go in one batched task each,
+                // keeping the progress counter from resetting between files.
+                let mut remote_batches: std::collections::HashMap<String, Vec<(String, bool)>> =
+                    std::collections::HashMap::new();
                 for target in targets {
                     let target_str = target.to_string_lossy();
-                    if let Some(rest) = target_str.strip_prefix("/sftp/") {
-                        // Remote delete: parse host/path from synthetic path
-                        if let Some(slash) = rest.find('/') {
-                            let host = rest[..slash].to_string();
-                            let path = rest[slash..].to_string();
-                            let is_dir = target.extension().is_none()
-                                && std::path::Path::new(&path).extension().is_none();
-                            // Look up in entries for is_dir
-                            let is_dir = self
-                                .get_active_panel()
-                                .browser()
-                                .entries
-                                .iter()
-                                .find(|e| {
-                                    if let EntryLocation::Remote {
-                                        host: ref h,
-                                        path: ref p,
-                                    } = e.location
-                                    {
-                                        *h == host && *p == path
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .map(|e| e.is_dir)
-                                .unwrap_or(is_dir);
-                            self.enqueue_io(IOTask::DeleteRemote { host, path, is_dir });
-                            continue;
-                        }
+                    if let Some(rest) = target_str.strip_prefix("/sftp/")
+                        && let Some(slash) = rest.find('/')
+                    {
+                        let host = rest[..slash].to_string();
+                        let path = rest[slash..].to_string();
+                        let is_dir = self
+                            .get_active_panel()
+                            .browser()
+                            .entries
+                            .iter()
+                            .find(|e| {
+                                if let EntryLocation::Remote {
+                                    host: ref h,
+                                    path: ref p,
+                                } = e.location
+                                {
+                                    *h == host && *p == path
+                                } else {
+                                    false
+                                }
+                            })
+                            .map(|e| e.is_dir)
+                            .unwrap_or(false);
+                        remote_batches.entry(host).or_default().push((path, is_dir));
+                        continue;
                     }
                     self.enqueue_io(IOTask::Delete {
                         target: target.clone(),
                     });
+                }
+                for (host, items) in remote_batches {
+                    self.enqueue_io(IOTask::DeleteRemote { host, items });
                 }
             }
             PendingOp::Rename { ref src } => {

@@ -275,7 +275,16 @@ pub(crate) fn handle_keyboard(
     let ctrl_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E));
     let ctrl_n = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N));
     let ctrl_c = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C));
-    let ctrl_a = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A));
+    let in_preview = matches!(
+        app.panel(app.active_panel).mode,
+        app_state::PanelMode::Preview(_)
+    );
+    let ctrl_a = if in_preview {
+        // Don't consume: egui's selectable label handles Ctrl+A (select-all) natively.
+        false
+    } else {
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A))
+    };
     let ctrl_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
     let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::D));
     let ctrl_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G));
@@ -760,8 +769,11 @@ pub(crate) fn handle_keyboard(
             preview.scroll = max;
             consumed = true;
         }
+        let find_open = preview.find_open;
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        if preview.find_open && enter {
+        // Drop the `preview` borrow before calling preview_find_next (needs full &mut app).
+        let _ = preview;
+        if find_open && enter {
             preview_find_next(app);
             consumed = true;
         }

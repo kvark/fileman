@@ -245,8 +245,8 @@ pub enum IOTask {
     },
     DeleteRemote {
         host: String,
-        path: String,
-        is_dir: bool,
+        /// `(path, is_dir)` pairs — batched so the progress counter isn't reset between items.
+        items: Vec<(String, bool)>,
     },
     RenameRemote {
         host: String,
