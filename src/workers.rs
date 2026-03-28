@@ -275,16 +275,18 @@ pub fn start_io_worker(
                     }
                     io_result = IOResult::CompletedRemote(host);
                 }
-                IOTask::DeleteRemote { host, path, is_dir } => {
+                IOTask::DeleteRemote { host, items } => {
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
-                        if let Err(e) = crate::sftp::recursive_delete(
-                            &locked.sftp,
-                            &path,
-                            is_dir,
-                            Some(&transfer_progress),
-                        ) {
-                            eprintln!("Remote delete error: {e}");
+                        for item in items.iter() {
+                            if let Err(e) = crate::sftp::recursive_delete(
+                                &locked.sftp,
+                                item.0.as_str(),
+                                item.1,
+                                Some(&transfer_progress),
+                            ) {
+                                eprintln!("Remote delete error: {e}");
+                            }
                         }
                     } else {
                         eprintln!("No SFTP session for host: {host}");
