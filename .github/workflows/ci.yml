@@ -46,10 +46,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build
-      - name: Build release
-        run: cargo build --release
+      - name: Check
+        run: cargo check
       - name: Test
         run: cargo test
       - name: Clippy
