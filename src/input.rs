@@ -610,7 +610,7 @@ pub(crate) fn handle_keyboard(
         open_selected(app);
     }
     let ctrl_r = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R));
-    if ctrl_r {
+    if ctrl_r || f2 {
         refresh_active_panel(app);
     }
     let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
@@ -898,7 +898,7 @@ pub(crate) fn handle_keyboard(
         ctx.request_repaint();
     }
     let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
-    if shift_f6 || f2 {
+    if shift_f6 {
         app.prepare_rename_selected();
         ctx.request_repaint();
     }
