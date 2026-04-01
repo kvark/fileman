@@ -1291,13 +1291,47 @@ impl AppState {
     pub fn open_quick_jump(&mut self) {
         let mut entries = Vec::new();
 
-        // Home directory
-        if let Ok(home) = std::env::var("HOME") {
+        // Home directory (cross-platform)
+        let home_dir = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok());
+        if let Some(home) = home_dir {
             entries.push(QuickJumpEntry {
                 label: format!("~ {}", home),
                 path: path::PathBuf::from(&home),
                 category: QuickJumpCategory::Home,
             });
+        }
+
+        // Windows: enumerate drive letters
+        #[cfg(target_os = "windows")]
+        {
+            for letter in b'A'..=b'Z' {
+                let drive = format!("{}:\\", letter as char);
+                let dp = path::PathBuf::from(&drive);
+                if dp.exists() && !entries.iter().any(|e| e.path == dp) {
+                    entries.push(QuickJumpEntry {
+                        label: drive,
+                        path: dp,
+                        category: QuickJumpCategory::Mount,
+                    });
+                }
+            }
+        }
+
+        // macOS: enumerate /Volumes
+        #[cfg(target_os = "macos")]
+        if let Ok(rd) = std::fs::read_dir("/Volumes") {
+            for entry in rd.flatten() {
+                let mp = entry.path();
+                if !entries.iter().any(|e| e.path == mp) {
+                    entries.push(QuickJumpEntry {
+                        label: mp.to_string_lossy().to_string(),
+                        path: mp,
+                        category: QuickJumpCategory::Mount,
+                    });
+                }
+            }
         }
 
         // Mount points from /proc/mounts
