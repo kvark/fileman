@@ -29,6 +29,7 @@ pub fn draw_command_bar(
                             };
                         }
                         draw_key_cap(ui, k!("F1", "^H"), "Help", colors);
+                        draw_key_cap(ui, k!("F2", "^R"), "Refresh", colors);
                         let (mut f3, f4, mut f5, mut f6, f7, f8) = if modifiers.alt {
                             ("", "", "Pack", "Unpack", "Search", "Command")
                         } else if modifiers.shift {
@@ -61,11 +62,7 @@ pub fn draw_command_bar(
                         } else {
                             draw_key_cap(ui, k!("F5", "^C"), f5, colors);
                         }
-                        if modifiers.shift {
-                            draw_key_cap(ui, k!("F6", "F2"), f6, colors);
-                        } else {
-                            draw_key_cap(ui, k!("F6", "^M"), f6, colors);
-                        }
+                        draw_key_cap(ui, k!("F6", "^M"), f6, colors);
                         if modifiers.alt {
                             draw_key_cap(ui, k!("F7", "^G"), f7, colors);
                         } else {
