@@ -1,6 +1,6 @@
 [package]
 name = "fileman"
-version = "0.2.0"
+version = "0.3.0"
 description = "Two-panel file manager"
 keywords = ["file-manager", "egui", "blade"]
 categories = ["filesystem"]
