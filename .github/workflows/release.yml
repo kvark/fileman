@@ -79,6 +79,8 @@ jobs:
           cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle
           rustup target add aarch64-apple-darwin
           cargo bundle --release --target aarch64-apple-darwin --features self-update
+        env:
+          OPENSSL_DIR: /opt/homebrew/opt/openssl@3
 
       - name: Package (macOS)
         if: matrix.os == 'macos-latest'
