@@ -134,6 +134,7 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
             scroll
                 .id_salt("editor_scroll")
                 .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .max_height(editor_height)
                 .show(ui, |ui| {
                     let mut te = egui::TextEdit::multiline(&mut text)
@@ -219,7 +220,7 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                 response.request_focus();
                 ui.memory_mut(|mem| mem.request_focus(response.id));
                 ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(16));
+                    .request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui.horizontal(|ui| {
                 ui.colored_label(
