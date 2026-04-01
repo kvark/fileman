@@ -1335,6 +1335,9 @@ fn load_sftp_directory_async(
                 synthetic.starts_with(&browser.current_path) && synthetic != browser.current_path;
             if is_child {
                 // Descending: push current directory (with entries_rx) onto stack.
+                let dir_mtime = std::fs::metadata(&browser.current_path)
+                    .and_then(|m| m.modified())
+                    .ok();
                 let cache = app_state::DirListingCache {
                     current_path: browser.current_path.clone(),
                     entries: std::mem::take(&mut browser.entries),
@@ -1345,6 +1348,7 @@ fn load_sftp_directory_async(
                     entries_rx: browser.entries_rx.take(),
                     sort_mode: browser.sort_mode,
                     sort_desc: browser.sort_desc,
+                    dir_mtime,
                 };
                 browser.parent_cache.push(cache);
             } else {
@@ -1492,6 +1496,9 @@ fn load_fs_directory_async(
         if is_child {
             // Descending: push the current directory onto the parent stack
             // (with its entries_rx so async loading keeps going).
+            let dir_mtime = std::fs::metadata(&browser.current_path)
+                .and_then(|m| m.modified())
+                .ok();
             let cache = app_state::DirListingCache {
                 current_path: browser.current_path.clone(),
                 entries: std::mem::take(&mut browser.entries),
@@ -1502,6 +1509,7 @@ fn load_fs_directory_async(
                 entries_rx: browser.entries_rx.take(),
                 sort_mode: browser.sort_mode,
                 sort_desc: browser.sort_desc,
+                dir_mtime,
             };
             browser.parent_cache.push(cache);
         } else {
@@ -1516,32 +1524,41 @@ fn load_fs_directory_async(
                 }
             }
             if let Some(cached) = restored {
-                // Restore from cache — entries may have grown via background loading.
-                let sort_mode = browser.sort_mode;
-                let sort_desc = browser.sort_desc;
-                browser.current_path = path;
-                browser.browser_mode = core::BrowserMode::Fs;
-                browser.entries = cached.entries;
-                browser.selected_index = cached.selected_index;
-                browser.top_index = cached.top_index;
-                browser.loading = cached.loading;
-                browser.loading_progress = cached.loading_progress;
-                browser.entries_rx = cached.entries_rx;
-                browser.inline_rename = None;
-                browser.dir_token = browser.dir_token.wrapping_add(1);
-                browser.watching_archive = None;
-                browser.index_last_seen = 0;
-                browser.marked.clear();
-                // Re-sort since batches accumulated without sorting.
-                sort_entries(&mut browser.entries, sort_mode, sort_desc);
-                if let Some(ref name) = prefer_name
-                    && let Some(idx) = browser.entries.iter().position(|e| e.name == *name)
-                {
-                    browser.selected_index = idx;
-                    browser.top_index = idx.saturating_sub(5);
+                // Check if the directory has been modified since we cached it.
+                let current_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let stale = match (cached.dir_mtime, current_mtime) {
+                    (Some(old), Some(now)) => now > old,
+                    _ => false, // can't tell — trust the cache
+                };
+                if !stale {
+                    // Restore from cache — entries may have grown via background loading.
+                    let sort_mode = browser.sort_mode;
+                    let sort_desc = browser.sort_desc;
+                    browser.current_path = path;
+                    browser.browser_mode = core::BrowserMode::Fs;
+                    browser.entries = cached.entries;
+                    browser.selected_index = cached.selected_index;
+                    browser.top_index = cached.top_index;
+                    browser.loading = cached.loading;
+                    browser.loading_progress = cached.loading_progress;
+                    browser.entries_rx = cached.entries_rx;
+                    browser.inline_rename = None;
+                    browser.dir_token = browser.dir_token.wrapping_add(1);
+                    browser.watching_archive = None;
+                    browser.index_last_seen = 0;
+                    browser.marked.clear();
+                    // Re-sort since batches accumulated without sorting.
+                    sort_entries(&mut browser.entries, sort_mode, sort_desc);
+                    if let Some(ref name) = prefer_name
+                        && let Some(idx) = browser.entries.iter().position(|e| e.name == *name)
+                    {
+                        browser.selected_index = idx;
+                        browser.top_index = idx.saturating_sub(5);
+                    }
+                    browser.prefer_select_name = prefer_name;
+                    return;
                 }
-                browser.prefer_select_name = prefer_name;
-                return;
+                // Cache is stale — fall through to fresh load.
             }
             // Stack exhausted with no match — fall through to fresh load.
         }
