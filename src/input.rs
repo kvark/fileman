@@ -269,26 +269,31 @@ pub(crate) fn handle_keyboard(
     cache: &mut UiCache,
 ) {
     let io_tx = app.io_tx.clone();
-    // Ctrl+letter alternates for F-keys (friendlier on laptops without F-key row)
-    let ctrl_h = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::H));
-    let ctrl_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P));
-    let ctrl_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E));
-    let ctrl_n = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N));
-    let ctrl_c = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+    let in_edit = matches!(
+        app.panel(app.active_panel).mode,
+        app_state::PanelMode::Edit(_)
+    );
     let in_preview = matches!(
         app.panel(app.active_panel).mode,
         app_state::PanelMode::Preview(_)
     );
-    let ctrl_a = if in_preview {
-        // Don't consume: egui's selectable label handles Ctrl+A (select-all) natively.
+    // In edit mode, don't consume Ctrl+letter shortcuts that egui's TextEdit
+    // needs (copy, paste, cut, select-all, undo, redo, etc.).
+    let ctrl_h = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::H));
+    let ctrl_p = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P));
+    let ctrl_e = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E));
+    let ctrl_n = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N));
+    let ctrl_c = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+    let ctrl_a = if in_preview || in_edit {
+        // Don't consume: egui's widgets handle Ctrl+A (select-all) natively.
         false
     } else {
         ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A))
     };
-    let ctrl_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
-    let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::D));
+    let ctrl_m = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
+    let ctrl_d = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::D));
     let ctrl_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G));
-    let ctrl_x = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::X));
+    let ctrl_x = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::X));
     let f2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2));
 
     let f1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1));
