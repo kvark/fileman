@@ -199,6 +199,9 @@ pub struct DirListingCache {
     pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
     pub sort_mode: SortMode,
     pub sort_desc: bool,
+    /// Modification time of the directory when the listing was captured.
+    /// Used to detect stale caches when navigating back.
+    pub dir_mtime: Option<std::time::SystemTime>,
 }
 
 pub struct PreviewState {
