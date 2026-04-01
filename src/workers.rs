@@ -67,7 +67,9 @@ pub fn start_io_worker(
             match task {
                 IOTask::Copy { src, dst_dir } => {
                     if let Err(e) = copy_recursively(&src, &dst_dir) {
-                        eprintln!("Copy error: {e}");
+                        let msg = format!("Copy error: {e}");
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 IOTask::CopyContainer {
@@ -84,7 +86,9 @@ pub fn start_io_worker(
                         &dst_dir,
                         &display_name,
                     ) {
-                        eprintln!("Copy container error: {e}");
+                        let msg = format!("Copy container error: {e}");
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 IOTask::CopyContainerDir {
@@ -101,7 +105,9 @@ pub fn start_io_worker(
                         &dst_dir,
                         &display_name,
                     ) {
-                        eprintln!("Copy container dir error: {e}");
+                        let msg = format!("Copy container dir error: {e}");
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 IOTask::Move { src, dst_dir } => {
@@ -112,15 +118,21 @@ pub fn start_io_worker(
                     );
                     if let Err(e) = std::fs::rename(&src, &target) {
                         if let Err(copy_err) = copy_recursively(&src, &dst_dir) {
-                            eprintln!("Move error (copy fallback): {copy_err}");
+                            let msg = format!("Move error: {copy_err}");
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
                         } else if let Err(remove_err) = if src.is_dir() {
                             std::fs::remove_dir_all(&src)
                         } else {
                             std::fs::remove_file(&src)
                         } {
-                            eprintln!("Move cleanup error: {remove_err}");
+                            let msg = format!("Move cleanup error: {remove_err}");
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
                         }
-                        eprintln!("Move error: {e}");
+                        if matches!(io_result, IOResult::Completed) {
+                            eprintln!("Move error (rename failed, copy succeeded): {e}");
+                        }
                     }
                 }
                 IOTask::Delete { target } => {
@@ -130,23 +142,31 @@ pub fn start_io_worker(
                         std::fs::remove_file(&target)
                     };
                     if let Err(e) = res {
-                        eprintln!("Delete error: {e}");
+                        let msg = format!("Delete error: {}\n{e}", target.to_string_lossy());
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 IOTask::Rename { src, new_name } => {
-                    let target = src.with_file_name(new_name);
+                    let target = src.with_file_name(&new_name);
                     if let Err(e) = std::fs::rename(&src, &target) {
-                        eprintln!("Rename error: {e}");
+                        let msg = format!("Rename error: {e}");
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 IOTask::WriteFile { path, contents } => {
                     if let Err(e) = std::fs::write(&path, contents) {
-                        eprintln!("Write error: {e}");
+                        let msg = format!("Write error: {e}");
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 IOTask::Mkdir { path } => {
                     if let Err(e) = std::fs::create_dir(&path) {
-                        eprintln!("Mkdir error: {e}");
+                        let msg = format!("Mkdir error: {e}");
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 IOTask::Pack {
@@ -155,7 +175,9 @@ pub fn start_io_worker(
                     kind,
                 } => {
                     if let Err(e) = create_archive(&sources, &archive_path, kind) {
-                        eprintln!("Pack error: {e}");
+                        let msg = format!("Pack error: {e}");
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 #[cfg(unix)]
@@ -172,27 +194,40 @@ pub fn start_io_worker(
                         apply_props(&path, mode, uid, gid)
                     };
                     if let Err(e) = res {
-                        eprintln!("Props error: {e}");
+                        let msg = format!("Props error: {e}");
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
                     }
                 }
                 #[cfg(not(unix))]
                 IOTask::SetProps { .. } => {
-                    eprintln!("SetProps is not supported on this platform");
+                    let msg = "SetProps is not supported on this platform".to_string();
+                    eprintln!("{msg}");
+                    io_result = IOResult::Error(msg);
                 }
                 IOTask::WriteRemoteFile {
                     host,
                     path,
                     contents,
                 } => {
+                    let mut err_msg = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         if let Err(e) = crate::sftp::write_file(&locked.sftp, &path, &contents) {
-                            eprintln!("Remote write error: {e}");
+                            let msg = format!("Remote write error: {e}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    io_result = IOResult::CompletedRemote(host);
+                    io_result = if let Some(msg) = err_msg {
+                        IOResult::ErrorRemote(host, msg)
+                    } else {
+                        IOResult::CompletedRemote(host)
+                    };
                 }
                 IOTask::CopyRemoteToLocal {
                     host,
@@ -276,6 +311,7 @@ pub fn start_io_worker(
                     io_result = IOResult::CompletedRemote(host);
                 }
                 IOTask::DeleteRemote { host, items } => {
+                    let mut err_msg = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         for item in items.iter() {
@@ -285,19 +321,28 @@ pub fn start_io_worker(
                                 item.1,
                                 Some(&transfer_progress),
                             ) {
-                                eprintln!("Remote delete error: {e}");
+                                let msg = format!("Remote delete error: {e}");
+                                eprintln!("{msg}");
+                                err_msg = Some(msg);
                             }
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    io_result = IOResult::CompletedRemote(host);
+                    io_result = if let Some(msg) = err_msg {
+                        IOResult::ErrorRemote(host, msg)
+                    } else {
+                        IOResult::CompletedRemote(host)
+                    };
                 }
                 IOTask::RenameRemote {
                     host,
                     src,
                     new_name,
                 } => {
+                    let mut err_msg = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         let parent = if let Some(pos) = src.rfind('/') {
@@ -311,23 +356,40 @@ pub fn start_io_worker(
                             format!("{parent}/{new_name}")
                         };
                         if let Err(e) = crate::sftp::rename(&locked.sftp, &src, &dst) {
-                            eprintln!("Remote rename error: {e}");
+                            let msg = format!("Remote rename error: {e}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    io_result = IOResult::CompletedRemote(host);
+                    io_result = if let Some(msg) = err_msg {
+                        IOResult::ErrorRemote(host, msg)
+                    } else {
+                        IOResult::CompletedRemote(host)
+                    };
                 }
                 IOTask::MkdirRemote { host, path } => {
+                    let mut err_msg = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         if let Err(e) = crate::sftp::mkdir(&locked.sftp, &path) {
-                            eprintln!("Remote mkdir error: {e}");
+                            let msg = format!("Remote mkdir error: {e}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    io_result = IOResult::CompletedRemote(host);
+                    io_result = if let Some(msg) = err_msg {
+                        IOResult::ErrorRemote(host, msg)
+                    } else {
+                        IOResult::CompletedRemote(host)
+                    };
                 }
                 IOTask::CopyRemoteToLocalAndOpen {
                     host,
@@ -356,6 +418,7 @@ pub fn start_io_worker(
                     dst_dir,
                     name,
                 } => {
+                    let mut err_msg = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         if let Err(e) = crate::sftp::recursive_copy_remote(
@@ -364,12 +427,20 @@ pub fn start_io_worker(
                             &dst_dir,
                             &name,
                         ) {
-                            eprintln!("Remote copy error: {e}");
+                            let msg = format!("Remote copy error: {e}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    io_result = IOResult::CompletedRemote(host);
+                    io_result = if let Some(msg) = err_msg {
+                        IOResult::ErrorRemote(host, msg)
+                    } else {
+                        IOResult::CompletedRemote(host)
+                    };
                 }
                 IOTask::MoveRemoteSameHost {
                     host,
@@ -377,16 +448,25 @@ pub fn start_io_worker(
                     dst_dir,
                     name,
                 } => {
+                    let mut err_msg = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         let dst_path = format!("{}/{}", dst_dir.trim_end_matches('/'), name);
                         if let Err(e) = crate::sftp::rename(&locked.sftp, &src_path, &dst_path) {
-                            eprintln!("Remote move error: {e}");
+                            let msg = format!("Remote move error: {e}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    io_result = IOResult::CompletedRemote(host);
+                    io_result = if let Some(msg) = err_msg {
+                        IOResult::ErrorRemote(host, msg)
+                    } else {
+                        IOResult::CompletedRemote(host)
+                    };
                 }
                 IOTask::CopyContainerAndOpen {
                     kind,

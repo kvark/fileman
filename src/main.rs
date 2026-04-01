@@ -3562,13 +3562,25 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let mut completed = 0usize;
                 let mut local_refresh = false;
                 let mut remote_hosts: Vec<String> = Vec::new();
+                let mut io_errors: Vec<String> = Vec::new();
                 while let Ok(result) = runtime.app.io_rx.try_recv() {
                     match result {
                         core::IOResult::Completed => local_refresh = true,
                         core::IOResult::CompletedRemote(host) => remote_hosts.push(host),
                         core::IOResult::CompletedSilent => {}
+                        core::IOResult::Error(msg) => {
+                            local_refresh = true;
+                            io_errors.push(msg);
+                        }
+                        core::IOResult::ErrorRemote(host, msg) => {
+                            remote_hosts.push(host);
+                            io_errors.push(msg);
+                        }
                     }
                     completed += 1;
+                }
+                if !io_errors.is_empty() {
+                    runtime.app.error_message = Some(io_errors.join("\n"));
                 }
                 if completed > 0 {
                     runtime.app.on_io_completed(completed);

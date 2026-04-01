@@ -298,6 +298,10 @@ pub enum IOResult {
     CompletedRemote(String),
     /// No panel refresh needed (open-only / read-only ops).
     CompletedSilent,
+    /// Operation failed — display the error to the user and still refresh.
+    Error(String),
+    /// Remote operation failed — display error and refresh that host.
+    ErrorRemote(String, String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
