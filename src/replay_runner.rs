@@ -305,10 +305,17 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 },
                 Err(e) => format!("Failed to read file: {e}"),
             };
+            let crlf = text.contains("\r\n");
+            let text = if crlf {
+                text.replace("\r\n", "\n")
+            } else {
+                text
+            };
             let _ = edit_res_tx.send(core::EditLoadResult {
                 id: req.id,
                 path: req.path,
                 text,
+                crlf,
             });
         }
     });
