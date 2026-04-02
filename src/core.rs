@@ -176,6 +176,7 @@ pub enum PreviewRequest {
     },
 }
 
+#[derive(Clone)]
 pub enum IOTask {
     Copy {
         src: path::PathBuf,
@@ -289,6 +290,8 @@ pub enum IOTask {
         name: String,
         is_dir: bool,
     },
+    /// Re-run the inner task with OS-level privilege elevation.
+    Elevated(Box<IOTask>),
 }
 
 pub enum IOResult {
@@ -302,6 +305,8 @@ pub enum IOResult {
     Error(String),
     /// Remote operation failed — display error and refresh that host.
     ErrorRemote(String, String),
+    /// Local operation failed with a permission error — offer elevation retry.
+    PermissionError { message: String, task: IOTask },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

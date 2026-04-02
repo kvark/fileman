@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- On access denied, offer to retry with elevated privileges
+
 ## 0.3.1 (4 Apr 2026)
 
 ### Features

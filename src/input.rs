@@ -310,6 +310,18 @@ pub(crate) fn handle_keyboard(
         }
         return;
     }
+    if app.elevation_prompt.is_some() {
+        if input.key_pressed(egui::Key::Enter) {
+            if let Some((_, task)) = app.elevation_prompt.take() {
+                app.enqueue_io(crate::core::IOTask::Elevated(Box::new(task)));
+            }
+            ctx.request_repaint();
+        } else if input.key_pressed(egui::Key::Escape) {
+            app.elevation_prompt = None;
+            ctx.request_repaint();
+        }
+        return;
+    }
     if app.error_message.is_some() {
         if input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::Enter) {
             app.error_message = None;

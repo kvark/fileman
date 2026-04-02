@@ -361,6 +361,8 @@ pub struct AppState {
     pub gpu_info: String,
     pub quick_jump: Option<QuickJumpState>,
     pub error_message: Option<String>,
+    /// Permission error with retryable task — shown as elevation prompt.
+    pub elevation_prompt: Option<(String, crate::core::IOTask)>,
     /// Active SFTP sessions keyed by hostname — local reference for quick lookups.
     pub sftp_sessions: HashMap<String, Arc<Mutex<crate::sftp::SftpSession>>>,
     /// Shared SFTP sessions for worker threads (IO, preview).
@@ -1416,7 +1418,7 @@ impl AppState {
         self.quick_jump = None;
     }
 
-    fn enqueue_io(&mut self, task: IOTask) {
+    pub fn enqueue_io(&mut self, task: IOTask) {
         if let Err(e) = self.io_tx.send(task) {
             eprintln!("Failed to enqueue IO: {e}");
         } else {

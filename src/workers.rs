@@ -64,12 +64,26 @@ pub fn start_io_worker(
             transfer_progress.reset(0);
             // Default: refresh local Fs panels. Remote/silent ops override below.
             let mut io_result = IOResult::Completed;
+            let task_clone = task.clone();
             match task {
                 IOTask::Copy { src, dst_dir } => {
                     if let Err(e) = copy_recursively(&src, &dst_dir) {
-                        let msg = format!("Copy error: {e}");
-                        eprintln!("{msg}");
-                        io_result = IOResult::Error(msg);
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            let msg = format!(
+                                "Permission denied: copy {} → {}",
+                                src.display(),
+                                dst_dir.display()
+                            );
+                            eprintln!("{msg}");
+                            io_result = IOResult::PermissionError {
+                                message: msg,
+                                task: task_clone,
+                            };
+                        } else {
+                            let msg = format!("Copy error: {e}");
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
+                        }
                     }
                 }
                 IOTask::CopyContainer {
@@ -117,18 +131,52 @@ pub fn start_io_worker(
                             .unwrap_or_else(|| "moved".to_string()),
                     );
                     if let Err(e) = std::fs::rename(&src, &target) {
-                        if let Err(copy_err) = copy_recursively(&src, &dst_dir) {
-                            let msg = format!("Move error: {copy_err}");
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            let msg = format!(
+                                "Permission denied: move {} → {}",
+                                src.display(),
+                                dst_dir.display()
+                            );
                             eprintln!("{msg}");
-                            io_result = IOResult::Error(msg);
+                            io_result = IOResult::PermissionError {
+                                message: msg,
+                                task: task_clone,
+                            };
+                        } else if let Err(copy_err) = copy_recursively(&src, &dst_dir) {
+                            if copy_err.kind() == std::io::ErrorKind::PermissionDenied {
+                                let msg = format!(
+                                    "Permission denied: move {} → {}",
+                                    src.display(),
+                                    dst_dir.display()
+                                );
+                                eprintln!("{msg}");
+                                io_result = IOResult::PermissionError {
+                                    message: msg,
+                                    task: task_clone,
+                                };
+                            } else {
+                                let msg = format!("Move error: {copy_err}");
+                                eprintln!("{msg}");
+                                io_result = IOResult::Error(msg);
+                            }
                         } else if let Err(remove_err) = if src.is_dir() {
                             std::fs::remove_dir_all(&src)
                         } else {
                             std::fs::remove_file(&src)
                         } {
-                            let msg = format!("Move cleanup error: {remove_err}");
-                            eprintln!("{msg}");
-                            io_result = IOResult::Error(msg);
+                            if remove_err.kind() == std::io::ErrorKind::PermissionDenied {
+                                let msg =
+                                    format!("Permission denied: move cleanup {}", src.display());
+                                eprintln!("{msg}");
+                                io_result = IOResult::PermissionError {
+                                    message: msg,
+                                    task: task_clone,
+                                };
+                            } else {
+                                let msg = format!("Move cleanup error: {remove_err}");
+                                eprintln!("{msg}");
+                                io_result = IOResult::Error(msg);
+                            }
                         }
                         if matches!(io_result, IOResult::Completed) {
                             eprintln!("Move error (rename failed, copy succeeded): {e}");
@@ -142,31 +190,67 @@ pub fn start_io_worker(
                         std::fs::remove_file(&target)
                     };
                     if let Err(e) = res {
-                        let msg = format!("Delete error: {}\n{e}", target.to_string_lossy());
-                        eprintln!("{msg}");
-                        io_result = IOResult::Error(msg);
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            let msg = format!("Permission denied: {}", target.display());
+                            eprintln!("{msg}");
+                            io_result = IOResult::PermissionError {
+                                message: msg,
+                                task: task_clone,
+                            };
+                        } else {
+                            let msg = format!("Delete error: {}\n{e}", target.to_string_lossy());
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
+                        }
                     }
                 }
                 IOTask::Rename { src, new_name } => {
                     let target = src.with_file_name(&new_name);
                     if let Err(e) = std::fs::rename(&src, &target) {
-                        let msg = format!("Rename error: {e}");
-                        eprintln!("{msg}");
-                        io_result = IOResult::Error(msg);
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            let msg = format!("Permission denied: rename {}", src.display());
+                            eprintln!("{msg}");
+                            io_result = IOResult::PermissionError {
+                                message: msg,
+                                task: task_clone,
+                            };
+                        } else {
+                            let msg = format!("Rename error: {e}");
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
+                        }
                     }
                 }
                 IOTask::WriteFile { path, contents } => {
-                    if let Err(e) = std::fs::write(&path, contents) {
-                        let msg = format!("Write error: {e}");
-                        eprintln!("{msg}");
-                        io_result = IOResult::Error(msg);
+                    if let Err(e) = std::fs::write(&path, &contents) {
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            let msg = format!("Permission denied: write {}", path.display());
+                            eprintln!("{msg}");
+                            io_result = IOResult::PermissionError {
+                                message: msg,
+                                task: task_clone,
+                            };
+                        } else {
+                            let msg = format!("Write error: {e}");
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
+                        }
                     }
                 }
                 IOTask::Mkdir { path } => {
                     if let Err(e) = std::fs::create_dir(&path) {
-                        let msg = format!("Mkdir error: {e}");
-                        eprintln!("{msg}");
-                        io_result = IOResult::Error(msg);
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            let msg = format!("Permission denied: mkdir {}", path.display());
+                            eprintln!("{msg}");
+                            io_result = IOResult::PermissionError {
+                                message: msg,
+                                task: task_clone,
+                            };
+                        } else {
+                            let msg = format!("Mkdir error: {e}");
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
+                        }
                     }
                 }
                 IOTask::Pack {
@@ -194,9 +278,18 @@ pub fn start_io_worker(
                         apply_props(&path, mode, uid, gid)
                     };
                     if let Err(e) = res {
-                        let msg = format!("Props error: {e}");
-                        eprintln!("{msg}");
-                        io_result = IOResult::Error(msg);
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            let msg = format!("Permission denied: set props on {}", path.display());
+                            eprintln!("{msg}");
+                            io_result = IOResult::PermissionError {
+                                message: msg,
+                                task: task_clone,
+                            };
+                        } else {
+                            let msg = format!("Props error: {e}");
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
+                        }
                     }
                 }
                 #[cfg(not(unix))]
@@ -524,6 +617,13 @@ pub fn start_io_worker(
                     }
                     io_result = IOResult::CompletedRemote(dst_host);
                 }
+                IOTask::Elevated(inner) => match crate::elevate::execute_elevated(&inner) {
+                    Ok(()) => {}
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
+                    }
+                },
             }
             let _ = result_tx.send(io_result);
             if let Some(ref wake) = wake {
