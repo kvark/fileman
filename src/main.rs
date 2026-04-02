@@ -380,9 +380,16 @@ fn highlight_text_job(
                 style.foreground.b,
                 style.foreground.a,
             );
+            let bg = style.background;
+            let background = if bg.a > 0 && (bg.r, bg.g, bg.b) != (0, 0, 0) {
+                egui::Color32::from_rgba_unmultiplied(bg.r, bg.g, bg.b, bg.a)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
             let format = egui::TextFormat {
                 font_id: egui::FontId::monospace(13.0),
                 color,
+                background,
                 ..Default::default()
             };
             job.append(piece, 0.0, format);
