@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (4 Apr 2026)
 
 ### Features
 - Remote search (Alt+F7 on a remote panel) using `find` / `grep` over SSH; results stream back and behave like a normal search folder
@@ -8,6 +8,9 @@
 
 ### Fixes
 - Fix `du` byte count: `exit_status()` was read before `wait_close()`, making the result unreliable
+- Refresh stale cached directories automatically
+- Better surface IO errors
+- Fix quick access on Windows
 
 ## 0.3.0 (25 Mar 2026)
 
