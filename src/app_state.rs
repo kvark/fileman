@@ -246,6 +246,8 @@ pub struct EditState {
     pub request_id: u64,
     pub wrap: bool,
     pub show_whitespace: bool,
+    /// Whether the original file used CRLF line endings (restore on save).
+    pub crlf: bool,
 }
 
 pub struct HelpState {
@@ -997,6 +999,7 @@ impl AppState {
                 request_id,
                 wrap: true,
                 show_whitespace: false,
+                crlf: false,
             };
             panel.mode = PanelMode::Edit(edit);
             match panel.mode {

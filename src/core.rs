@@ -322,6 +322,8 @@ pub struct EditLoadResult {
     pub id: u64,
     pub path: path::PathBuf,
     pub text: String,
+    /// Whether the original file used CRLF line endings.
+    pub crlf: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

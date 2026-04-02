@@ -427,7 +427,13 @@ pub(crate) fn handle_keyboard(
         }
         if ctrl_s {
             if let Some(path) = edit.path.clone() {
-                let contents = edit.text.as_bytes().to_vec();
+                // Restore CRLF line endings if the original file used them.
+                let save_text = if edit.crlf {
+                    edit.text.replace('\n', "\r\n")
+                } else {
+                    edit.text.clone()
+                };
+                let contents = save_text.as_bytes().to_vec();
                 // Check if this is a remote file (synthetic /sftp/host/path)
                 let path_str = path.to_string_lossy();
                 if let Some(rest) = path_str.strip_prefix("/sftp/") {

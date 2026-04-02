@@ -1057,6 +1057,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         {
             edit.loading = false;
             edit.text = result.text;
+            edit.crlf = result.crlf;
             edit.highlight_hash = hash_text(&edit.text);
             edit.highlight_wrap_width = 0.0;
             edit.highlight_key = Some(format!("edit:{}", result.path.to_string_lossy()));
@@ -3336,10 +3337,17 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             Err(e) => format!("Failed to read file: {e}"),
                         }
                     };
+                    let crlf = text.contains("\r\n");
+                    let text = if crlf {
+                        text.replace("\r\n", "\n")
+                    } else {
+                        text
+                    };
                     let _ = edit_res_tx.send(core::EditLoadResult {
                         id: req.id,
                         path: req.path,
                         text,
+                        crlf,
                     });
                 }
             });
