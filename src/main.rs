@@ -1230,6 +1230,43 @@ fn draw_error_modal(ctx: &egui::Context, message: &str) {
         });
 }
 
+fn draw_elevation_modal(ctx: &egui::Context, message: &str) -> Option<bool> {
+    let screen = ctx.available_rect();
+    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "elevation_overlay".into());
+    ctx.layer_painter(overlay_layer).rect_filled(
+        screen,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_black_alpha(160),
+    );
+    let mut result = None;
+    egui::Window::new("Permission Denied")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), message);
+            ui.add_space(4.0);
+            ui.label("An OS authentication prompt will appear.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("Retry with elevation").min_size(egui::vec2(160.0, 0.0)))
+                    .clicked()
+                {
+                    result = Some(true);
+                }
+                if ui
+                    .add(egui::Button::new("Dismiss").min_size(egui::vec2(80.0, 0.0)))
+                    .clicked()
+                {
+                    result = Some(false);
+                }
+            });
+        });
+    result
+}
+
 fn draw_async_indicator(ctx: &egui::Context, app: &app_state::AppState) {
     let search_running = matches!(app.search_status, app_state::SearchStatus::Running(_));
     let is_busy = app.io_in_flight > 0
@@ -3482,6 +3519,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             },
             quick_jump: None,
             error_message: None,
+            elevation_prompt: None,
             sftp_sessions: HashMap::new(),
             sftp_sessions_shared: sftp_sessions_shared.clone(),
             sftp_connecting: None,
@@ -3607,6 +3645,14 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         core::IOResult::ErrorRemote(host, msg) => {
                             remote_hosts.push(host);
                             io_errors.push(msg);
+                        }
+                        core::IOResult::PermissionError { message, task } => {
+                            local_refresh = true;
+                            if fileman::elevate::elevation_available() {
+                                runtime.app.elevation_prompt = Some((message, task));
+                            } else {
+                                io_errors.push(message);
+                            }
                         }
                     }
                     completed += 1;
@@ -3959,6 +4005,21 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     if let Some(ref host) = runtime.app.sftp_connecting.clone() {
                         draw_connecting_modal(ctx, host);
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                    if let Some((ref msg, _)) = runtime.app.elevation_prompt.clone() {
+                        match draw_elevation_modal(ctx, msg) {
+                            Some(true) => {
+                                if let Some((_, task)) = runtime.app.elevation_prompt.take() {
+                                    runtime
+                                        .app
+                                        .enqueue_io(core::IOTask::Elevated(Box::new(task)));
+                                }
+                            }
+                            Some(false) => {
+                                runtime.app.elevation_prompt = None;
+                            }
+                            None => {}
+                        }
                     }
                     if let Some(ref msg) = runtime.app.error_message.clone() {
                         draw_error_modal(ctx, msg);
