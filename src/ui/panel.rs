@@ -294,11 +294,6 @@ pub fn draw_panel(
                                         egui::Vec2::new(left_width, ui.available_height()),
                                         egui::Sense::hover(),
                                     );
-                                    let header_display = if is_active {
-                                        format!("● {header_text}")
-                                    } else {
-                                        header_text.clone()
-                                    };
                                     let header_font = egui::TextStyle::Body.resolve(ui.style());
                                     let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
                                     let header_color = color32(colors.header_fg);
@@ -330,22 +325,24 @@ pub fn draw_panel(
                                             },
                                         );
                                     }
+                                    // Reserve space for the active-panel dot
+                                    let dot_space = if is_active { header_font.size } else { 0.0 };
                                     let suffix = if loading {
                                         if let Some((loaded, total)) = loading_progress {
                                             if let Some(total) = total {
-                                                format!("{header_display} ({loaded}/{total})")
+                                                format!("{header_text} ({loaded}/{total})")
                                             } else {
-                                                format!("{header_display} ({loaded})")
+                                                format!("{header_text} ({loaded})")
                                             }
                                         } else {
-                                            header_display.clone()
+                                            header_text.clone()
                                         }
                                     } else {
-                                        header_display.clone()
+                                        header_text.clone()
                                     };
                                     job.append(
                                         &suffix,
-                                        0.0,
+                                        dot_space,
                                         egui::text::TextFormat {
                                             font_id: header_font.clone(),
                                             color: header_color,
@@ -357,6 +354,14 @@ pub fn draw_panel(
                                     let pos = egui::Align2::LEFT_CENTER
                                         .anchor_size(left_rect.left_center(), galley.size());
                                     painter.galley(pos.min, galley, header_color);
+                                    if is_active {
+                                        let radius = header_font.size * 0.25;
+                                        let center = egui::pos2(
+                                            pos.min.x + radius + 1.0,
+                                            left_rect.center().y,
+                                        );
+                                        painter.circle_filled(center, radius, header_color);
+                                    }
                                     if left_width > 0.0 {
                                         ui.add_space(gap);
                                     }
