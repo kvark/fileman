@@ -251,7 +251,7 @@ fn apply_theme(ctx: &egui::Context, colors: &theme::ThemeColors) {
     style.spacing.window_margin = egui::Margin::same(8);
     style.visuals.window_fill = color32(colors.preview_bg);
     style.visuals.panel_fill = color32(colors.preview_bg);
-    style.visuals.extreme_bg_color = color32(colors.header_bg);
+    style.visuals.extreme_bg_color = color32(colors.preview_bg);
     style.visuals.window_stroke.color = color32(colors.panel_border_inactive);
     style.visuals.window_corner_radius = egui::CornerRadius::same(6);
     style.visuals.menu_corner_radius = egui::CornerRadius::same(6);
