@@ -142,10 +142,9 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
                         .animate(true),
                 );
             } else if items > 0 {
-                ui.add(
-                    egui::ProgressBar::new(0.0)
-                        .text(format!("Deleted {items}…"))
-                        .animate(true),
+                ui.colored_label(
+                    color32(colors.row_fg_active),
+                    format!("Deleted {items} items…"),
                 );
             } else {
                 ui.add(egui::ProgressBar::new(0.0).animate(true));
