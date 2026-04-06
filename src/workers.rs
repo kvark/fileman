@@ -349,6 +349,7 @@ pub fn start_io_worker(
                                 &locked.sftp,
                                 &remote_path,
                                 &local_path,
+                                Some(&cancel_flag),
                                 Some(&transfer_progress),
                             )
                         };
@@ -390,6 +391,7 @@ pub fn start_io_worker(
                                 &locked.sftp,
                                 &src,
                                 &remote_path,
+                                Some(&cancel_flag),
                                 Some(&transfer_progress),
                             )
                         };
@@ -495,9 +497,11 @@ pub fn start_io_worker(
                             &locked.sftp,
                             &remote_path,
                             &local_path,
+                            Some(&cancel_flag),
                             Some(&transfer_progress),
                         ) {
                             Ok(()) => open_with_default_app_bg(&local_path),
+                            Err(e) if e == "Cancelled" => {}
                             Err(e) => eprintln!("Remote-to-local copy error: {e}"),
                         }
                     } else {
