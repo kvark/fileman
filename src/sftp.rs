@@ -772,13 +772,14 @@ pub fn copy_remote_to_local(
     remote_path: &str,
     local_dst: &Path,
 ) -> Result<(), String> {
-    copy_remote_to_local_progress(sftp, remote_path, local_dst, None)
+    copy_remote_to_local_progress(sftp, remote_path, local_dst, None, None)
 }
 
 pub fn copy_remote_to_local_progress(
     sftp: &Sftp,
     remote_path: &str,
     local_dst: &Path,
+    cancel: Option<&AtomicBool>,
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
     let stat = sftp.stat(Path::new(remote_path)).ok();
@@ -792,6 +793,9 @@ pub fn copy_remote_to_local_progress(
         .map_err(|e| format!("create local {}: {e}", local_dst.display()))?;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err("Cancelled".to_string());
+        }
         match remote_file.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -815,13 +819,14 @@ pub fn copy_local_to_remote(
     local_src: &Path,
     remote_path: &str,
 ) -> Result<(), String> {
-    copy_local_to_remote_progress(sftp, local_src, remote_path, None)
+    copy_local_to_remote_progress(sftp, local_src, remote_path, None, None)
 }
 
 pub fn copy_local_to_remote_progress(
     sftp: &Sftp,
     local_src: &Path,
     remote_path: &str,
+    cancel: Option<&AtomicBool>,
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
     if let Some(p) = progress {
@@ -835,6 +840,9 @@ pub fn copy_local_to_remote_progress(
         .map_err(|e| format!("create remote {remote_path}: {e}"))?;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err("Cancelled".to_string());
+        }
         match local_file.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
