@@ -78,16 +78,21 @@ jobs:
         run: |
           cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle
           rustup target add aarch64-apple-darwin
-          cargo bundle --release --target aarch64-apple-darwin --features self-update
-        env:
-          OPENSSL_DIR: /opt/homebrew/opt/openssl@3
+          cargo bundle --release --target aarch64-apple-darwin --features self-update,vendored-openssl
 
       - name: Package (macOS)
         if: matrix.os == 'macos-latest'
         run: |
           mkdir -p dist
-          codesign --sign - --deep --force target/aarch64-apple-darwin/release/bundle/osx/FileMan.app
-          ditto -c -k --sequesterRsrc --keepParent target/aarch64-apple-darwin/release/bundle/osx/FileMan.app dist/fileman-macos-aarch64.zip
+          APP=target/aarch64-apple-darwin/release/bundle/osx/FileMan.app
+          codesign --sign - --deep --force "$APP"
+          # ZIP for self-update compatibility
+          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/fileman-macos-aarch64.zip
+          # DMG for drag-to-install
+          mkdir -p dmg_staging
+          cp -R "$APP" dmg_staging/
+          ln -s /Applications dmg_staging/Applications
+          hdiutil create -volname FileMan -srcfolder dmg_staging -ov -format UDZO dist/fileman-macos-aarch64.dmg
 
       # --- Windows ---
       - name: Build (Windows)
