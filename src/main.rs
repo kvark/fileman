@@ -867,9 +867,22 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
 
     // Evict stale SFTP sessions that failed during directory listing.
     // The next navigation will trigger a fresh reconnect.
-    for host in stale_sessions {
-        app.sftp_sessions.remove(&host);
-        app.sftp_sessions_shared.lock().unwrap().remove(&host);
+    // Drop removed sessions on a background thread because libssh2_session_free
+    // can block in poll() for an extended time, which would hang the UI.
+    if !stale_sessions.is_empty() {
+        let mut removed = Vec::new();
+        {
+            let mut shared = app.sftp_sessions_shared.lock().unwrap();
+            for host in stale_sessions {
+                if let Some(s) = app.sftp_sessions.remove(&host) {
+                    removed.push(s);
+                }
+                shared.remove(&host);
+            }
+        }
+        if !removed.is_empty() {
+            std::thread::spawn(move || drop(removed));
+        }
     }
 
     // Poll shared archive indexes for incremental updates
@@ -1030,12 +1043,18 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
             Ok(session) => {
                 let host_key = session.host.clone();
                 let arc_session = Arc::new(std::sync::Mutex::new(session));
-                app.sftp_sessions
+                let old = app
+                    .sftp_sessions
                     .insert(host_key.clone(), arc_session.clone());
                 app.sftp_sessions_shared
                     .lock()
                     .unwrap()
                     .insert(host_key.clone(), arc_session);
+                // Drop old session on a background thread to avoid blocking
+                // the UI in libssh2_session_free.
+                if let Some(old) = old {
+                    std::thread::spawn(move || drop(old));
+                }
                 if let Some((nav_host, nav_path, nav_panel)) = app.sftp_pending_nav.take()
                     && nav_host == host_key
                 {
