@@ -582,6 +582,32 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Format a Unix timestamp (seconds since epoch) as a compact date/time string.
+/// Returns "YYYY-MM-DD HH:MM" for compactness.
+pub fn format_date(epoch_secs: u64) -> String {
+    // Convert epoch seconds to calendar date/time using basic arithmetic.
+    // This handles leap years correctly.
+    let secs = epoch_secs as i64;
+    let days_since_epoch = secs.div_euclid(86400);
+    let time_of_day = secs.rem_euclid(86400) as u64;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    // Civil date from days since 1970-01-01 (algorithm from Howard Hinnant)
+    let z = days_since_epoch + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097) as u64; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02} {hours:02}:{minutes:02}")
+}
+
 pub fn format_mode(mode: u32) -> String {
     let file_type = if mode & 0o40000 != 0 {
         'd'
