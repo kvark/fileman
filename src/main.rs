@@ -247,7 +247,7 @@ static THEME_SET: once_cell::sync::Lazy<syntect::highlighting::ThemeSet> =
     once_cell::sync::Lazy::new(syntect::highlighting::ThemeSet::load_defaults);
 
 fn apply_theme(ctx: &egui::Context, colors: &theme::ThemeColors) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.spacing.item_spacing = egui::Vec2::new(8.0, 6.0);
     style.spacing.window_margin = egui::Margin::same(8);
     style.visuals.window_fill = color32(colors.preview_bg);
@@ -268,7 +268,7 @@ fn apply_theme(ctx: &egui::Context, colors: &theme::ThemeColors) {
     style.visuals.widgets.hovered.fg_stroke.color = color32(colors.row_fg_active);
     style.visuals.hyperlink_color = color32(colors.panel_border_active);
     style.visuals.override_text_color = Some(color32(colors.row_fg_active));
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 fn app_icon() -> Option<winit::window::Icon> {
@@ -1206,7 +1206,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
 }
 
 fn draw_connecting_modal(ctx: &egui::Context, host: &str) {
-    let screen = ctx.available_rect();
+    let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "connecting_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
@@ -1226,7 +1226,7 @@ fn draw_connecting_modal(ctx: &egui::Context, host: &str) {
 }
 
 fn draw_error_modal(ctx: &egui::Context, message: &str) {
-    let screen = ctx.available_rect();
+    let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "error_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
@@ -1251,7 +1251,7 @@ fn draw_error_modal(ctx: &egui::Context, message: &str) {
 }
 
 fn draw_elevation_modal(ctx: &egui::Context, message: &str) -> Option<bool> {
-    let screen = ctx.available_rect();
+    let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "elevation_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
@@ -2945,7 +2945,7 @@ impl Runtime {
         self.highlight_cache.clear();
         self.highlight_pending.clear();
         if let Some(sync) = self.last_sync.take() {
-            self.context.wait_for(&sync, !0);
+            self.context.wait_for(&sync, !0).ok();
         }
         self.context
             .destroy_command_encoder(&mut self.command_encoder);
@@ -3013,7 +3013,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 timing: false,
                 capture: false,
                 overlay: false,
-                device_id: 0,
+                device_id: Some(0),
             }) {
                 Ok(context) => context,
                 Err(err) => {
@@ -3728,12 +3728,13 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 raw_input
                     .events
                     .retain(|e| !matches!(e, egui::Event::Key { .. }));
-                let output = runtime.egui_ctx.run(raw_input, |ctx| {
+                let output = runtime.egui_ctx.run_ui(raw_input, |root_ui| {
+                    let ctx = root_ui.ctx().clone();
                     // Inject key events back into InputState so our handler can read them
                     ctx.input_mut(|i| i.events.extend(key_events.iter().cloned()));
-                    apply_theme(ctx, &runtime.app.theme.colors());
+                    apply_theme(&ctx, &runtime.app.theme.colors());
                     let input = ctx.input(|i| i.clone());
-                    input::handle_keyboard(ctx, &input, &mut runtime.app, &mut runtime.ui_cache);
+                    input::handle_keyboard(&ctx, &input, &mut runtime.app, &mut runtime.ui_cache);
                     runtime.ui_cache.update_scroll_mode(&runtime.app);
 
                     // Defer results for keys whose current refining preview
@@ -3829,12 +3830,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
                     runtime.app.refresh_tick = runtime.app.refresh_tick.wrapping_add(1);
                     ui::command_bar::draw_command_bar(
-                        ctx,
+                        root_ui,
                         &runtime.app,
                         &runtime.app.theme.colors(),
                     );
 
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show_inside(root_ui, |ui| {
                         let rect = ui.available_rect_before_wrap();
                         let spacing_x = ui.spacing().item_spacing.x;
                         let panel_width = ((rect.width() - spacing_x) * 0.5).max(0.0);
@@ -3998,36 +3999,37 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     });
 
                     if runtime.app.theme_picker_open {
-                        ui::theme_picker::draw_theme_picker(ctx, &mut runtime.app);
+                        ui::theme_picker::draw_theme_picker(&ctx, &mut runtime.app);
                     }
                     if runtime.app.pending_op.is_some() {
-                        ui::modals::draw_confirmation(ctx, &mut runtime.app);
+                        ui::modals::draw_confirmation(&ctx, &mut runtime.app);
                     }
                     if let Some(edit) = runtime.app.edit_panel_mut()
                         && edit.confirm_discard
                     {
-                        ui::modals::draw_discard_modal(ctx, &mut runtime.app);
+                        ui::modals::draw_discard_modal(&ctx, &mut runtime.app);
                     }
                     #[cfg(unix)]
                     if runtime.app.props_dialog.is_some() {
-                        ui::props_dialog::draw_props_modal(ctx, &mut runtime.app);
+                        ui::props_dialog::draw_props_modal(&ctx, &mut runtime.app);
                     }
                     if runtime.app.io_in_flight > 0 {
-                        ui::modals::draw_progress_modal(ctx, &runtime.app);
+                        ui::modals::draw_progress_modal(&ctx, &runtime.app);
                     }
                     if runtime.app.quick_jump.is_some()
-                        && let Some(result) = ui::quick_jump::draw_quick_jump(ctx, &mut runtime.app)
+                        && let Some(result) =
+                            ui::quick_jump::draw_quick_jump(&ctx, &mut runtime.app)
                     {
                         let active = runtime.app.active_panel;
                         runtime.app.close_quick_jump();
                         navigate_quick_jump(&mut runtime.app, result, active);
                     }
                     if let Some(ref host) = runtime.app.sftp_connecting.clone() {
-                        draw_connecting_modal(ctx, host);
+                        draw_connecting_modal(&ctx, host);
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     }
                     if let Some((ref msg, _)) = runtime.app.elevation_prompt.clone() {
-                        match draw_elevation_modal(ctx, msg) {
+                        match draw_elevation_modal(&ctx, msg) {
                             Some(true) => {
                                 if let Some((_, task)) = runtime.app.elevation_prompt.take() {
                                     runtime
@@ -4042,9 +4044,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         }
                     }
                     if let Some(ref msg) = runtime.app.error_message.clone() {
-                        draw_error_modal(ctx, msg);
+                        draw_error_modal(&ctx, msg);
                     }
-                    draw_async_indicator(ctx, &runtime.app);
+                    draw_async_indicator(&ctx, &runtime.app);
                 });
                 runtime
                     .egui_state
@@ -4070,7 +4072,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 };
 
                 if let Some(sync) = runtime.last_sync.take() {
-                    runtime.context.wait_for(&sync, !0);
+                    runtime.context.wait_for(&sync, !0).ok();
                 }
                 runtime.command_encoder.start();
                 runtime.painter.update_textures(
@@ -4331,7 +4333,7 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
 }
 
 struct UiRender<'a> {
-    ctx: &'a egui::Context,
+    ui: &'a mut egui::Ui,
     app: &'a mut app_state::AppState,
     ui_cache: &'a mut UiCache,
     image_cache: &'a mut ImageCache,
@@ -4343,7 +4345,7 @@ struct UiRender<'a> {
 
 fn draw_root_ui(render: UiRender<'_>) {
     let UiRender {
-        ctx,
+        ui: root_ui,
         app,
         ui_cache,
         image_cache,
@@ -4352,11 +4354,12 @@ fn draw_root_ui(render: UiRender<'_>) {
         highlight_pending,
         highlight_req_tx,
     } = render;
+    let ctx = root_ui.ctx().clone();
     let transfer_progress = app.transfer_progress.clone();
     app.refresh_tick = app.refresh_tick.wrapping_add(1);
-    apply_theme(ctx, &app.theme.colors());
-    ui::command_bar::draw_command_bar(ctx, app, &app.theme.colors());
-    egui::CentralPanel::default().show(ctx, |ui| {
+    apply_theme(&ctx, &app.theme.colors());
+    ui::command_bar::draw_command_bar(root_ui, app, &app.theme.colors());
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         let rect = ui.available_rect_before_wrap();
         let spacing_x = ui.spacing().item_spacing.x;
         let panel_width = ((rect.width() - spacing_x) * 0.5).max(0.0);
@@ -4501,22 +4504,22 @@ fn draw_root_ui(render: UiRender<'_>) {
         );
     });
     if app.pending_op.is_some() {
-        ui::modals::draw_confirmation(ctx, app);
+        ui::modals::draw_confirmation(&ctx, app);
     }
     if let Some(edit) = app.edit_panel_mut()
         && edit.confirm_discard
     {
-        ui::modals::draw_discard_modal(ctx, app);
+        ui::modals::draw_discard_modal(&ctx, app);
     }
     #[cfg(unix)]
     if app.props_dialog.is_some() {
-        ui::props_dialog::draw_props_modal(ctx, app);
+        ui::props_dialog::draw_props_modal(&ctx, app);
     }
     if app.io_in_flight > 0 {
-        ui::modals::draw_progress_modal(ctx, app);
+        ui::modals::draw_progress_modal(&ctx, app);
     }
     if app.quick_jump.is_some()
-        && let Some(result) = ui::quick_jump::draw_quick_jump(ctx, app)
+        && let Some(result) = ui::quick_jump::draw_quick_jump(&ctx, app)
     {
         let active = app.active_panel;
         app.close_quick_jump();

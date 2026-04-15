@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## v0.3.2 (14 Apr 2026)
 
 ### Features
 - On access denied, offer to retry with elevated privileges
+- Last-modified tab
+
+### Fixes
+- Better IO and remote error handling
+- Update to egui-0.34
 
 ## 0.3.1 (4 Apr 2026)
 

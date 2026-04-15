@@ -158,7 +158,7 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
             let response = edit_output
                 .as_ref()
                 .map(|output| output.response.clone())
-                .unwrap_or_else(|| ui.label(" "));
+                .unwrap_or_else(|| egui::AtomLayoutResponse::empty(ui.label(" ")));
             // Auto-indent: if Enter was just pressed, copy leading whitespace
             // from the previous line and insert it after the newline.
             // Auto-indent: if Enter was just pressed, copy leading whitespace
@@ -260,7 +260,7 @@ fn paint_newline_markers(ui: &egui::Ui, output: &egui::text_edit::TextEditOutput
     let color = egui::Color32::from_white_alpha(40);
     let font = egui::FontId::monospace(10.0);
     for placed_row in &galley.rows {
-        if placed_row.row.ends_with_newline {
+        if placed_row.ends_with_newline {
             let row_rect = placed_row.rect();
             let last_x = if let Some(last_glyph) = placed_row.row.glyphs.last() {
                 last_glyph.pos.x + last_glyph.size().x

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use png::{AdaptiveFilterType, Compression, FilterType};
+use png::Compression;
 use zune_core::colorspace::ColorSpace;
 use zune_image::image::Image as ZuneImage;
 
@@ -88,9 +88,7 @@ pub fn save_snapshot_png(
     let mut encoder = png::Encoder::new(file, width, height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(Compression::Best);
-    encoder.set_filter(FilterType::Paeth);
-    encoder.set_adaptive_filter(AdaptiveFilterType::Adaptive);
+    encoder.set_compression(Compression::High);
     let mut writer = encoder
         .write_header()
         .map_err(|err| format!("Failed to write PNG header: {err}"))?;

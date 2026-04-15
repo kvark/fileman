@@ -551,11 +551,12 @@ impl HeadlessUi {
             .collect(),
             ..Default::default()
         };
-        let _ = self.egui_ctx.run(raw_input, |ctx| {
+        let _ = self.egui_ctx.run_ui(raw_input, |ui| {
+            let ctx = ui.ctx();
             let input = ctx.input(|i| i.clone());
             input::handle_keyboard(ctx, &input, app, ui_cache);
             draw_root_ui(UiRender {
-                ctx,
+                ui,
                 app,
                 ui_cache,
                 image_cache: &mut self.image_cache,

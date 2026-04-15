@@ -10,7 +10,7 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
         return;
     };
     let colors = app.theme.colors();
-    let screen = ctx.available_rect();
+    let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "props_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,

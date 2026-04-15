@@ -16,7 +16,7 @@ pub fn draw_quick_jump(
     let qj = app.quick_jump.as_mut()?;
 
     let colors = app.theme.colors();
-    let screen = ctx.available_rect();
+    let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "quick_jump_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
