@@ -5,6 +5,7 @@
 ### Features
 - On access denied, offer to retry with elevated privileges
 - Last-modified tab
+- Prompt to elevate permissions
 
 ### Fixes
 - Better IO and remote error handling
