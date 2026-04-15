@@ -2,21 +2,17 @@ use fileman::{app_state, theme};
 
 use crate::color32;
 
-pub fn draw_command_bar(
-    ctx: &egui::Context,
-    app: &app_state::AppState,
-    colors: &theme::ThemeColors,
-) {
-    let modifiers = ctx.input(|i| i.modifiers);
+pub fn draw_command_bar(ui: &mut egui::Ui, app: &app_state::AppState, colors: &theme::ThemeColors) {
+    let modifiers = ui.ctx().input(|i| i.modifiers);
     let preview_side = app.preview_panel_side();
     let other_panel_preview = preview_side
         .as_ref()
         .is_some_and(|side| *side != app.active_panel);
     // On macOS, show Ctrl+letter combos instead of F-keys (laptops lack a real F-key row).
     let use_ctrl = cfg!(target_os = "macos");
-    egui::TopBottomPanel::bottom("command_bar")
-        .exact_height(30.0)
-        .show(ctx, |ui| {
+    egui::Panel::bottom("command_bar")
+        .exact_size(30.0)
+        .show_inside(ui, |ui| {
             egui::Frame::NONE
                 .fill(color32(colors.footer_bg))
                 .inner_margin(egui::Margin::symmetric(10, 6))

@@ -13,7 +13,7 @@ pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
     let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
     let (title, body) = pending_op_text(&op);
     let colors = app.theme.colors();
-    let screen = ctx.available_rect();
+    let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "confirm_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
@@ -99,7 +99,7 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
     }
 
     let colors = app.theme.colors();
-    let screen = ctx.available_rect();
+    let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "progress_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
@@ -160,7 +160,7 @@ pub fn draw_discard_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
     let Some(side) = app.edit_panel_side() else {
         return;
     };
-    let screen = ctx.available_rect();
+    let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "discard_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,

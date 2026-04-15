@@ -1242,8 +1242,8 @@ pub fn create_archive(
 fn create_zip_archive(sources: &[path::PathBuf], archive_path: &Path) -> io::Result<()> {
     let file = fs::File::create(archive_path)?;
     let mut zip = zip::ZipWriter::new(file);
-    let options =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     for src in sources {
         add_path_to_zip(&mut zip, src, "", options)?;
     }
@@ -1255,7 +1255,7 @@ fn add_path_to_zip<W: Write + io::Seek>(
     zip: &mut zip::ZipWriter<W>,
     path: &Path,
     prefix: &str,
-    options: zip::write::FileOptions,
+    options: zip::write::SimpleFileOptions,
 ) -> io::Result<()> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let archive_name = if prefix.is_empty() {

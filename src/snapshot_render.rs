@@ -20,7 +20,10 @@ pub(crate) fn render_snapshot(
     path: &PathBuf,
 ) -> anyhow::Result<()> {
     let context = unsafe {
-        bg::Context::init(bg::ContextDesc::default())
+        bg::Context::init(bg::ContextDesc {
+            device_id: Some(0),
+            ..Default::default()
+        })
             .map_err(|err| anyhow::anyhow!("Failed to init GPU context: {err:?}"))?
     };
 
@@ -119,9 +122,9 @@ pub(crate) fn render_snapshot(
         .collect(),
         ..Default::default()
     };
-    let output = egui_ctx.run(raw_input, |ctx| {
+    let output = egui_ctx.run_ui(raw_input, |ui| {
         draw_root_ui(UiRender {
-            ctx,
+            ui,
             app,
             ui_cache,
             image_cache: &mut image_cache,
@@ -180,7 +183,7 @@ pub(crate) fn render_snapshot(
 
     let sync = context.submit(&mut command_encoder);
     painter.after_submit(&sync);
-    context.wait_for(&sync, !0);
+    context.wait_for(&sync, !0).ok();
 
     snapshot::save_snapshot_png(
         &result_buffer,

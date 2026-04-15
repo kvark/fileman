@@ -92,7 +92,7 @@ pub fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
     }
 
     let options = zune_core::options::DecoderOptions::new_fast();
-    if let Ok(image) = zune_image::image::Image::read(bytes, options) {
+    if let Ok(image) = zune_image::image::Image::read(std::io::Cursor::new(bytes), options) {
         let orientation = exif_orientation(&image).unwrap_or(1);
         let (width, height) = image.dimensions();
         let depth = image.depth();
@@ -682,11 +682,11 @@ fn tga_decode_rle_gray(
 }
 
 fn decode_bmp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
-    let mut decoder = zune_bmp::BmpDecoder::new(bytes);
+    let mut decoder = zune_bmp::BmpDecoder::new(std::io::Cursor::new(bytes));
     decoder.decode_headers().ok()?;
-    let (width, height) = decoder.get_dimensions()?;
-    let depth = decoder.get_depth();
-    let colorspace = decoder.get_colorspace()?;
+    let (width, height) = decoder.dimensions()?;
+    let depth = decoder.depth();
+    let colorspace = decoder.colorspace()?;
     let data = decoder.decode().ok()?;
     let rgba = convert_to_rgba(&data, width, height, colorspace)?;
     let (out_w, out_h, out_rgba) = downscale_rgba(&rgba, width, height, max_side);
@@ -752,7 +752,7 @@ fn extract_exif_thumbnail(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, 
     }
     // Decode the small thumbnail with zune
     let options = zune_core::options::DecoderOptions::new_fast();
-    let image = zune_image::image::Image::read(thumb_bytes, options).ok()?;
+    let image = zune_image::image::Image::read(std::io::Cursor::new(thumb_bytes), options).ok()?;
     let (width, height) = image.dimensions();
     // Skip if thumbnail is too small to be useful
     if width.max(height) < 160 {

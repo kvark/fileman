@@ -282,7 +282,7 @@ fn parse_theme_bytes(name_hint: &str, bytes: &[u8]) -> Option<(String, ThemeColo
             .unwrap_or(dark_base.clone());
         return Some((name, colors));
     }
-    if let Ok(tf) = serde_yaml::from_slice::<ThemeFile>(bytes) {
+    if let Ok(tf) = serde_yml::from_slice::<ThemeFile>(bytes) {
         let name = tf.name.unwrap_or_else(|| name_hint.to_string());
         let colors = tf
             .colors
