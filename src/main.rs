@@ -33,6 +33,7 @@ mod replay;
 
 const ROW_HEIGHT: f32 = 24.0;
 const SIZE_COL_WIDTH: f32 = 84.0;
+const DATE_COL_WIDTH: f32 = 110.0;
 const SNAPSHOT_WIDTH: u32 = 800;
 const SNAPSHOT_HEIGHT: u32 = 600;
 const MAX_IMAGE_TEXTURES: usize = 64;

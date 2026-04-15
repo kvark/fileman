@@ -4,8 +4,8 @@ use fileman::{app_state, archive, core, theme};
 
 use crate::input::open_selected;
 use crate::{
-    ImageCache, ImageRequest, ROW_HEIGHT, SIZE_COL_WIDTH, ScrollMode, blend_color, color32,
-    fade_color, panel_path_display, reload_panel, resort_browser_entries, sort_mode_label,
+    DATE_COL_WIDTH, ImageCache, ImageRequest, ROW_HEIGHT, SIZE_COL_WIDTH, ScrollMode, blend_color,
+    color32, fade_color, panel_path_display, reload_panel, resort_browser_entries, sort_mode_label,
     window_rows_for,
 };
 
@@ -600,10 +600,25 @@ pub fn draw_panel(
                                         color32(fg),
                                     );
                                 }
+                                // Date column between name and size
+                                if let Some(mtime) = entry.modified {
+                                    let date_text = core::format_date(mtime);
+                                    ui.painter().text(
+                                        egui::pos2(
+                                            rect.right() - SIZE_COL_WIDTH - 4.0,
+                                            rect.center().y,
+                                        ),
+                                        egui::Align2::RIGHT_CENTER,
+                                        date_text,
+                                        font_id.clone(),
+                                        color32(fade_color(fg, 0.7)),
+                                    );
+                                }
+                                let right_cols = SIZE_COL_WIDTH + DATE_COL_WIDTH;
                                 let name_min = rect.left_center() + egui::Vec2::new(22.0, 0.0);
                                 let name_rect = egui::Rect::from_min_max(
                                     egui::pos2(name_min.x, rect.top()),
-                                    egui::pos2(rect.right() - SIZE_COL_WIDTH, rect.bottom()),
+                                    egui::pos2(rect.right() - right_cols, rect.bottom()),
                                 );
                                 if rename_active {
                                     ui.scope_builder(
