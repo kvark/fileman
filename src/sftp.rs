@@ -3,7 +3,7 @@ use std::{
     io::{self, Read, Write},
     net::TcpStream,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}},
 };
 
 use ssh2::{self, Session, Sftp};
@@ -14,6 +14,40 @@ pub struct SftpSession {
     pub session: Session,
     pub sftp: Sftp,
     pub host: String,
+}
+
+type SessionMap = HashMap<String, Arc<Mutex<SftpSession>>>;
+
+/// Shared SFTP session registry for global access (e.g. from archive streaming).
+/// Initialized once at startup with the app's shared session map.
+static SHARED_SESSIONS: OnceLock<Arc<Mutex<SessionMap>>> = OnceLock::new();
+
+pub fn init_shared_registry(sessions: Arc<Mutex<SessionMap>>) {
+    let _ = SHARED_SESSIONS.set(sessions);
+}
+
+pub fn get_session(host: &str) -> Option<Arc<Mutex<SftpSession>>> {
+    SHARED_SESSIONS.get()?.lock().ok()?.get(host).cloned()
+}
+
+/// Synthetic path prefix used to encode remote archive locations as `PathBuf`,
+/// so remote archives can flow through the existing container browsing path.
+/// Format: `/.sftp-archive/<host><remote_abs_path>` — the remote path keeps
+/// its leading `/` so `<host>` is the first path segment after the marker.
+pub const SFTP_ARCHIVE_PREFIX: &str = "/.sftp-archive/";
+
+pub fn encode_archive_path(host: &str, remote_path: &str) -> std::path::PathBuf {
+    let trimmed = remote_path.trim_start_matches('/');
+    std::path::PathBuf::from(format!("{SFTP_ARCHIVE_PREFIX}{host}/{trimmed}"))
+}
+
+pub fn decode_archive_path(path: &Path) -> Option<(String, String)> {
+    let s = path.to_str()?;
+    let rest = s.strip_prefix(SFTP_ARCHIVE_PREFIX)?;
+    let slash = rest.find('/')?;
+    let host = rest[..slash].to_string();
+    let remote = format!("/{}", &rest[slash + 1..]);
+    Some((host, remote))
 }
 
 pub struct SshHostConfig {

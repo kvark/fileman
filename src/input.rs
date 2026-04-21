@@ -245,28 +245,26 @@ fn open_selected_from_to(
             } else if let Some(kind) =
                 core::container_kind_from_path(std::path::Path::new(&path))
             {
-                let name = path.rsplit('/').next().unwrap_or(&selected_entry.name);
-                let tmp_dir = std::env::temp_dir().join("fileman_extract");
-                if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-                    eprintln!("Failed to create temp dir: {e}");
-                    return;
-                }
-                let local_path = tmp_dir.join(name);
+                // Navigate into the remote archive as a container, using a
+                // synthetic archive path so the whole container stack can work
+                // unchanged. The archive reader streams via SFTP.
+                let synthetic = fileman::sftp::encode_archive_path(&host, &path);
                 let return_dir = path
                     .trim_end_matches('/')
                     .rsplit_once('/')
                     .map(|(parent, _)| parent.to_string())
                     .unwrap_or_else(|| "/".to_string());
-                let _ = app.io_tx.send(core::IOTask::DownloadRemoteArchive {
-                    host: host.clone(),
-                    remote_path: path,
-                    local_path,
+                load_container_directory_async(
+                    app,
                     kind,
-                    panel: target,
-                    return_host: host,
-                    return_dir,
-                });
-                app.io_in_flight = app.io_in_flight.saturating_add(1);
+                    synthetic,
+                    "".to_string(),
+                    None,
+                    target,
+                    None,
+                    ContainerLoadMode::UseCache,
+                    Some((host, return_dir)),
+                );
             }
         }
     }

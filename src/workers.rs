@@ -509,45 +509,6 @@ pub fn start_io_worker(
                     }
                     io_result = IOResult::CompletedSilent;
                 }
-                IOTask::DownloadRemoteArchive {
-                    host,
-                    remote_path,
-                    local_path,
-                    kind,
-                    panel,
-                    return_host,
-                    return_dir,
-                } => {
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
-                        match crate::sftp::copy_remote_to_local_progress(
-                            &locked.sftp,
-                            &remote_path,
-                            &local_path,
-                            Some(&cancel_flag),
-                            Some(&transfer_progress),
-                        ) {
-                            Ok(()) => {
-                                io_result = IOResult::EnterContainer {
-                                    archive_path: local_path,
-                                    kind,
-                                    panel,
-                                    return_remote: Some((return_host, return_dir)),
-                                };
-                            }
-                            Err(e) if e == "Cancelled" => {}
-                            Err(e) => {
-                                let msg = format!("Failed to download remote archive: {e}");
-                                eprintln!("{msg}");
-                                io_result = IOResult::ErrorRemote(host, msg);
-                            }
-                        }
-                    } else {
-                        let msg = format!("No SFTP session for host: {host}");
-                        eprintln!("{msg}");
-                        io_result = IOResult::ErrorRemote(host, msg);
-                    }
-                }
                 IOTask::CopyRemoteSameHost {
                     host,
                     src_path,

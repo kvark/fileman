@@ -39,7 +39,6 @@ const SNAPSHOT_HEIGHT: u32 = 600;
 const MAX_IMAGE_TEXTURES: usize = 64;
 const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 2;
 const MAX_TEXTURE_SIDE: u32 = 1024;
-const ARCHIVE_READ_BUFFER: usize = 1024 * 1024;
 
 struct UiCache {
     left_rows: usize,
@@ -1944,6 +1943,24 @@ fn build_listing_from_index(
             size: None,
             modified: None,
         });
+    } else if let Some((host, remote_path)) = fileman::sftp::decode_archive_path(archive_path) {
+        let parent_dir = remote_path
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_else(|| "/".to_string());
+        entries.push(core::DirEntry {
+            name: "..".into(),
+            is_dir: true,
+            is_symlink: false,
+            link_target: None,
+            location: core::EntryLocation::Remote {
+                host,
+                path: parent_dir,
+            },
+            size: None,
+            modified: None,
+        });
     } else {
         let parent = archive_path
             .parent()
@@ -2079,15 +2096,26 @@ fn load_container_directory_async(
                 size: None,
                 modified: None,
             });
-        } else if let Some((ref host, ref path)) = return_remote {
+        } else if let Some((host, remote_path)) =
+            return_remote.clone().or_else(|| {
+                fileman::sftp::decode_archive_path(&archive_path).map(|(h, p)| {
+                    let parent = p
+                        .trim_end_matches('/')
+                        .rsplit_once('/')
+                        .map(|(parent, _)| parent.to_string())
+                        .unwrap_or_else(|| "/".to_string());
+                    (h, parent)
+                })
+            })
+        {
             initial.push(core::DirEntry {
                 name: "..".into(),
                 is_dir: true,
                 is_symlink: false,
                 link_target: None,
                 location: core::EntryLocation::Remote {
-                    host: host.clone(),
-                    path: path.clone(),
+                    host,
+                    path: remote_path,
                 },
                 size: None,
                 modified: None,
@@ -2160,18 +2188,6 @@ fn load_container_directory_async(
             let mut seen_other_root = false;
             let mut batch_buf: Vec<(String, bool, Option<u64>)> = Vec::new();
 
-            let file = match std::fs::File::open(&archive_clone) {
-                Ok(file) => file,
-                Err(_e) => {
-                    let mut idx = shared.lock().unwrap();
-                    idx.complete = true;
-                    if let Some(ref wake) = wake {
-                        wake();
-                    }
-                    return;
-                }
-            };
-
             // Closure to decide implicit root from buffered entries
             let decide_root = |root_candidate: &Option<String>,
                                seen_root_file: bool,
@@ -2230,122 +2246,127 @@ fn load_container_directory_async(
                 }
             }
 
-            if kind_clone == core::ContainerKind::Zip {
-                let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
-                let mut zip = match zip::ZipArchive::new(reader) {
-                    Ok(zip) => zip,
-                    Err(_e) => {
-                        let mut idx = shared.lock().unwrap();
-                        idx.complete = true;
-                        if let Some(ref wake) = wake {
-                            wake();
+            let indexing_result: std::io::Result<()> = if kind_clone == core::ContainerKind::Zip {
+                fileman::archive::with_seek_reader(&archive_clone, |reader| {
+                    let mut zip =
+                        zip::ZipArchive::new(reader).map_err(std::io::Error::other)?;
+                    // Pre-scan all entry names to detect root (cheap — central
+                    // directory is already parsed, no I/O needed).
+                    for raw_name in zip.file_names() {
+                        let name = core::normalize_archive_path(Path::new(raw_name));
+                        if name.is_empty() {
+                            continue;
                         }
-                        return;
-                    }
-                };
-                // Pre-scan all entry names to detect root (cheap — central
-                // directory is already parsed, no I/O needed).
-                for raw_name in zip.file_names() {
-                    let name = core::normalize_archive_path(Path::new(raw_name));
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let is_dir = raw_name.ends_with('/');
-                    detect_root_from_entry(
-                        &name,
-                        is_dir,
-                        &mut root_candidate,
-                        &mut seen_root_file,
-                        &mut seen_other_root,
-                    );
-                    if seen_root_file || seen_other_root {
-                        break;
-                    }
-                }
-                decided = true;
-                implicit_root = decide_root(&root_candidate, seen_root_file, seen_other_root);
-
-                for i in 0..zip.len() {
-                    let entry = match zip.by_index(i) {
-                        Ok(entry) => entry,
-                        Err(_) => continue,
-                    };
-                    let entry_is_dir = entry.is_dir();
-                    let entry_size = if entry_is_dir {
-                        None
-                    } else {
-                        Some(entry.size())
-                    };
-                    let name = core::normalize_archive_path(Path::new(entry.name()));
-                    if name.is_empty() {
-                        continue;
-                    }
-
-                    batch_buf.push((name, entry_is_dir, entry_size));
-                    if batch_buf.len() >= BATCH {
-                        flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
-                    }
-                }
-            } else {
-                let reader = std::io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
-                let reader: Box<dyn Read> = match kind_clone {
-                    core::ContainerKind::TarBz2 => Box::new(bzip2::read::BzDecoder::new(reader)),
-                    core::ContainerKind::TarGz => Box::new(flate2::read::GzDecoder::new(reader)),
-                    core::ContainerKind::Tar => Box::new(reader),
-                    _ => unreachable!(),
-                };
-                let mut archive = tar::Archive::new(reader);
-                let entries = match archive.entries() {
-                    Ok(entries) => entries,
-                    Err(_e) => {
-                        let mut idx = shared.lock().unwrap();
-                        idx.complete = true;
-                        if let Some(ref wake) = wake {
-                            wake();
-                        }
-                        return;
-                    }
-                };
-
-                for entry in entries.flatten() {
-                    let path = match entry.path() {
-                        Ok(path) => path,
-                        Err(_) => continue,
-                    };
-                    let entry_is_dir = entry.header().entry_type().is_dir();
-                    let entry_size = if entry_is_dir {
-                        None
-                    } else {
-                        Some(entry.size())
-                    };
-                    let name = fileman::core::normalize_archive_path(&path);
-                    if name.is_empty() {
-                        continue;
-                    }
-
-                    if !decided {
-                        buffered.push((name.clone(), entry_is_dir, entry_size));
+                        let is_dir = raw_name.ends_with('/');
                         detect_root_from_entry(
                             &name,
-                            entry_is_dir,
+                            is_dir,
                             &mut root_candidate,
                             &mut seen_root_file,
                             &mut seen_other_root,
                         );
-                        if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
-                            decided = true;
-                            implicit_root =
-                                decide_root(&root_candidate, seen_root_file, seen_other_root);
-                            batch_buf.append(&mut buffered);
-                            flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
+                        if seen_root_file || seen_other_root {
+                            break;
                         }
-                    } else {
+                    }
+                    decided = true;
+                    implicit_root =
+                        decide_root(&root_candidate, seen_root_file, seen_other_root);
+
+                    for i in 0..zip.len() {
+                        let entry = match zip.by_index(i) {
+                            Ok(entry) => entry,
+                            Err(_) => continue,
+                        };
+                        let entry_is_dir = entry.is_dir();
+                        let entry_size = if entry_is_dir {
+                            None
+                        } else {
+                            Some(entry.size())
+                        };
+                        let name = core::normalize_archive_path(Path::new(entry.name()));
+                        if name.is_empty() {
+                            continue;
+                        }
+
                         batch_buf.push((name, entry_is_dir, entry_size));
                         if batch_buf.len() >= BATCH {
                             flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
                         }
                     }
+                    Ok(())
+                })
+            } else {
+                fileman::archive::with_reader(&archive_clone, |reader| {
+                    let reader: Box<dyn Read> = match kind_clone {
+                        core::ContainerKind::TarBz2 => {
+                            Box::new(bzip2::read::BzDecoder::new(reader))
+                        }
+                        core::ContainerKind::TarGz => {
+                            Box::new(flate2::read::GzDecoder::new(reader))
+                        }
+                        core::ContainerKind::Tar => reader,
+                        _ => unreachable!(),
+                    };
+                    let mut archive = tar::Archive::new(reader);
+                    let entries = archive.entries()?;
+
+                    for entry in entries.flatten() {
+                        let path = match entry.path() {
+                            Ok(path) => path,
+                            Err(_) => continue,
+                        };
+                        let entry_is_dir = entry.header().entry_type().is_dir();
+                        let entry_size = if entry_is_dir {
+                            None
+                        } else {
+                            Some(entry.size())
+                        };
+                        let name = fileman::core::normalize_archive_path(&path);
+                        if name.is_empty() {
+                            continue;
+                        }
+
+                        if !decided {
+                            buffered.push((name.clone(), entry_is_dir, entry_size));
+                            detect_root_from_entry(
+                                &name,
+                                entry_is_dir,
+                                &mut root_candidate,
+                                &mut seen_root_file,
+                                &mut seen_other_root,
+                            );
+                            if buffered.len() >= DECIDE_LIMIT
+                                || seen_root_file
+                                || seen_other_root
+                            {
+                                decided = true;
+                                implicit_root = decide_root(
+                                    &root_candidate,
+                                    seen_root_file,
+                                    seen_other_root,
+                                );
+                                batch_buf.append(&mut buffered);
+                                flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
+                            }
+                        } else {
+                            batch_buf.push((name, entry_is_dir, entry_size));
+                            if batch_buf.len() >= BATCH {
+                                flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            };
+
+            if indexing_result.is_err() {
+                let mut idx = shared.lock().unwrap();
+                idx.complete = true;
+                if let Some(ref wake) = wake {
+                    wake();
                 }
+                return;
             }
 
             // Flush remaining buffered entries (pre-decide phase never triggered)
@@ -3103,6 +3124,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let sftp_sessions_shared: Arc<
             std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<fileman::sftp::SftpSession>>>>,
         > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Register the shared map globally so archive streaming can access sessions.
+        fileman::sftp::init_shared_registry(sftp_sessions_shared.clone());
         let transfer_progress = Arc::new(core::TransferProgress::new());
         let io_cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (io_tx, io_rx, io_cancel_tx) = workers::start_io_worker(
@@ -3689,24 +3712,6 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             } else {
                                 io_errors.push(message);
                             }
-                        }
-                        core::IOResult::EnterContainer {
-                            archive_path,
-                            kind,
-                            panel,
-                            return_remote,
-                        } => {
-                            load_container_directory_async(
-                                &mut runtime.app,
-                                kind,
-                                archive_path,
-                                "".to_string(),
-                                None,
-                                panel,
-                                None,
-                                ContainerLoadMode::UseCache,
-                                return_remote,
-                            );
                         }
                     }
                     completed += 1;
