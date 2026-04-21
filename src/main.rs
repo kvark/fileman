@@ -2036,6 +2036,7 @@ fn load_container_directory_async(
     target_panel: core::ActivePanel,
     prefer_name: Option<String>,
     cache_mode: ContainerLoadMode,
+    return_remote: Option<(String, String)>,
 ) {
     app.stash_container_cache(target_panel);
     let cache_key = (archive_path.clone(), cwd.clone(), kind);
@@ -2074,6 +2075,19 @@ fn load_container_directory_async(
                     kind,
                     archive_path: archive_path.clone(),
                     inner_path: parent,
+                },
+                size: None,
+                modified: None,
+            });
+        } else if let Some((ref host, ref path)) = return_remote {
+            initial.push(core::DirEntry {
+                name: "..".into(),
+                is_dir: true,
+                is_symlink: false,
+                link_target: None,
+                location: core::EntryLocation::Remote {
+                    host: host.clone(),
+                    path: path.clone(),
                 },
                 size: None,
                 modified: None,
@@ -2547,6 +2561,7 @@ fn apply_panel_snapshot(
                 which,
                 snapshot.selected_name,
                 ContainerLoadMode::UseCache,
+                None,
             );
         }
         core::BrowserMode::Remote { ref host, ref path } => {
@@ -2794,6 +2809,7 @@ fn reload_panel(app: &mut app_state::AppState, which: core::ActivePanel) {
             which,
             selected_name,
             ContainerLoadMode::ForceReload,
+            None,
         ),
         core::BrowserMode::Remote { ref host, ref path } => {
             load_sftp_directory_async(app, host, path, which, selected_name);
@@ -3673,6 +3689,24 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             } else {
                                 io_errors.push(message);
                             }
+                        }
+                        core::IOResult::EnterContainer {
+                            archive_path,
+                            kind,
+                            panel,
+                            return_remote,
+                        } => {
+                            load_container_directory_async(
+                                &mut runtime.app,
+                                kind,
+                                archive_path,
+                                "".to_string(),
+                                None,
+                                panel,
+                                None,
+                                ContainerLoadMode::UseCache,
+                                return_remote,
+                            );
                         }
                     }
                     completed += 1;

@@ -797,16 +797,19 @@ impl AppState {
                 return;
             }
             let entry = &browser.entries[browser.selected_index];
-            if entry.name == ".." || entry.is_dir && !matches!(entry.location, EntryLocation::Fs(_))
-            {
+            if entry.name == ".." {
                 return;
             }
-            if let EntryLocation::Fs(path) = entry.location.clone() {
-                path.file_name()
+            match entry.location {
+                EntryLocation::Fs(ref path) => path
+                    .file_name()
                     .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            } else {
-                None
+                    .map(|s| s.to_string()),
+                EntryLocation::Remote { ref path, .. } => path
+                    .rsplit('/')
+                    .next()
+                    .map(|s| s.to_string()),
+                _ => None,
             }
         };
         if let Some(name) = name {
@@ -825,13 +828,27 @@ impl AppState {
     }
 
     pub fn start_inline_new_file(&mut self) {
-        let target_dir = {
+        enum InsertMode {
+            Fs(path::PathBuf),
+            Remote { host: String, path: String },
+        }
+
+        let mode = {
             let panel = self.get_active_panel();
             let browser = panel.browser();
-            if !matches!(browser.browser_mode, BrowserMode::Fs) {
-                return;
+            match browser.browser_mode {
+                BrowserMode::Fs => InsertMode::Fs(browser.current_path.clone()),
+                BrowserMode::Remote { ref host, ref path } => InsertMode::Remote {
+                    host: host.clone(),
+                    path: path.clone(),
+                },
+                _ => {
+                    self.error_message = Some(
+                        "Cannot create files inside archives or search results.".to_string(),
+                    );
+                    return;
+                }
             }
-            browser.current_path.clone()
         };
         let panel = self.get_active_panel_mut();
         let browser = panel.browser_mut();
@@ -847,7 +864,13 @@ impl AppState {
             .iter()
             .position(|e| e.name != "..")
             .unwrap_or(browser.entries.len());
-        let new_path = target_dir.join(&candidate);
+        let location = match mode {
+            InsertMode::Fs(ref dir) => EntryLocation::Fs(dir.join(&candidate)),
+            InsertMode::Remote { ref host, ref path } => EntryLocation::Remote {
+                host: host.clone(),
+                path: format!("{}/{}", path.trim_end_matches('/'), candidate),
+            },
+        };
         browser.entries.insert(
             insert_at,
             DirEntry {
@@ -855,7 +878,7 @@ impl AppState {
                 is_dir: false,
                 is_symlink: false,
                 link_target: None,
-                location: EntryLocation::Fs(new_path),
+                location,
                 size: None,
                 modified: None,
             },

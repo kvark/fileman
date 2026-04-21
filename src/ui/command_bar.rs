@@ -58,7 +58,11 @@ pub fn draw_command_bar(ui: &mut egui::Ui, app: &app_state::AppState, colors: &t
                         } else {
                             draw_key_cap(ui, k!("F5", "^C"), f5, colors);
                         }
-                        draw_key_cap(ui, k!("F6", "^M"), f6, colors);
+                        if modifiers.shift {
+                            draw_key_cap(ui, k!("F6", "^⇧M"), f6, colors);
+                        } else {
+                            draw_key_cap(ui, k!("F6", "^M"), f6, colors);
+                        }
                         if modifiers.alt {
                             draw_key_cap(ui, k!("F7", "^G"), f7, colors);
                         } else {

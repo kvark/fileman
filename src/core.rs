@@ -290,6 +290,15 @@ pub enum IOTask {
         name: String,
         is_dir: bool,
     },
+    DownloadRemoteArchive {
+        host: String,
+        remote_path: String,
+        local_path: path::PathBuf,
+        kind: crate::archive::ContainerKind,
+        panel: ActivePanel,
+        return_host: String,
+        return_dir: String,
+    },
     /// Re-run the inner task with OS-level privilege elevation.
     Elevated(Box<IOTask>),
 }
@@ -307,6 +316,13 @@ pub enum IOResult {
     ErrorRemote(String, String),
     /// Local operation failed with a permission error — offer elevation retry.
     PermissionError { message: String, task: IOTask },
+    /// Remote archive downloaded — enter it as a container.
+    EnterContainer {
+        archive_path: path::PathBuf,
+        kind: crate::archive::ContainerKind,
+        panel: ActivePanel,
+        return_remote: Option<(String, String)>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

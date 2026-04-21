@@ -169,6 +169,7 @@ fn open_selected_from_to(
                     target,
                     None,
                     ContainerLoadMode::UseCache,
+                    None,
                 );
             }
         }
@@ -207,6 +208,7 @@ fn open_selected_from_to(
                     target,
                     prefer_name,
                     ContainerLoadMode::UseCache,
+                    None,
                 );
 
                 if selected_entry.name != ".."
@@ -240,6 +242,31 @@ fn open_selected_from_to(
                     None
                 };
                 crate::load_sftp_directory_async(app, &host, &path, target, prefer_name);
+            } else if let Some(kind) =
+                core::container_kind_from_path(std::path::Path::new(&path))
+            {
+                let name = path.rsplit('/').next().unwrap_or(&selected_entry.name);
+                let tmp_dir = std::env::temp_dir().join("fileman_extract");
+                if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+                    eprintln!("Failed to create temp dir: {e}");
+                    return;
+                }
+                let local_path = tmp_dir.join(name);
+                let return_dir = path
+                    .trim_end_matches('/')
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_string())
+                    .unwrap_or_else(|| "/".to_string());
+                let _ = app.io_tx.send(core::IOTask::DownloadRemoteArchive {
+                    host: host.clone(),
+                    remote_path: path,
+                    local_path,
+                    kind,
+                    panel: target,
+                    return_host: host,
+                    return_dir,
+                });
+                app.io_in_flight = app.io_in_flight.saturating_add(1);
             }
         }
     }
@@ -294,6 +321,14 @@ pub(crate) fn handle_keyboard(
     let ctrl_d = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::D));
     let ctrl_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G));
     let ctrl_x = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::X));
+    let ctrl_i = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
+    let ctrl_shift_m = !in_edit
+        && ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+                egui::Key::M,
+            )
+        });
     let f2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2));
 
     let f1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1));
@@ -850,7 +885,7 @@ pub(crate) fn handle_keyboard(
             }
         }
     }
-    if input.key_pressed(egui::Key::Insert) && active_is_browser {
+    if (input.key_pressed(egui::Key::Insert) || ctrl_i) && active_is_browser {
         let browser = app.get_active_panel_mut().browser_mut();
         let idx = browser.selected_index;
         if idx < browser.entries.len() && browser.entries[idx].name != ".." {
@@ -921,7 +956,7 @@ pub(crate) fn handle_keyboard(
         ctx.request_repaint();
     }
     let shift_f6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6));
-    if shift_f6 {
+    if shift_f6 || ctrl_shift_m {
         app.prepare_rename_selected();
         ctx.request_repaint();
     }
@@ -1132,16 +1167,35 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
         let mut next_selection: Option<(PathBuf, String)> = None;
         match rename.kind {
             app_state::InlineEditKind::NewFile => {
-                let dir = browser.current_path.clone();
-                let path = dir.join(new_name);
-                action = Some(fileman::core::IOTask::WriteFile {
-                    path: path.clone(),
-                    contents: Vec::new(),
-                });
-                next_selection = Some((dir, new_name.to_string()));
-                if rename.index < browser.entries.len() {
-                    browser.entries[rename.index].name = new_name.to_string();
-                    browser.entries[rename.index].location = core::EntryLocation::Fs(path);
+                if let core::BrowserMode::Remote { ref host, ref path } = browser.browser_mode {
+                    let host = host.clone();
+                    let base_path = path.clone();
+                    let remote_path =
+                        format!("{}/{}", base_path.trim_end_matches('/'), new_name);
+                    if rename.index < browser.entries.len() {
+                        browser.entries[rename.index].name = new_name.to_string();
+                        browser.entries[rename.index].location = core::EntryLocation::Remote {
+                            host: host.clone(),
+                            path: remote_path.clone(),
+                        };
+                    }
+                    action = Some(fileman::core::IOTask::WriteRemoteFile {
+                        host,
+                        path: remote_path,
+                        contents: Vec::new(),
+                    });
+                } else {
+                    let dir = browser.current_path.clone();
+                    let path = dir.join(new_name);
+                    action = Some(fileman::core::IOTask::WriteFile {
+                        path: path.clone(),
+                        contents: Vec::new(),
+                    });
+                    next_selection = Some((dir, new_name.to_string()));
+                    if rename.index < browser.entries.len() {
+                        browser.entries[rename.index].name = new_name.to_string();
+                        browser.entries[rename.index].location = core::EntryLocation::Fs(path);
+                    }
                 }
             }
             app_state::InlineEditKind::NewDir => {
@@ -1174,20 +1228,34 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
             app_state::InlineEditKind::Rename => {
                 if rename.index < browser.entries.len() {
                     let entry = &browser.entries[rename.index];
-                    if let core::EntryLocation::Fs(path) = &entry.location {
-                        let current = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        if current != new_name {
-                            action = Some(fileman::core::IOTask::Rename {
-                                src: path.clone(),
-                                new_name: new_name.to_string(),
-                            });
-                            next_selection = Some((
-                                path.parent()
-                                    .unwrap_or_else(|| std::path::Path::new("."))
-                                    .to_path_buf(),
-                                new_name.to_string(),
-                            ));
+                    match &entry.location {
+                        core::EntryLocation::Fs(path) => {
+                            let current =
+                                path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                            if current != new_name {
+                                action = Some(fileman::core::IOTask::Rename {
+                                    src: path.clone(),
+                                    new_name: new_name.to_string(),
+                                });
+                                next_selection = Some((
+                                    path.parent()
+                                        .unwrap_or_else(|| std::path::Path::new("."))
+                                        .to_path_buf(),
+                                    new_name.to_string(),
+                                ));
+                            }
                         }
+                        core::EntryLocation::Remote { host, path } => {
+                            let current = path.rsplit('/').next().unwrap_or("");
+                            if current != new_name {
+                                action = Some(fileman::core::IOTask::RenameRemote {
+                                    host: host.clone(),
+                                    src: path.clone(),
+                                    new_name: new_name.to_string(),
+                                });
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
