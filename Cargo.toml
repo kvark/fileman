@@ -1,6 +1,6 @@
 [package]
 name = "fileman"
-version = "0.3.2"
+version = "0.3.3"
 description = "Two-panel file manager"
 keywords = ["file-manager", "egui", "blade"]
 categories = ["filesystem"]
@@ -44,8 +44,8 @@ serde_json = "1.0"
 serde_yml = "0.0.12"
 toml = "0.8"
 ron = "0.12"
-blade-egui = { git = "https://github.com/kvark/blade", rev = "33d3918" }
-blade-graphics = { git = "https://github.com/kvark/blade", rev = "33d3918" }
+blade-egui = { git = "https://github.com/kvark/blade", rev = "3a72838" }
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "3a72838" }
 egui = "0.34"
 egui-winit = "0.34"
 winit = "0.30.5"
