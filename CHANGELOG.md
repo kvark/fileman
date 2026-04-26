@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.3 (26 Apr 2026)
+
+## Features
+- Improved "Go To" menu with grouped remote and local destinations
+- Automatic whitespace display on selection only
+- Editor mode now covers the whole window
+- Archive navigation on remotes
+
+### Fixes
+- Newlines in editor mode
+- Leak in egui rendering
+
 ## v0.3.2 (14 Apr 2026)
 
 ### Features
