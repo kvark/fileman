@@ -11,6 +11,8 @@
     clippy::single_match,
     // Push commands are more regular than macros.
     clippy::vec_init_then_push,
+    // More regular structure is fine.
+    clippy::collapsible_if,
 )]
 #![warn(
     trivial_numeric_casts,

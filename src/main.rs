@@ -1,6 +1,8 @@
 #![allow(
     // No need for harsh threshold here.
     clippy::too_many_arguments,
+    // More regular structure is fine.
+    clippy::collapsible_if,
 )]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -251,23 +253,35 @@ fn apply_theme(ctx: &egui::Context, colors: &theme::ThemeColors) {
     style.spacing.window_margin = egui::Margin::same(8);
     style.visuals.window_fill = color32(colors.preview_bg);
     style.visuals.panel_fill = color32(colors.preview_bg);
-    style.visuals.extreme_bg_color = color32(colors.preview_bg);
+    style.visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
+    style.visuals.text_edit_bg_color = Some(egui::Color32::TRANSPARENT);
     style.visuals.window_stroke.color = color32(colors.panel_border_inactive);
     style.visuals.window_corner_radius = egui::CornerRadius::same(6);
     style.visuals.menu_corner_radius = egui::CornerRadius::same(6);
     style.visuals.faint_bg_color = color32(colors.divider);
     style.visuals.code_bg_color = color32(colors.footer_bg);
-    style.visuals.selection.bg_fill = color32(colors.row_bg_selected_active);
-    style.visuals.selection.stroke.color = color32(colors.row_fg_selected);
+    // Text selection
+    style.visuals.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(40, 80, 180, 180);
+    style.visuals.selection.stroke = egui::Stroke::new(0.0, egui::Color32::WHITE);
     style.visuals.widgets.inactive.bg_fill = color32(colors.preview_bg);
     style.visuals.widgets.inactive.fg_stroke.color = color32(colors.row_fg_inactive);
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
     style.visuals.widgets.active.bg_fill = color32(colors.row_bg_selected_active);
     style.visuals.widgets.active.fg_stroke.color = color32(colors.row_fg_selected);
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
     style.visuals.widgets.hovered.bg_fill = color32(colors.row_bg_selected_inactive);
     style.visuals.widgets.hovered.fg_stroke.color = color32(colors.row_fg_active);
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
     style.visuals.hyperlink_color = color32(colors.panel_border_active);
     style.visuals.override_text_color = Some(color32(colors.row_fg_active));
+    #[cfg(debug_assertions)]
+    {
+        style.debug.warn_if_rect_changes_id = false;
+    }
     ctx.set_global_style(style);
+    ctx.options_mut(|opt| opt.warn_on_id_clash = false);
 }
 
 fn app_icon() -> Option<winit::window::Icon> {
@@ -380,12 +394,7 @@ fn highlight_text_job(
                 style.foreground.b,
                 style.foreground.a,
             );
-            let bg = style.background;
-            let background = if bg.a > 0 && (bg.r, bg.g, bg.b) != (0, 0, 0) {
-                egui::Color32::from_rgba_unmultiplied(bg.r, bg.g, bg.b, bg.a)
-            } else {
-                egui::Color32::TRANSPARENT
-            };
+            let background = egui::Color32::TRANSPARENT;
             let format = egui::TextFormat {
                 font_id: egui::FontId::monospace(13.0),
                 color,
@@ -1332,6 +1341,22 @@ fn navigate_quick_jump(
         navigate_sftp(app, &host, "/", target_panel);
         return;
     }
+    if result.category == app_state::QuickJumpCategory::Remote {
+        // Navigate on the current remote host
+        let host = {
+            let browser = app.panel(target_panel).browser();
+            if let core::BrowserMode::Remote { ref host, .. } = browser.browser_mode {
+                Some(host.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(host) = host {
+            let remote_path = result.path.to_string_lossy().to_string();
+            load_sftp_directory_async(app, &host, &remote_path, target_panel, None);
+        }
+        return;
+    }
     if result.path.is_dir() {
         load_fs_directory_async(app, result.path, target_panel, None);
     }
@@ -2096,18 +2121,16 @@ fn load_container_directory_async(
                 size: None,
                 modified: None,
             });
-        } else if let Some((host, remote_path)) =
-            return_remote.clone().or_else(|| {
-                fileman::sftp::decode_archive_path(&archive_path).map(|(h, p)| {
-                    let parent = p
-                        .trim_end_matches('/')
-                        .rsplit_once('/')
-                        .map(|(parent, _)| parent.to_string())
-                        .unwrap_or_else(|| "/".to_string());
-                    (h, parent)
-                })
+        } else if let Some((host, remote_path)) = return_remote.clone().or_else(|| {
+            fileman::sftp::decode_archive_path(&archive_path).map(|(h, p)| {
+                let parent = p
+                    .trim_end_matches('/')
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_string())
+                    .unwrap_or_else(|| "/".to_string());
+                (h, parent)
             })
-        {
+        }) {
             initial.push(core::DirEntry {
                 name: "..".into(),
                 is_dir: true,
@@ -2248,8 +2271,7 @@ fn load_container_directory_async(
 
             let indexing_result: std::io::Result<()> = if kind_clone == core::ContainerKind::Zip {
                 fileman::archive::with_seek_reader(&archive_clone, |reader| {
-                    let mut zip =
-                        zip::ZipArchive::new(reader).map_err(std::io::Error::other)?;
+                    let mut zip = zip::ZipArchive::new(reader).map_err(std::io::Error::other)?;
                     // Pre-scan all entry names to detect root (cheap — central
                     // directory is already parsed, no I/O needed).
                     for raw_name in zip.file_names() {
@@ -2270,8 +2292,7 @@ fn load_container_directory_async(
                         }
                     }
                     decided = true;
-                    implicit_root =
-                        decide_root(&root_candidate, seen_root_file, seen_other_root);
+                    implicit_root = decide_root(&root_candidate, seen_root_file, seen_other_root);
 
                     for i in 0..zip.len() {
                         let entry = match zip.by_index(i) {
@@ -2336,16 +2357,10 @@ fn load_container_directory_async(
                                 &mut seen_root_file,
                                 &mut seen_other_root,
                             );
-                            if buffered.len() >= DECIDE_LIMIT
-                                || seen_root_file
-                                || seen_other_root
-                            {
+                            if buffered.len() >= DECIDE_LIMIT || seen_root_file || seen_other_root {
                                 decided = true;
-                                implicit_root = decide_root(
-                                    &root_candidate,
-                                    seen_root_file,
-                                    seen_other_root,
-                                );
+                                implicit_root =
+                                    decide_root(&root_candidate, seen_root_file, seen_other_root);
                                 batch_buf.append(&mut buffered);
                                 flush_batch(&shared, &mut batch_buf, &implicit_root, &wake);
                             }
@@ -2928,18 +2943,6 @@ fn file_type_label(meta: &std::fs::Metadata) -> String {
     } else {
         "Unknown".to_string()
     }
-}
-
-fn make_whitespace_visible(text: &str) -> String {
-    text.replace('\t', "→   ")
-        .lines()
-        .map(|line| format!("{line}⏎"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn mark_line_endings(text: &str) -> String {
-    text.replace('\n', "↵\n")
 }
 
 struct Runtime {
@@ -3877,164 +3880,195 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     egui::CentralPanel::default().show_inside(root_ui, |ui| {
                         let rect = ui.available_rect_before_wrap();
                         let spacing_x = ui.spacing().item_spacing.x;
-                        let panel_width = ((rect.width() - spacing_x) * 0.5).max(0.0);
+                        let left_editing =
+                            should_show_editor(&runtime.app, core::ActivePanel::Left);
+                        let right_editing =
+                            should_show_editor(&runtime.app, core::ActivePanel::Right);
+                        let full_width = left_editing || right_editing;
+                        let panel_width = if full_width {
+                            rect.width()
+                        } else {
+                            ((rect.width() - spacing_x) * 0.5).max(0.0)
+                        };
                         let left_rect = egui::Rect::from_min_size(
                             rect.min,
                             egui::Vec2::new(panel_width, rect.height()),
                         );
                         let right_rect = egui::Rect::from_min_size(
-                            rect.min + egui::Vec2::new(panel_width + spacing_x, 0.0),
+                            rect.min
+                                + egui::Vec2::new(
+                                    if full_width {
+                                        0.0
+                                    } else {
+                                        panel_width + spacing_x
+                                    },
+                                    0.0,
+                                ),
                             egui::Vec2::new(panel_width, rect.height()),
                         );
 
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                            if should_show_editor(&runtime.app, core::ActivePanel::Left) {
-                                let is_focused =
-                                    runtime.app.active_panel == core::ActivePanel::Left;
-                                let theme = runtime.app.theme.clone();
-                                let panel = runtime.app.panel_mut(core::ActivePanel::Left);
-                                if let app_state::PanelMode::Edit(ref mut edit) = panel.mode {
-                                    ui::editor::draw_editor(
+                        if !right_editing {
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                                if left_editing {
+                                    let is_focused =
+                                        runtime.app.active_panel == core::ActivePanel::Left;
+                                    let theme = runtime.app.theme.clone();
+                                    let panel = runtime.app.panel_mut(core::ActivePanel::Left);
+                                    if let app_state::PanelMode::Edit(ref mut edit) = panel.mode {
+                                        ui::editor::draw_editor(
+                                            ui,
+                                            ui::editor::EditorRender {
+                                                theme: &theme,
+                                                is_focused,
+                                                edit,
+                                                highlight_cache: &runtime.highlight_cache,
+                                                highlight_pending: &mut runtime.highlight_pending,
+                                                highlight_req_tx: &runtime.highlight_req_tx,
+                                                available_height: rect.height(),
+                                            },
+                                        );
+                                    }
+                                } else if should_show_preview(&runtime.app, core::ActivePanel::Left)
+                                {
+                                    let is_focused =
+                                        runtime.app.active_panel == core::ActivePanel::Left;
+                                    let theme = runtime.app.theme.clone();
+                                    let panel = runtime.app.panel_mut(core::ActivePanel::Left);
+                                    if let app_state::PanelMode::Preview(ref mut preview) =
+                                        panel.mode
+                                    {
+                                        ui::preview::draw_preview(
+                                            ui,
+                                            ui::preview::PreviewRender {
+                                                theme: &theme,
+                                                is_focused,
+                                                preview,
+                                                image_cache: &mut runtime.image_cache,
+                                                image_req_tx: &runtime.image_req_tx,
+                                                highlight_cache: &runtime.highlight_cache,
+                                                highlight_pending: &mut runtime.highlight_pending,
+                                                highlight_req_tx: &runtime.highlight_req_tx,
+                                                transfer_progress: &transfer_progress,
+                                                min_height: rect.height(),
+                                            },
+                                        );
+                                    }
+                                } else if let Some(_help) =
+                                    runtime.app.help_panel(core::ActivePanel::Left)
+                                {
+                                    let is_focused =
+                                        runtime.app.active_panel == core::ActivePanel::Left;
+                                    let theme = runtime.app.theme.clone();
+                                    let async_status = runtime.app.async_status();
+                                    if ui::help::draw_help(
                                         ui,
-                                        ui::editor::EditorRender {
-                                            theme: &theme,
-                                            is_focused,
-                                            edit,
-                                            highlight_cache: &runtime.highlight_cache,
-                                            highlight_pending: &mut runtime.highlight_pending,
-                                            highlight_req_tx: &runtime.highlight_req_tx,
-                                            min_height: rect.height(),
-                                        },
+                                        &theme,
+                                        is_focused,
+                                        rect.height(),
+                                        &async_status,
+                                    ) {
+                                        start_install(&mut runtime.app);
+                                    }
+                                } else {
+                                    runtime.ui_cache.left_rows = ui::panel::draw_panel(
+                                        ui,
+                                        &mut runtime.app,
+                                        core::ActivePanel::Left,
+                                        &mut runtime.image_cache,
+                                        &runtime.image_req_tx,
+                                        runtime.ui_cache.scroll_mode,
+                                        rect.height(),
                                     );
                                 }
-                            } else if should_show_preview(&runtime.app, core::ActivePanel::Left) {
-                                let is_focused =
-                                    runtime.app.active_panel == core::ActivePanel::Left;
-                                let theme = runtime.app.theme.clone();
-                                let panel = runtime.app.panel_mut(core::ActivePanel::Left);
-                                if let app_state::PanelMode::Preview(ref mut preview) = panel.mode {
-                                    ui::preview::draw_preview(
-                                        ui,
-                                        ui::preview::PreviewRender {
-                                            theme: &theme,
-                                            is_focused,
-                                            preview,
-                                            image_cache: &mut runtime.image_cache,
-                                            image_req_tx: &runtime.image_req_tx,
-                                            highlight_cache: &runtime.highlight_cache,
-                                            highlight_pending: &mut runtime.highlight_pending,
-                                            highlight_req_tx: &runtime.highlight_req_tx,
-                                            transfer_progress: &transfer_progress,
-                                            min_height: rect.height(),
-                                        },
-                                    );
-                                }
-                            } else if let Some(_help) =
-                                runtime.app.help_panel(core::ActivePanel::Left)
-                            {
-                                let is_focused =
-                                    runtime.app.active_panel == core::ActivePanel::Left;
-                                let theme = runtime.app.theme.clone();
-                                let async_status = runtime.app.async_status();
-                                if ui::help::draw_help(
-                                    ui,
-                                    &theme,
-                                    is_focused,
-                                    rect.height(),
-                                    &async_status,
-                                ) {
-                                    start_install(&mut runtime.app);
-                                }
-                            } else {
-                                runtime.ui_cache.left_rows = ui::panel::draw_panel(
-                                    ui,
-                                    &mut runtime.app,
-                                    core::ActivePanel::Left,
-                                    &mut runtime.image_cache,
-                                    &runtime.image_req_tx,
-                                    runtime.ui_cache.scroll_mode,
-                                    rect.height(),
-                                );
-                            }
-                        });
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                            if should_show_editor(&runtime.app, core::ActivePanel::Right) {
-                                let is_focused =
-                                    runtime.app.active_panel == core::ActivePanel::Right;
-                                let theme = runtime.app.theme.clone();
-                                let panel = runtime.app.panel_mut(core::ActivePanel::Right);
-                                if let app_state::PanelMode::Edit(ref mut edit) = panel.mode {
-                                    ui::editor::draw_editor(
-                                        ui,
-                                        ui::editor::EditorRender {
-                                            theme: &theme,
-                                            is_focused,
-                                            edit,
-                                            highlight_cache: &runtime.highlight_cache,
-                                            highlight_pending: &mut runtime.highlight_pending,
-                                            highlight_req_tx: &runtime.highlight_req_tx,
-                                            min_height: rect.height(),
-                                        },
-                                    );
-                                }
-                            } else if should_show_preview(&runtime.app, core::ActivePanel::Right) {
-                                let is_focused =
-                                    runtime.app.active_panel == core::ActivePanel::Right;
-                                let theme = runtime.app.theme.clone();
-                                let panel = runtime.app.panel_mut(core::ActivePanel::Right);
-                                if let app_state::PanelMode::Preview(ref mut preview) = panel.mode {
-                                    ui::preview::draw_preview(
-                                        ui,
-                                        ui::preview::PreviewRender {
-                                            theme: &theme,
-                                            is_focused,
-                                            preview,
-                                            image_cache: &mut runtime.image_cache,
-                                            image_req_tx: &runtime.image_req_tx,
-                                            highlight_cache: &runtime.highlight_cache,
-                                            highlight_pending: &mut runtime.highlight_pending,
-                                            highlight_req_tx: &runtime.highlight_req_tx,
-                                            transfer_progress: &transfer_progress,
-                                            min_height: rect.height(),
-                                        },
-                                    );
-                                }
-                            } else if let Some(_help) =
-                                runtime.app.help_panel(core::ActivePanel::Right)
-                            {
-                                let is_focused =
-                                    runtime.app.active_panel == core::ActivePanel::Right;
-                                let theme = runtime.app.theme.clone();
-                                let async_status = runtime.app.async_status();
-                                if ui::help::draw_help(
-                                    ui,
-                                    &theme,
-                                    is_focused,
-                                    rect.height(),
-                                    &async_status,
-                                ) {
-                                    start_install(&mut runtime.app);
-                                }
-                            } else {
-                                runtime.ui_cache.right_rows = ui::panel::draw_panel(
-                                    ui,
-                                    &mut runtime.app,
+                            });
+                        }
+                        if !left_editing {
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                                if right_editing {
+                                    let is_focused =
+                                        runtime.app.active_panel == core::ActivePanel::Right;
+                                    let theme = runtime.app.theme.clone();
+                                    let panel = runtime.app.panel_mut(core::ActivePanel::Right);
+                                    if let app_state::PanelMode::Edit(ref mut edit) = panel.mode {
+                                        ui::editor::draw_editor(
+                                            ui,
+                                            ui::editor::EditorRender {
+                                                theme: &theme,
+                                                is_focused,
+                                                edit,
+                                                highlight_cache: &runtime.highlight_cache,
+                                                highlight_pending: &mut runtime.highlight_pending,
+                                                highlight_req_tx: &runtime.highlight_req_tx,
+                                                available_height: rect.height(),
+                                            },
+                                        );
+                                    }
+                                } else if should_show_preview(
+                                    &runtime.app,
                                     core::ActivePanel::Right,
-                                    &mut runtime.image_cache,
-                                    &runtime.image_req_tx,
-                                    runtime.ui_cache.scroll_mode,
-                                    rect.height(),
-                                );
-                            }
-                        });
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_size(
-                                rect.min + egui::Vec2::new(panel_width, 0.0),
-                                egui::Vec2::new(spacing_x, rect.height()),
-                            ),
-                            egui::CornerRadius::ZERO,
-                            color32(runtime.app.theme.colors().divider),
-                        );
+                                ) {
+                                    let is_focused =
+                                        runtime.app.active_panel == core::ActivePanel::Right;
+                                    let theme = runtime.app.theme.clone();
+                                    let panel = runtime.app.panel_mut(core::ActivePanel::Right);
+                                    if let app_state::PanelMode::Preview(ref mut preview) =
+                                        panel.mode
+                                    {
+                                        ui::preview::draw_preview(
+                                            ui,
+                                            ui::preview::PreviewRender {
+                                                theme: &theme,
+                                                is_focused,
+                                                preview,
+                                                image_cache: &mut runtime.image_cache,
+                                                image_req_tx: &runtime.image_req_tx,
+                                                highlight_cache: &runtime.highlight_cache,
+                                                highlight_pending: &mut runtime.highlight_pending,
+                                                highlight_req_tx: &runtime.highlight_req_tx,
+                                                transfer_progress: &transfer_progress,
+                                                min_height: rect.height(),
+                                            },
+                                        );
+                                    }
+                                } else if let Some(_help) =
+                                    runtime.app.help_panel(core::ActivePanel::Right)
+                                {
+                                    let is_focused =
+                                        runtime.app.active_panel == core::ActivePanel::Right;
+                                    let theme = runtime.app.theme.clone();
+                                    let async_status = runtime.app.async_status();
+                                    if ui::help::draw_help(
+                                        ui,
+                                        &theme,
+                                        is_focused,
+                                        rect.height(),
+                                        &async_status,
+                                    ) {
+                                        start_install(&mut runtime.app);
+                                    }
+                                } else {
+                                    runtime.ui_cache.right_rows = ui::panel::draw_panel(
+                                        ui,
+                                        &mut runtime.app,
+                                        core::ActivePanel::Right,
+                                        &mut runtime.image_cache,
+                                        &runtime.image_req_tx,
+                                        runtime.ui_cache.scroll_mode,
+                                        rect.height(),
+                                    );
+                                }
+                            });
+                        }
+                        if !full_width {
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    rect.min + egui::Vec2::new(panel_width, 0.0),
+                                    egui::Vec2::new(spacing_x, rect.height()),
+                                ),
+                                egui::CornerRadius::ZERO,
+                                color32(runtime.app.theme.colors().divider),
+                            );
+                        }
                     });
 
                     if runtime.app.theme_picker_open {
@@ -4401,146 +4435,167 @@ fn draw_root_ui(render: UiRender<'_>) {
     egui::CentralPanel::default().show_inside(root_ui, |ui| {
         let rect = ui.available_rect_before_wrap();
         let spacing_x = ui.spacing().item_spacing.x;
-        let panel_width = ((rect.width() - spacing_x) * 0.5).max(0.0);
+        let left_editing = should_show_editor(app, core::ActivePanel::Left);
+        let right_editing = should_show_editor(app, core::ActivePanel::Right);
+        let full_width = left_editing || right_editing;
+        let panel_width = if full_width {
+            rect.width()
+        } else {
+            ((rect.width() - spacing_x) * 0.5).max(0.0)
+        };
         let left_rect =
             egui::Rect::from_min_size(rect.min, egui::Vec2::new(panel_width, rect.height()));
         let right_rect = egui::Rect::from_min_size(
-            rect.min + egui::Vec2::new(panel_width + spacing_x, 0.0),
+            rect.min
+                + egui::Vec2::new(
+                    if full_width {
+                        0.0
+                    } else {
+                        panel_width + spacing_x
+                    },
+                    0.0,
+                ),
             egui::Vec2::new(panel_width, rect.height()),
         );
 
-        ui_cache.left_rows = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                if should_show_editor(app, core::ActivePanel::Left) {
-                    let is_focused = app.active_panel == core::ActivePanel::Left;
-                    let theme = app.theme.clone();
-                    let panel = app.panel_mut(core::ActivePanel::Left);
-                    if let app_state::PanelMode::Edit(ref mut edit) = panel.mode {
-                        ui::editor::draw_editor(
+        if !right_editing {
+            ui_cache.left_rows = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                    if left_editing {
+                        let is_focused = app.active_panel == core::ActivePanel::Left;
+                        let theme = app.theme.clone();
+                        let panel = app.panel_mut(core::ActivePanel::Left);
+                        if let app_state::PanelMode::Edit(ref mut edit) = panel.mode {
+                            ui::editor::draw_editor(
+                                ui,
+                                ui::editor::EditorRender {
+                                    theme: &theme,
+                                    is_focused,
+                                    edit,
+                                    highlight_cache,
+                                    highlight_pending,
+                                    highlight_req_tx,
+                                    available_height: rect.height(),
+                                },
+                            );
+                        }
+                        ui_cache.left_rows
+                    } else if should_show_preview(app, core::ActivePanel::Left) {
+                        let is_focused = app.active_panel == core::ActivePanel::Left;
+                        let theme = app.theme.clone();
+                        let panel = app.panel_mut(core::ActivePanel::Left);
+                        if let app_state::PanelMode::Preview(ref mut preview) = panel.mode {
+                            ui::preview::draw_preview(
+                                ui,
+                                ui::preview::PreviewRender {
+                                    theme: &theme,
+                                    is_focused,
+                                    preview,
+                                    image_cache,
+                                    image_req_tx,
+                                    highlight_cache,
+                                    highlight_pending,
+                                    highlight_req_tx,
+                                    transfer_progress: &transfer_progress,
+                                    min_height: rect.height(),
+                                },
+                            );
+                        }
+                        ui_cache.left_rows
+                    } else if let Some(_help) = app.help_panel(core::ActivePanel::Left) {
+                        let is_focused = app.active_panel == core::ActivePanel::Left;
+                        let theme = app.theme.clone();
+                        let async_status = app.async_status();
+                        ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
+                        ui_cache.left_rows
+                    } else {
+                        ui::panel::draw_panel(
                             ui,
-                            ui::editor::EditorRender {
-                                theme: &theme,
-                                is_focused,
-                                edit,
-                                highlight_cache,
-                                highlight_pending,
-                                highlight_req_tx,
-                                min_height: rect.height(),
-                            },
-                        );
+                            app,
+                            core::ActivePanel::Left,
+                            image_cache,
+                            image_req_tx,
+                            ui_cache.scroll_mode,
+                            rect.height(),
+                        )
                     }
-                    ui_cache.left_rows
-                } else if should_show_preview(app, core::ActivePanel::Left) {
-                    let is_focused = app.active_panel == core::ActivePanel::Left;
-                    let theme = app.theme.clone();
-                    let panel = app.panel_mut(core::ActivePanel::Left);
-                    if let app_state::PanelMode::Preview(ref mut preview) = panel.mode {
-                        ui::preview::draw_preview(
+                })
+                .inner;
+        }
+        if !left_editing {
+            ui_cache.right_rows = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                    if right_editing {
+                        let is_focused = app.active_panel == core::ActivePanel::Right;
+                        let theme = app.theme.clone();
+                        let panel = app.panel_mut(core::ActivePanel::Right);
+                        if let app_state::PanelMode::Edit(ref mut edit) = panel.mode {
+                            ui::editor::draw_editor(
+                                ui,
+                                ui::editor::EditorRender {
+                                    theme: &theme,
+                                    is_focused,
+                                    edit,
+                                    highlight_cache,
+                                    highlight_pending,
+                                    highlight_req_tx,
+                                    available_height: rect.height(),
+                                },
+                            );
+                        }
+                        ui_cache.right_rows
+                    } else if should_show_preview(app, core::ActivePanel::Right) {
+                        let is_focused = app.active_panel == core::ActivePanel::Right;
+                        let theme = app.theme.clone();
+                        let panel = app.panel_mut(core::ActivePanel::Right);
+                        if let app_state::PanelMode::Preview(ref mut preview) = panel.mode {
+                            ui::preview::draw_preview(
+                                ui,
+                                ui::preview::PreviewRender {
+                                    theme: &theme,
+                                    is_focused,
+                                    preview,
+                                    image_cache,
+                                    image_req_tx,
+                                    highlight_cache,
+                                    highlight_pending,
+                                    highlight_req_tx,
+                                    transfer_progress: &transfer_progress,
+                                    min_height: rect.height(),
+                                },
+                            );
+                        }
+                        ui_cache.right_rows
+                    } else if let Some(_help) = app.help_panel(core::ActivePanel::Right) {
+                        let is_focused = app.active_panel == core::ActivePanel::Right;
+                        let theme = app.theme.clone();
+                        let async_status = app.async_status();
+                        ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
+                        ui_cache.right_rows
+                    } else {
+                        ui::panel::draw_panel(
                             ui,
-                            ui::preview::PreviewRender {
-                                theme: &theme,
-                                is_focused,
-                                preview,
-                                image_cache,
-                                image_req_tx,
-                                highlight_cache,
-                                highlight_pending,
-                                highlight_req_tx,
-                                transfer_progress: &transfer_progress,
-                                min_height: rect.height(),
-                            },
-                        );
+                            app,
+                            core::ActivePanel::Right,
+                            image_cache,
+                            image_req_tx,
+                            ui_cache.scroll_mode,
+                            rect.height(),
+                        )
                     }
-                    ui_cache.left_rows
-                } else if let Some(_help) = app.help_panel(core::ActivePanel::Left) {
-                    let is_focused = app.active_panel == core::ActivePanel::Left;
-                    let theme = app.theme.clone();
-                    let async_status = app.async_status();
-                    ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
-                    ui_cache.left_rows
-                } else {
-                    ui::panel::draw_panel(
-                        ui,
-                        app,
-                        core::ActivePanel::Left,
-                        image_cache,
-                        image_req_tx,
-                        ui_cache.scroll_mode,
-                        rect.height(),
-                    )
-                }
-            })
-            .inner;
-        ui_cache.right_rows = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                if should_show_editor(app, core::ActivePanel::Right) {
-                    let is_focused = app.active_panel == core::ActivePanel::Right;
-                    let theme = app.theme.clone();
-                    let panel = app.panel_mut(core::ActivePanel::Right);
-                    if let app_state::PanelMode::Edit(ref mut edit) = panel.mode {
-                        ui::editor::draw_editor(
-                            ui,
-                            ui::editor::EditorRender {
-                                theme: &theme,
-                                is_focused,
-                                edit,
-                                highlight_cache,
-                                highlight_pending,
-                                highlight_req_tx,
-                                min_height: rect.height(),
-                            },
-                        );
-                    }
-                    ui_cache.right_rows
-                } else if should_show_preview(app, core::ActivePanel::Right) {
-                    let is_focused = app.active_panel == core::ActivePanel::Right;
-                    let theme = app.theme.clone();
-                    let panel = app.panel_mut(core::ActivePanel::Right);
-                    if let app_state::PanelMode::Preview(ref mut preview) = panel.mode {
-                        ui::preview::draw_preview(
-                            ui,
-                            ui::preview::PreviewRender {
-                                theme: &theme,
-                                is_focused,
-                                preview,
-                                image_cache,
-                                image_req_tx,
-                                highlight_cache,
-                                highlight_pending,
-                                highlight_req_tx,
-                                transfer_progress: &transfer_progress,
-                                min_height: rect.height(),
-                            },
-                        );
-                    }
-                    ui_cache.right_rows
-                } else if let Some(_help) = app.help_panel(core::ActivePanel::Right) {
-                    let is_focused = app.active_panel == core::ActivePanel::Right;
-                    let theme = app.theme.clone();
-                    let async_status = app.async_status();
-                    ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
-                    ui_cache.right_rows
-                } else {
-                    ui::panel::draw_panel(
-                        ui,
-                        app,
-                        core::ActivePanel::Right,
-                        image_cache,
-                        image_req_tx,
-                        ui_cache.scroll_mode,
-                        rect.height(),
-                    )
-                }
-            })
-            .inner;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(
-                rect.min + egui::Vec2::new(panel_width, 0.0),
-                egui::Vec2::new(spacing_x, rect.height()),
-            ),
-            egui::CornerRadius::ZERO,
-            color32(app.theme.colors().divider),
-        );
+                })
+                .inner;
+        }
+        if !full_width {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    rect.min + egui::Vec2::new(panel_width, 0.0),
+                    egui::Vec2::new(spacing_x, rect.height()),
+                ),
+                egui::CornerRadius::ZERO,
+                color32(app.theme.colors().divider),
+            );
+        }
     });
     if app.pending_op.is_some() {
         ui::modals::draw_confirmation(&ctx, app);

@@ -9,6 +9,14 @@ pub struct QuickJumpResult {
     pub category: app_state::QuickJumpCategory,
 }
 
+fn category_group(cat: app_state::QuickJumpCategory) -> u8 {
+    match cat {
+        app_state::QuickJumpCategory::Remote => 0,
+        app_state::QuickJumpCategory::Home | app_state::QuickJumpCategory::Mount => 1,
+        app_state::QuickJumpCategory::Ssh => 2,
+    }
+}
+
 pub fn draw_quick_jump(
     ctx: &egui::Context,
     app: &mut app_state::AppState,
@@ -63,6 +71,7 @@ pub fn draw_quick_jump(
             ui.add_space(4.0);
 
             let row_height = 20.0;
+            let separator_height = 5.0;
             let max_rows = 12;
             let visible = qj.filtered.len().min(max_rows);
             let scroll_height = (visible as f32) * row_height + 8.0;
@@ -70,8 +79,32 @@ pub fn draw_quick_jump(
             egui::ScrollArea::vertical()
                 .max_height(scroll_height)
                 .show(ui, |ui| {
+                    let mut prev_group: Option<u8> = None;
                     for (fi, &idx) in qj.filtered.iter().enumerate() {
                         let entry = &qj.entries[idx];
+                        let group = category_group(entry.category);
+
+                        // Draw separator between groups
+                        if let Some(pg) = prev_group {
+                            if pg != group {
+                                let (sep_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), separator_height),
+                                    egui::Sense::hover(),
+                                );
+                                if ui.is_rect_visible(sep_rect) {
+                                    let y = sep_rect.center().y;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(sep_rect.left() + 4.0, y),
+                                            egui::pos2(sep_rect.right() - 4.0, y),
+                                        ],
+                                        egui::Stroke::new(2.0, color32(colors.panel_border_active)),
+                                    );
+                                }
+                            }
+                        }
+                        prev_group = Some(group);
+
                         let is_selected = fi == qj.selected;
                         let bg = if is_selected {
                             color32(colors.row_bg_selected_active)
@@ -84,13 +117,7 @@ pub fn draw_quick_jump(
                             color32(colors.row_fg_active)
                         };
 
-                        let prefix = match entry.category {
-                            app_state::QuickJumpCategory::Home => "  ",
-                            app_state::QuickJumpCategory::Mount => "  ",
-                            app_state::QuickJumpCategory::Ssh => "  ",
-                        };
-
-                        let text = format!("{}{}", prefix, entry.label);
+                        let text = format!("  {}", entry.label);
                         let (rect, resp) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), row_height),
                             egui::Sense::click(),

@@ -1,0 +1,22 @@
+(
+  root: "tests/data/edit_test",
+  keys: [
+    (key: "Wait"),
+    (key: "select:whitespace.txt"),
+    (key: "F4"),
+    (key: "Wait"),
+    (key: "Wait"),
+    // Select chars 0..30 (covers "hello world\n  indent\nend\n")
+    (key: "editor_select:0,25"),
+  ],
+  asserts: (
+    snapshots: [
+      (
+        path: "target/test-artifacts/edit_selection.png",
+        expected: "etc/snapshots/tests/edit_selection.png",
+        max_channel_diff: 200,
+        max_pixel_fraction: 0.005,
+      ),
+    ],
+  ),
+)

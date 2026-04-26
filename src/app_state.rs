@@ -157,6 +157,8 @@ pub struct QuickJumpEntry {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum QuickJumpCategory {
+    /// Remote root or home (only shown when on a remote host).
+    Remote,
     Home,
     Mount,
     Ssh,
@@ -221,7 +223,6 @@ pub struct PreviewState {
     pub find_focus: bool,
     pub request_id: u64,
     pub wrap: bool,
-    pub show_whitespace: bool,
     pub bytes_per_row: usize,
     pub bytes_per_row_auto: bool,
     pub loading_since: Option<Instant>,
@@ -245,9 +246,10 @@ pub struct EditState {
     pub highlight_dirty_at: Option<Instant>,
     pub request_id: u64,
     pub wrap: bool,
-    pub show_whitespace: bool,
     /// Whether the original file used CRLF line endings (restore on save).
     pub crlf: bool,
+    /// Pending forced selection range (char indices), consumed on next frame.
+    pub force_select: Option<(usize, usize)>,
 }
 
 pub struct HelpState {
@@ -805,10 +807,9 @@ impl AppState {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_string()),
-                EntryLocation::Remote { ref path, .. } => path
-                    .rsplit('/')
-                    .next()
-                    .map(|s| s.to_string()),
+                EntryLocation::Remote { ref path, .. } => {
+                    path.rsplit('/').next().map(|s| s.to_string())
+                }
                 _ => None,
             }
         };
@@ -843,9 +844,8 @@ impl AppState {
                     path: path.clone(),
                 },
                 _ => {
-                    self.error_message = Some(
-                        "Cannot create files inside archives or search results.".to_string(),
-                    );
+                    self.error_message =
+                        Some("Cannot create files inside archives or search results.".to_string());
                     return;
                 }
             }
@@ -1023,8 +1023,8 @@ impl AppState {
                 highlight_dirty_at: None,
                 request_id,
                 wrap: true,
-                show_whitespace: false,
                 crlf: false,
+                force_select: None,
             };
             panel.mode = PanelMode::Edit(edit);
             match panel.mode {
@@ -1120,7 +1120,6 @@ impl AppState {
                 find_focus: false,
                 request_id,
                 wrap: true,
-                show_whitespace: false,
                 bytes_per_row: 16,
                 bytes_per_row_auto: true,
                 loading_since: Some(Instant::now()),
@@ -1322,7 +1321,31 @@ impl AppState {
     pub fn open_quick_jump(&mut self) {
         let mut entries = Vec::new();
 
-        // Home directory (cross-platform)
+        // Group 1: Remote paths (only if the active panel is on a remote)
+        if let BrowserMode::Remote { ref host, .. } = self.get_active_panel().browser().browser_mode
+        {
+            let host = host.clone();
+            // Remote root
+            entries.push(QuickJumpEntry {
+                label: format!("{host}:/"),
+                path: path::PathBuf::from("/"),
+                category: QuickJumpCategory::Remote,
+            });
+            // Remote home (if we have a session with home_dir)
+            if let Some(session_arc) = self.sftp_sessions.get(&host) {
+                if let Ok(session) = session_arc.try_lock() {
+                    if let Some(ref home) = session.home_dir {
+                        entries.push(QuickJumpEntry {
+                            label: format!("{host}:~"),
+                            path: path::PathBuf::from(home),
+                            category: QuickJumpCategory::Remote,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Group 2: Local paths — Home directory (cross-platform)
         let home_dir = std::env::var("HOME")
             .ok()
             .or_else(|| std::env::var("USERPROFILE").ok());

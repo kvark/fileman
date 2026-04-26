@@ -24,7 +24,7 @@ pub(crate) fn render_snapshot(
             device_id: Some(0),
             ..Default::default()
         })
-            .map_err(|err| anyhow::anyhow!("Failed to init GPU context: {err:?}"))?
+        .map_err(|err| anyhow::anyhow!("Failed to init GPU context: {err:?}"))?
     };
 
     let size = bg::Extent {
