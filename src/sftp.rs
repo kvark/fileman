@@ -3,7 +3,10 @@ use std::{
     io::{self, Read, Write},
     net::TcpStream,
     path::Path,
-    sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ssh2::{self, Session, Sftp};
@@ -14,6 +17,8 @@ pub struct SftpSession {
     pub session: Session,
     pub sftp: Sftp,
     pub host: String,
+    /// Remote user's home directory (from `realpath(".")`), if resolved.
+    pub home_dir: Option<String>,
 }
 
 type SessionMap = HashMap<String, Arc<Mutex<SftpSession>>>;
@@ -168,10 +173,15 @@ pub fn connect(
     // Try ssh-agent first
     if session.userauth_agent(&user).is_ok() && session.authenticated() {
         let sftp = session.sftp().map_err(|e| format!("SFTP subsystem: {e}"))?;
+        let home_dir = sftp
+            .realpath(Path::new("."))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
         return Ok(SftpSession {
             session,
             sftp,
             host: host.to_string(),
+            home_dir,
         });
     }
 
@@ -193,10 +203,15 @@ pub fn connect(
         }
         if session.userauth_pubkey_file(&user, None, key, None).is_ok() && session.authenticated() {
             let sftp = session.sftp().map_err(|e| format!("SFTP subsystem: {e}"))?;
+            let home_dir = sftp
+                .realpath(Path::new("."))
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
             return Ok(SftpSession {
                 session,
                 sftp,
                 host: host.to_string(),
+                home_dir,
             });
         }
     }

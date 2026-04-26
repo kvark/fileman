@@ -242,9 +242,7 @@ fn open_selected_from_to(
                     None
                 };
                 crate::load_sftp_directory_async(app, &host, &path, target, prefer_name);
-            } else if let Some(kind) =
-                core::container_kind_from_path(std::path::Path::new(&path))
-            {
+            } else if let Some(kind) = core::container_kind_from_path(std::path::Path::new(&path)) {
                 // Navigate into the remote archive as a container, using a
                 // synthetic archive path so the whole container stack can work
                 // unchanged. The archive reader streams via SFTP.
@@ -1168,8 +1166,7 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
                 if let core::BrowserMode::Remote { ref host, ref path } = browser.browser_mode {
                     let host = host.clone();
                     let base_path = path.clone();
-                    let remote_path =
-                        format!("{}/{}", base_path.trim_end_matches('/'), new_name);
+                    let remote_path = format!("{}/{}", base_path.trim_end_matches('/'), new_name);
                     if rename.index < browser.entries.len() {
                         browser.entries[rename.index].name = new_name.to_string();
                         browser.entries[rename.index].location = core::EntryLocation::Remote {
@@ -1228,8 +1225,7 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
                     let entry = &browser.entries[rename.index];
                     match &entry.location {
                         core::EntryLocation::Fs(path) => {
-                            let current =
-                                path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                            let current = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                             if current != new_name {
                                 action = Some(fileman::core::IOTask::Rename {
                                     src: path.clone(),

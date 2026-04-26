@@ -17,10 +17,11 @@ where
     F: FnOnce(&mut (dyn ReadSeek + '_)) -> io::Result<R>,
 {
     if let Some((host, remote_path)) = crate::sftp::decode_archive_path(archive_path) {
-        let session = crate::sftp::get_session(&host).ok_or_else(|| {
-            io::Error::other(format!("no active SFTP session for host {host}"))
-        })?;
-        let locked = session.lock().map_err(|_| io::Error::other("session mutex poisoned"))?;
+        let session = crate::sftp::get_session(&host)
+            .ok_or_else(|| io::Error::other(format!("no active SFTP session for host {host}")))?;
+        let locked = session
+            .lock()
+            .map_err(|_| io::Error::other("session mutex poisoned"))?;
         let mut file = locked
             .sftp
             .open(Path::new(&remote_path))
@@ -40,10 +41,11 @@ where
     F: FnOnce(Box<dyn Read + '_>) -> io::Result<R>,
 {
     if let Some((host, remote_path)) = crate::sftp::decode_archive_path(archive_path) {
-        let session = crate::sftp::get_session(&host).ok_or_else(|| {
-            io::Error::other(format!("no active SFTP session for host {host}"))
-        })?;
-        let locked = session.lock().map_err(|_| io::Error::other("session mutex poisoned"))?;
+        let session = crate::sftp::get_session(&host)
+            .ok_or_else(|| io::Error::other(format!("no active SFTP session for host {host}")))?;
+        let locked = session
+            .lock()
+            .map_err(|_| io::Error::other("session mutex poisoned"))?;
         let file = locked
             .sftp
             .open(Path::new(&remote_path))
@@ -331,7 +333,9 @@ fn copy_tar_dir_gz(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io
 }
 
 fn copy_tar_dir_plain(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
-    with_reader(archive_path, |reader| copy_tar_dir(reader, inner_path, dst_root))
+    with_reader(archive_path, |reader| {
+        copy_tar_dir(reader, inner_path, dst_root)
+    })
 }
 
 fn copy_tar_dir_bz2(archive_path: &Path, inner_path: &str, dst_root: &Path) -> io::Result<()> {
@@ -1133,10 +1137,7 @@ impl ContainerPlugin for TarPlugin {
     }
 }
 
-fn tar_entry_meta<R: Read>(
-    reader: R,
-    inner_path: &str,
-) -> io::Result<Option<(u64, Option<u32>)>> {
+fn tar_entry_meta<R: Read>(reader: R, inner_path: &str) -> io::Result<Option<(u64, Option<u32>)>> {
     let mut archive = tar::Archive::new(reader);
     let normalized = inner_path.trim_start_matches('/');
     for entry in archive.entries()? {

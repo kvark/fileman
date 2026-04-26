@@ -169,6 +169,66 @@ fn apply_replay_key(
         headless.run_frame(app, ui_cache, Vec::new());
         return;
     }
+    if let Some(rest) = key_name.strip_prefix("drag:") {
+        // drag:x1,y1,x2,y2 — simulate mouse drag from (x1,y1) to (x2,y2)
+        let coords: Vec<f32> = rest
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if coords.len() == 4 {
+            let from = egui::Pos2::new(coords[0], coords[1]);
+            let to = egui::Pos2::new(coords[2], coords[3]);
+            // Hover at start position first
+            headless.run_frame(app, ui_cache, vec![egui::Event::PointerMoved(from)]);
+            // Press at start
+            headless.run_frame(
+                app,
+                ui_cache,
+                vec![egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            // Drag to end over several frames for smooth selection
+            let steps = 5;
+            for i in 1..=steps {
+                let t = i as f32 / steps as f32;
+                let pos =
+                    egui::Pos2::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+                headless.run_frame(app, ui_cache, vec![egui::Event::PointerMoved(pos)]);
+            }
+            // Release at end
+            headless.run_frame(
+                app,
+                ui_cache,
+                vec![egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            // Extra frame to finalize
+            headless.run_frame(app, ui_cache, Vec::new());
+        }
+        return;
+    }
+    if let Some(rest) = key_name.strip_prefix("editor_select:") {
+        let coords: Vec<usize> = rest
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if coords.len() == 2 {
+            if let Some(edit) = app.edit_panel_mut() {
+                edit.force_select = Some((coords[0], coords[1]));
+            }
+        }
+        headless.run_frame(app, ui_cache, Vec::new());
+        headless.run_frame(app, ui_cache, Vec::new());
+        return;
+    }
     if let Some(rest) = key_name.strip_prefix("text:") {
         events.push(egui::Event::Text(rest.to_string()));
     } else if key_name.len() == 1 && modifiers == egui::Modifiers::NONE {
@@ -494,7 +554,7 @@ pub(crate) fn run_replay(case_path: &PathBuf, snapshot: Option<PathBuf>) -> anyh
 }
 
 pub(crate) struct HeadlessUi {
-    egui_ctx: egui::Context,
+    pub(crate) egui_ctx: egui::Context,
     image_cache: ImageCache,
     highlight_cache: HashMap<String, egui::text::LayoutJob>,
     highlight_pending: HashSet<String>,
@@ -545,6 +605,7 @@ impl HeadlessUi {
                         egui::Pos2::ZERO,
                         egui::Vec2::new(SNAPSHOT_WIDTH as f32, SNAPSHOT_HEIGHT as f32),
                     )),
+                    focused: Some(true),
                     ..Default::default()
                 },
             ))

@@ -1,0 +1,20 @@
+(
+  root: "tests/data/edit_test",
+  keys: [
+    (key: "Wait"),
+    (key: "select:target.txt"),
+    (key: "F4"),
+    (key: "Wait"),
+    // Cursor starts at position 0. Type text at the beginning.
+    (key: "text:XXXX"),
+    (key: "Enter"),
+    // Save
+    (key: "S", modifiers: ["Ctrl"]),
+    (key: "Wait"),
+  ],
+  asserts: (
+    files: [
+      (path: "target.txt", equals: Some("XXXX\nAAAA\nBBBB\nCCCC\nDDDD\n")),
+    ],
+  ),
+)

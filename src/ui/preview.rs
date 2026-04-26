@@ -6,7 +6,7 @@ use zune_core;
 
 use crate::{
     HighlightRequest, ImageCache, ImageRequest, ImageSource, color32, hash_text, hexdump_job,
-    make_whitespace_visible, mark_line_endings, touch_image,
+    touch_image,
 };
 
 /// Post-process a `LayoutJob` to add background highlights for all find-query matches.
@@ -117,88 +117,98 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
     let header_fg = color32(colors.preview_header_fg);
     let text_color = color32(colors.preview_text);
 
-    egui::Frame::NONE
-        .fill(color32(colors.preview_bg))
-        .stroke(egui::Stroke::new(
-            1.0,
-            color32(if is_focused {
-                colors.panel_border_active
-            } else {
-                colors.panel_border_inactive
-            }),
-        ))
-        .show(ui, |ui| {
-            ui.set_min_size(egui::Vec2::new(ui.available_width(), min_height));
-            egui::Frame::NONE.fill(header_bg).show(ui, |ui| {
-                if is_focused {
-                    ui.colored_label(header_fg, "● Preview (Tab to return)");
+    ui.push_id("preview_panel", |ui| {
+        egui::Frame::NONE
+            .stroke(egui::Stroke::new(
+                1.0,
+                color32(if is_focused {
+                    colors.panel_border_active
                 } else {
-                    ui.colored_label(header_fg, "Preview (Tab to focus)");
-                }
-            });
-            ui.add_space(4.0);
-
-            if let Some(core::PreviewContent::Text(_)) = preview.content.as_ref() {
-                if preview.find_open {
+                    colors.panel_border_inactive
+                }),
+            ))
+            .show(ui, |ui| {
+                ui.set_min_size(egui::Vec2::new(ui.available_width(), min_height));
+                let is_text = matches!(
+                    preview.content.as_ref(),
+                    Some(core::PreviewContent::Text(_))
+                        | Some(core::PreviewContent::TextChunk { .. })
+                );
+                egui::Frame::NONE.fill(header_bg).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.colored_label(text_color, "Find:");
-                        let response = ui.text_edit_singleline(&mut preview.find_query);
-                        if preview.find_focus {
-                            response.request_focus();
-                            preview.find_focus = false;
-                        }
-                        if preview.find_matches.is_empty() {
-                            if !preview.find_query.trim().is_empty() {
-                                ui.colored_label(color32(colors.row_fg_inactive), "No matches");
-                            }
+                        if is_focused {
+                            ui.colored_label(header_fg, "● Preview (Tab to return)");
                         } else {
-                            let label = format!(
-                                "{}/{}",
-                                preview.find_match_num + 1,
-                                preview.find_matches.len()
-                            );
-                            ui.colored_label(color32(colors.row_fg_inactive), label);
-                            ui.colored_label(
-                                color32(colors.row_fg_inactive),
-                                "↵ next  ⇧↵ prev  Esc close",
+                            ui.colored_label(header_fg, "Preview (Tab to focus)");
+                        }
+                        if is_text {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut preview.wrap, "Wrap");
+                                },
                             );
                         }
                     });
-                    ui.add_space(4.0);
-                }
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut preview.wrap, "Wrap");
-                    ui.checkbox(&mut preview.show_whitespace, "Show whitespace");
                 });
-                ui.add_space(6.0);
-            } else if let Some(core::PreviewContent::Binary(_)) = preview.content.as_ref() {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut preview.bytes_per_row_auto, "Auto bytes/row");
-                    if !preview.bytes_per_row_auto {
-                        ui.add(
-                            egui::Slider::new(&mut preview.bytes_per_row, 4..=32)
-                                .step_by(4.0)
-                                .text("bytes/row"),
-                        );
-                    }
-                });
-                ui.add_space(6.0);
-            }
+                ui.add_space(4.0);
 
-            let page_height = ui.available_height();
-            let output = ui
-                .scope_builder(
-                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
-                        ui.available_rect_before_wrap().min,
-                        egui::Vec2::new(ui.available_width(), page_height),
-                    )),
-                    |ui| {
-                        let scroll = if preview.wrap {
-                            egui::ScrollArea::vertical()
-                        } else {
-                            egui::ScrollArea::both()
-                        };
-                        scroll
+                if is_text {
+                    if preview.find_open {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(text_color, "Find:");
+                            let response = ui.text_edit_singleline(&mut preview.find_query);
+                            if preview.find_focus {
+                                response.request_focus();
+                                preview.find_focus = false;
+                            }
+                            if preview.find_matches.is_empty() {
+                                if !preview.find_query.trim().is_empty() {
+                                    ui.colored_label(color32(colors.row_fg_inactive), "No matches");
+                                }
+                            } else {
+                                let label = format!(
+                                    "{}/{}",
+                                    preview.find_match_num + 1,
+                                    preview.find_matches.len()
+                                );
+                                ui.colored_label(color32(colors.row_fg_inactive), label);
+                                ui.colored_label(
+                                    color32(colors.row_fg_inactive),
+                                    "↵ next  ⇧↵ prev  Esc close",
+                                );
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                } else if let Some(core::PreviewContent::Binary(_)) = preview.content.as_ref() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut preview.bytes_per_row_auto, "Auto bytes/row");
+                        if !preview.bytes_per_row_auto {
+                            ui.add(
+                                egui::Slider::new(&mut preview.bytes_per_row, 4..=32)
+                                    .step_by(4.0)
+                                    .text("bytes/row"),
+                            );
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+
+                let page_height = ui.available_height();
+                let output = ui
+                    .scope_builder(
+                        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                            ui.available_rect_before_wrap().min,
+                            egui::Vec2::new(ui.available_width(), page_height),
+                        )),
+                        |ui| {
+                            let scroll = if preview.wrap {
+                                egui::ScrollArea::vertical()
+                            } else {
+                                egui::ScrollArea::both()
+                            };
+                            scroll
                             .auto_shrink([false, false])
                             .scroll_bar_visibility(
                                 egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
@@ -207,13 +217,7 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                             .show(ui, |ui| match preview.content.as_ref() {
                                 Some(core::PreviewContent::Text(text))
                                 | Some(core::PreviewContent::TextChunk { text, .. }) => {
-                                    let display_text = if preview.show_whitespace {
-                                        make_whitespace_visible(text)
-                                    } else if preview.wrap {
-                                        mark_line_endings(text)
-                                    } else {
-                                        text.clone()
-                                    };
+                                    let display_text = text.clone();
 
                                     let ext = preview.ext.clone();
                                     let base_key = preview
@@ -626,13 +630,14 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                     }
                                 }
                             })
-                    },
-                )
-                .inner;
-            preview.scroll = output.state.offset.y;
-            preview.page_height = page_height;
-            preview.line_height = ui.text_style_height(&egui::TextStyle::Body);
-            preview.max_scroll = (output.content_size.y - output.inner_rect.height()).max(0.0);
-            preview.can_scroll = output.content_size.y > output.inner_rect.height();
-        });
+                        },
+                    )
+                    .inner;
+                preview.scroll = output.state.offset.y;
+                preview.page_height = page_height;
+                preview.line_height = ui.text_style_height(&egui::TextStyle::Body);
+                preview.max_scroll = (output.content_size.y - output.inner_rect.height()).max(0.0);
+                preview.can_scroll = output.content_size.y > output.inner_rect.height();
+            });
+    });
 }

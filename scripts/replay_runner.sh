@@ -24,7 +24,12 @@ fi
 
 failures=0
 for case in "${cases[@]}"; do
-  # Clean test output directory before each case for isolation
+  # Restore test data to pristine state before each case
+  git -C "${root_dir}" checkout -- tests/data/ 2>/dev/null || true
+  # Reset files that replay tests modify
+  printf 'AAAA\nBBBB\nCCCC\nDDDD\n' > "${root_dir}/tests/data/edit_test/target.txt"
+  rm -f "${root_dir}/tests/data/basic/test_new_file.txt"
+  rm -rf "${root_dir}/tests/data/basic/out/test_mkdir"
   if [[ -d "${out_dir}" ]]; then
     find "${out_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   fi

@@ -192,603 +192,636 @@ pub fn draw_panel(
     let mut request_raw_reload = false;
     let mut tab_clicked: Option<usize> = None;
     let mut tab_close_clicked: Option<usize> = None;
-    let panel_response = egui::Frame::NONE
-        .fill(color32(theme::Color::rgba(0.0, 0.0, 0.0, 0.0)))
-        .stroke(egui::Stroke::new(
-            1.0,
-            color32(if is_active {
-                colors.panel_border_active
-            } else {
-                colors.panel_border_inactive
-            }),
-        ))
-        .show(ui, |ui| {
-            ui.set_min_height(panel_height);
-            ui.spacing_mut().item_spacing = egui::Vec2::new(6.0, 4.0);
-            ui.vertical(|ui| {
-                let header_height = 30.0;
-                let footer_height = 24.0;
-                let spacing = ui.spacing().item_spacing.y;
+    let panel_response = ui
+        .push_id("browser_panel", |ui| {
+            egui::Frame::NONE
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    color32(if is_active {
+                        colors.panel_border_active
+                    } else {
+                        colors.panel_border_inactive
+                    }),
+                ))
+                .show(ui, |ui| {
+                    ui.set_min_height(panel_height);
+                    ui.spacing_mut().item_spacing = egui::Vec2::new(6.0, 4.0);
+                    ui.vertical(|ui| {
+                        let header_height = 30.0;
+                        let footer_height = 24.0;
+                        let spacing = ui.spacing().item_spacing.y;
 
-                // Draw tab bar when multiple tabs exist
-                if app.panel(panel_side).tabs.len() > 1 {
-                    let tab_count = app.panel(panel_side).tabs.len();
-                    let active_tab_idx = app.panel(panel_side).active_tab;
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(ui.available_width(), 22.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            for i in 0..tab_count {
-                                let is_active_tab = i == active_tab_idx;
-                                let tab_bg = if is_active_tab {
-                                    colors.header_bg
-                                } else {
-                                    colors.footer_bg
-                                };
-                                let tab_fg = if is_active_tab {
-                                    colors.header_fg
-                                } else {
-                                    colors.row_fg_inactive
-                                };
-                                let label = {
-                                    let browser = &app.panel(panel_side).tabs[i];
-                                    browser
-                                        .current_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("/")
-                                        .to_string()
-                                };
-                                let resp = egui::Frame::NONE
-                                    .fill(color32(tab_bg))
-                                    .corner_radius(egui::CornerRadius {
-                                        nw: 4,
-                                        ne: 4,
-                                        sw: 0,
-                                        se: 0,
-                                    })
-                                    .inner_margin(egui::Margin::symmetric(6, 2))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.colored_label(color32(tab_fg), &label);
-                                            let x_resp = ui.colored_label(
-                                                color32(tab_fg),
-                                                egui::RichText::new("×").small(),
-                                            );
-                                            if x_resp.clicked() {
-                                                tab_close_clicked = Some(i);
-                                            }
-                                        });
-                                    });
-                                if resp.response.clicked() {
-                                    tab_clicked = Some(i);
-                                }
-                            }
-                        },
-                    );
-                }
-
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(ui.available_width(), header_height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        egui::Frame::NONE
-                            .fill(color32(colors.header_bg))
-                            .corner_radius(egui::CornerRadius::same(4))
-                            .show(ui, |ui| {
-                                let panel = app.panel_mut(panel_side);
-                                let browser = panel.browser_mut();
-                                let mut sort_mode = browser.sort_mode;
-                                let mut sort_desc = browser.sort_desc;
-                                let mut sort_changed = false;
-                                let previous_sort_mode = browser.sort_mode;
-
-                                let full_width = ui.available_width();
-                                let controls_width = 120.0;
-                                let gap = 24.0;
-                                let left_width = (full_width - controls_width - gap).max(0.0);
-                                let prev_spacing = ui.spacing().item_spacing;
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.horizontal(|ui| {
-                                    let (left_rect, _) = ui.allocate_exact_size(
-                                        egui::Vec2::new(left_width, ui.available_height()),
-                                        egui::Sense::hover(),
-                                    );
-                                    let header_font = egui::TextStyle::Body.resolve(ui.style());
-                                    let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
-                                    let header_color = color32(colors.header_fg);
-                                    let mut job = egui::text::LayoutJob::default();
-                                    if loading {
-                                        // Keep repainting so the spinner animates
-                                        ui.ctx().request_repaint_after(
-                                            std::time::Duration::from_millis(200),
-                                        );
-                                        let t = ui.ctx().input(|i| i.time);
-                                        let spinner =
-                                            ["|", "/", "-", "\\"][((t * 6.0) as usize) % 4];
-                                        job.append(
-                                            spinner,
-                                            0.0,
-                                            egui::text::TextFormat {
-                                                font_id: mono_font.clone(),
-                                                color: header_color,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        job.append(
-                                            " ",
-                                            0.0,
-                                            egui::text::TextFormat {
-                                                font_id: mono_font.clone(),
-                                                color: header_color,
-                                                ..Default::default()
-                                            },
-                                        );
-                                    }
-                                    // Reserve space for the active-panel dot
-                                    let dot_space = if is_active { header_font.size } else { 0.0 };
-                                    let suffix = if loading {
-                                        if let Some((loaded, total)) = loading_progress {
-                                            if let Some(total) = total {
-                                                format!("{header_text} ({loaded}/{total})")
-                                            } else {
-                                                format!("{header_text} ({loaded})")
-                                            }
+                        // Draw tab bar when multiple tabs exist
+                        if app.panel(panel_side).tabs.len() > 1 {
+                            let tab_count = app.panel(panel_side).tabs.len();
+                            let active_tab_idx = app.panel(panel_side).active_tab;
+                            ui.allocate_ui_with_layout(
+                                egui::Vec2::new(ui.available_width(), 22.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    for i in 0..tab_count {
+                                        let is_active_tab = i == active_tab_idx;
+                                        let tab_bg = if is_active_tab {
+                                            colors.header_bg
                                         } else {
-                                            header_text.clone()
-                                        }
-                                    } else {
-                                        header_text.clone()
-                                    };
-                                    job.append(
-                                        &suffix,
-                                        dot_space,
-                                        egui::text::TextFormat {
-                                            font_id: header_font.clone(),
-                                            color: header_color,
-                                            ..Default::default()
-                                        },
-                                    );
-                                    let galley = ui.fonts_mut(|f| f.layout_job(job));
-                                    let painter = ui.painter().with_clip_rect(left_rect);
-                                    let pos = egui::Align2::LEFT_CENTER
-                                        .anchor_size(left_rect.left_center(), galley.size());
-                                    painter.galley(pos.min, galley, header_color);
-                                    if is_active {
-                                        let radius = header_font.size * 0.25;
-                                        let center = egui::pos2(
-                                            pos.min.x + radius + 1.0,
-                                            left_rect.center().y,
-                                        );
-                                        painter.circle_filled(center, radius, header_color);
-                                    }
-                                    if left_width > 0.0 {
-                                        ui.add_space(gap);
-                                    }
-                                    ui.allocate_ui_with_layout(
-                                        egui::Vec2::new(controls_width, ui.available_height()),
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            egui::ComboBox::from_id_salt(match panel_side {
-                                                core::ActivePanel::Left => "left_sort_mode",
-                                                core::ActivePanel::Right => "right_sort_mode",
+                                            colors.footer_bg
+                                        };
+                                        let tab_fg = if is_active_tab {
+                                            colors.header_fg
+                                        } else {
+                                            colors.row_fg_inactive
+                                        };
+                                        let label = {
+                                            let browser = &app.panel(panel_side).tabs[i];
+                                            browser
+                                                .current_path
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("/")
+                                                .to_string()
+                                        };
+                                        let resp = egui::Frame::NONE
+                                            .fill(color32(tab_bg))
+                                            .corner_radius(egui::CornerRadius {
+                                                nw: 4,
+                                                ne: 4,
+                                                sw: 0,
+                                                se: 0,
                                             })
-                                            .selected_text(sort_mode_label(sort_mode))
-                                            .show_ui(
-                                                ui,
-                                                |ui| {
-                                                    sort_changed |= ui
-                                                        .selectable_value(
-                                                            &mut sort_mode,
-                                                            core::SortMode::Name,
-                                                            "Name",
-                                                        )
-                                                        .changed();
-                                                    sort_changed |= ui
-                                                        .selectable_value(
-                                                            &mut sort_mode,
-                                                            core::SortMode::Date,
-                                                            "Date",
-                                                        )
-                                                        .changed();
-                                                    sort_changed |= ui
-                                                        .selectable_value(
-                                                            &mut sort_mode,
-                                                            core::SortMode::Size,
-                                                            "Size",
-                                                        )
-                                                        .changed();
-                                                    sort_changed |= ui
-                                                        .selectable_value(
-                                                            &mut sort_mode,
-                                                            core::SortMode::Raw,
-                                                            "Raw",
-                                                        )
-                                                        .changed();
+                                            .inner_margin(egui::Margin::symmetric(6, 2))
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.colored_label(color32(tab_fg), &label);
+                                                    let x_resp = ui.colored_label(
+                                                        color32(tab_fg),
+                                                        egui::RichText::new("×").small(),
+                                                    );
+                                                    if x_resp.clicked() {
+                                                        tab_close_clicked = Some(i);
+                                                    }
+                                                });
+                                            });
+                                        if resp.response.clicked() {
+                                            tab_clicked = Some(i);
+                                        }
+                                    }
+                                },
+                            );
+                        }
+
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(ui.available_width(), header_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                egui::Frame::NONE
+                                    .fill(color32(colors.header_bg))
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .show(ui, |ui| {
+                                        let panel = app.panel_mut(panel_side);
+                                        let browser = panel.browser_mut();
+                                        let mut sort_mode = browser.sort_mode;
+                                        let mut sort_desc = browser.sort_desc;
+                                        let mut sort_changed = false;
+                                        let previous_sort_mode = browser.sort_mode;
+
+                                        let full_width = ui.available_width();
+                                        let controls_width = 120.0;
+                                        let gap = 24.0;
+                                        let left_width =
+                                            (full_width - controls_width - gap).max(0.0);
+                                        let prev_spacing = ui.spacing().item_spacing;
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        ui.horizontal(|ui| {
+                                            let (left_rect, _) = ui.allocate_exact_size(
+                                                egui::Vec2::new(left_width, ui.available_height()),
+                                                egui::Sense::hover(),
+                                            );
+                                            let header_font =
+                                                egui::TextStyle::Body.resolve(ui.style());
+                                            let mono_font =
+                                                egui::TextStyle::Monospace.resolve(ui.style());
+                                            let header_color = color32(colors.header_fg);
+                                            let mut job = egui::text::LayoutJob::default();
+                                            if loading {
+                                                // Keep repainting so the spinner animates
+                                                ui.ctx().request_repaint_after(
+                                                    std::time::Duration::from_millis(200),
+                                                );
+                                                let t = ui.ctx().input(|i| i.time);
+                                                let spinner =
+                                                    ["|", "/", "-", "\\"][((t * 6.0) as usize) % 4];
+                                                job.append(
+                                                    spinner,
+                                                    0.0,
+                                                    egui::text::TextFormat {
+                                                        font_id: mono_font.clone(),
+                                                        color: header_color,
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                                job.append(
+                                                    " ",
+                                                    0.0,
+                                                    egui::text::TextFormat {
+                                                        font_id: mono_font.clone(),
+                                                        color: header_color,
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                            }
+                                            // Reserve space for the active-panel dot
+                                            let dot_space =
+                                                if is_active { header_font.size } else { 0.0 };
+                                            let suffix = if loading {
+                                                if let Some((loaded, total)) = loading_progress {
+                                                    if let Some(total) = total {
+                                                        format!("{header_text} ({loaded}/{total})")
+                                                    } else {
+                                                        format!("{header_text} ({loaded})")
+                                                    }
+                                                } else {
+                                                    header_text.clone()
+                                                }
+                                            } else {
+                                                header_text.clone()
+                                            };
+                                            job.append(
+                                                &suffix,
+                                                dot_space,
+                                                egui::text::TextFormat {
+                                                    font_id: header_font.clone(),
+                                                    color: header_color,
+                                                    ..Default::default()
                                                 },
                                             );
-                                            let arrow = if sort_desc { "v" } else { "^" };
-                                            if ui.small_button(arrow).clicked() {
-                                                sort_desc = !sort_desc;
-                                                sort_changed = true;
-                                            }
-                                        },
-                                    );
-                                });
-                                ui.spacing_mut().item_spacing = prev_spacing;
-
-                                if sort_changed {
-                                    browser.sort_mode = sort_mode;
-                                    browser.sort_desc = sort_desc;
-                                    if sort_mode == core::SortMode::Raw
-                                        && previous_sort_mode != core::SortMode::Raw
-                                    {
-                                        request_raw_reload = true;
-                                    } else {
-                                        resort_browser_entries(browser);
-                                    }
-                                }
-                            });
-                    },
-                );
-
-                if request_raw_reload {
-                    reload_panel(app, panel_side);
-                    let panel = app.panel(panel_side);
-                    let browser = panel.browser();
-                    entries_len = browser.entries.len();
-                    selected_index = browser.selected_index.min(entries_len.saturating_sub(1));
-                    selected_label = browser
-                        .entries
-                        .get(selected_index)
-                        .map(|e| e.name.clone())
-                        .unwrap_or_else(|| "-".to_string());
-                    loading = browser.loading;
-                }
-
-                let list_height = (ui.available_height() - footer_height - spacing).max(0.0);
-                rows = window_rows_for(list_height, ui.spacing().item_spacing.y);
-                let mut visible_range = 0..0;
-
-                let mut scroll_target = None;
-                if is_active && entries_len > 0 {
-                    let row_height = ROW_HEIGHT + ui.spacing().item_spacing.y;
-                    let total_height =
-                        (row_height * entries_len as f32 - ui.spacing().item_spacing.y).max(0.0);
-                    let ensure_visible = selected_index < top_index
-                        || selected_index >= top_index.saturating_add(rows);
-                    let center_offset = (list_height - row_height) * 0.5;
-                    let mut target = if ensure_visible || scroll_mode == ScrollMode::ForceActive {
-                        selected_index as f32 * row_height - center_offset
-                    } else {
-                        0.0
-                    };
-                    if total_height > list_height {
-                        let max_offset = (total_height - list_height).max(0.0);
-                        if target < 0.0 {
-                            target = 0.0;
-                        } else if target > max_offset {
-                            target = max_offset;
-                        }
-                    } else {
-                        target = 0.0;
-                    }
-                    if ensure_visible || scroll_mode == ScrollMode::ForceActive {
-                        scroll_target = Some(target);
-                    }
-                }
-
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(ui.available_width(), list_height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        let mut scroll = egui::ScrollArea::vertical()
-                            .id_salt(match panel_side_for_closure {
-                                core::ActivePanel::Left => "left_list",
-                                core::ActivePanel::Right => "right_list",
-                            })
-                            .auto_shrink([false, false]);
-                        if let Some(offset) = scroll_target {
-                            scroll = scroll.vertical_scroll_offset(offset);
-                        }
-                        scroll.show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
-                            visible_range = row_range.clone();
-                            for idx in row_range {
-                                let (entry, rename_active, is_marked) = {
-                                    let browser = app.panel(panel_side_for_closure).browser();
-                                    let entry = browser.entries[idx].clone();
-                                    let rename_active = browser
-                                        .inline_rename
-                                        .as_ref()
-                                        .is_some_and(|rename| rename.index == idx);
-                                    let is_marked = browser.marked.contains(&entry.name);
-                                    (entry, rename_active, is_marked)
-                                };
-                                let is_selected = selected_index == idx;
-                                let stripe = idx % 2 == 0;
-                                let bg = if is_selected {
-                                    if is_active {
-                                        colors.row_bg_selected_active
-                                    } else {
-                                        colors.row_bg_selected_inactive
-                                    }
-                                } else if stripe {
-                                    colors.row_bg_stripe
-                                } else {
-                                    theme::Color::rgba(0.0, 0.0, 0.0, 0.0)
-                                };
-                                let fg = if is_selected && is_active {
-                                    colors.row_fg_selected
-                                } else if is_active {
-                                    colors.row_fg_active
-                                } else {
-                                    colors.row_fg_inactive
-                                };
-                                let mut fg = fg;
-                                let is_hidden =
-                                    entry.name.starts_with('.') && entry.name.as_str() != "..";
-                                let file_tint = if entry.is_dir {
-                                    None
-                                } else if core::is_text_name(&entry.name) {
-                                    Some(theme::Color::rgba(0.22, 0.78, 0.56, 1.0))
-                                } else if core::is_media_name(&entry.name) {
-                                    Some(theme::Color::rgba(0.32, 0.68, 1.0, 1.0))
-                                } else {
-                                    Some(theme::Color::rgba(0.92, 0.68, 0.28, 1.0))
-                                };
-                                if !is_selected && let Some(tint) = file_tint {
-                                    let factor = if is_active { 0.42 } else { 0.32 };
-                                    fg = blend_color(fg, tint, factor);
-                                }
-                                if is_hidden && !is_selected {
-                                    fg = fade_color(fg, 0.55);
-                                }
-                                // Invert colors for marked entries
-                                let (bg, fg) = if is_marked {
-                                    (fg, colors.preview_bg)
-                                } else {
-                                    (bg, fg)
-                                };
-
-                                let (rect, response) = ui.allocate_exact_size(
-                                    egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
-                                    egui::Sense::click(),
-                                );
-                                ui.painter().rect_filled(
-                                    rect,
-                                    egui::CornerRadius::same(3),
-                                    color32(bg),
-                                );
-
-                                let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                let icon_color = if is_marked {
-                                    fg
-                                } else if entry.is_dir {
-                                    colors.panel_border_active
-                                } else if is_selected {
-                                    fg
-                                } else if let Some(tint) = file_tint {
-                                    blend_color(fg, tint, 0.85)
-                                } else {
-                                    fg
-                                };
-                                let icon_color = if is_hidden && !is_selected && !is_marked {
-                                    fade_color(icon_color, 0.55)
-                                } else {
-                                    icon_color
-                                };
-                                let ic = color32(icon_color);
-                                let center = egui::pos2(rect.left() + 12.0, rect.center().y);
-                                let painter = ui.painter();
-                                draw_file_icon(painter, center, ic, &entry);
-
-                                let mut size_text =
-                                    entry.size.map(core::format_size).unwrap_or_default();
-                                if size_text.is_empty()
-                                    && entry.is_dir
-                                    && let core::EntryLocation::Fs(path) = &entry.location
-                                    && app.dir_size_pending.contains(path)
-                                {
-                                    size_text = "…".to_string();
-                                }
-                                if !size_text.is_empty() {
-                                    ui.painter().text(
-                                        egui::pos2(rect.right() - 8.0, rect.center().y),
-                                        egui::Align2::RIGHT_CENTER,
-                                        size_text,
-                                        font_id.clone(),
-                                        color32(fg),
-                                    );
-                                }
-                                // Date column between name and size
-                                if let Some(mtime) = entry.modified {
-                                    let date_text = core::format_date(mtime);
-                                    ui.painter().text(
-                                        egui::pos2(
-                                            rect.right() - SIZE_COL_WIDTH - 4.0,
-                                            rect.center().y,
-                                        ),
-                                        egui::Align2::RIGHT_CENTER,
-                                        date_text,
-                                        font_id.clone(),
-                                        color32(fade_color(fg, 0.7)),
-                                    );
-                                }
-                                let right_cols = SIZE_COL_WIDTH + DATE_COL_WIDTH;
-                                let name_min = rect.left_center() + egui::Vec2::new(22.0, 0.0);
-                                let name_rect = egui::Rect::from_min_max(
-                                    egui::pos2(name_min.x, rect.top()),
-                                    egui::pos2(rect.right() - right_cols, rect.bottom()),
-                                );
-                                if rename_active {
-                                    ui.scope_builder(
-                                        egui::UiBuilder::new().max_rect(name_rect),
-                                        |ui| {
-                                            ui.set_clip_rect(name_rect);
-                                            let rename = app
-                                                .panel_mut(panel_side_for_closure)
-                                                .browser_mut()
-                                                .inline_rename
-                                                .as_mut()
-                                                .expect("rename active");
-                                            let response = ui.add_sized(
-                                                name_rect.size(),
-                                                egui::TextEdit::singleline(&mut rename.text)
-                                                    .font(egui::TextStyle::Body)
-                                                    .id_source(match panel_side_for_closure {
-                                                        core::ActivePanel::Left => {
-                                                            "inline_rename_left"
-                                                        }
-                                                        core::ActivePanel::Right => {
-                                                            "inline_rename_right"
-                                                        }
-                                                    }),
+                                            let galley = ui.fonts_mut(|f| f.layout_job(job));
+                                            let painter = ui.painter().with_clip_rect(left_rect);
+                                            let pos = egui::Align2::LEFT_CENTER.anchor_size(
+                                                left_rect.left_center(),
+                                                galley.size(),
                                             );
-                                            if rename.focus {
-                                                response.request_focus();
-                                                if matches!(
-                                                    rename.kind,
-                                                    app_state::InlineEditKind::NewFile
-                                                        | app_state::InlineEditKind::NewDir
-                                                ) && let Some(mut state) =
-                                                    egui::TextEdit::load_state(
-                                                        ui.ctx(),
-                                                        response.id,
-                                                    )
-                                                {
-                                                    state.cursor.set_char_range(Some(
-                                                        egui::text::CCursorRange::two(
-                                                            egui::text::CCursor::new(0),
-                                                            egui::text::CCursor::new(
-                                                                rename.text.len(),
-                                                            ),
-                                                        ),
-                                                    ));
-                                                    state.store(ui.ctx(), response.id);
-                                                }
-                                                rename.focus = false;
+                                            painter.galley(pos.min, galley, header_color);
+                                            if is_active {
+                                                let radius = header_font.size * 0.25;
+                                                let center = egui::pos2(
+                                                    pos.min.x + radius + 1.0,
+                                                    left_rect.center().y,
+                                                );
+                                                painter.circle_filled(center, radius, header_color);
                                             }
-                                        },
-                                    );
-                                } else if entry.is_symlink {
-                                    let arrow_text = format!("{} -> ", entry.name);
-                                    let target_text = entry.link_target.as_deref().unwrap_or("?");
-                                    let is_broken = entry.size.is_none() && !entry.is_dir;
-                                    let target_color = if is_broken {
-                                        color32(theme::Color::rgba(0.9, 0.3, 0.3, 1.0))
-                                    } else {
-                                        color32(fade_color(fg, 0.65))
-                                    };
-                                    let full = format!("{arrow_text}{target_text}");
-                                    let galley = ui.painter().layout_no_wrap(
-                                        full,
-                                        font_id.clone(),
-                                        color32(fg),
-                                    );
-                                    let arrow_galley = ui.painter().layout_no_wrap(
-                                        arrow_text.clone(),
-                                        font_id.clone(),
-                                        color32(fg),
-                                    );
-                                    let arrow_w = arrow_galley.size().x;
-                                    let clipped = ui.painter().with_clip_rect(name_rect);
-                                    clipped.text(
-                                        name_min,
-                                        egui::Align2::LEFT_CENTER,
-                                        arrow_text,
-                                        font_id.clone(),
-                                        color32(fg),
-                                    );
-                                    let target_pos = name_min + egui::Vec2::new(arrow_w, 0.0);
-                                    clipped.text(
-                                        target_pos,
-                                        egui::Align2::LEFT_CENTER,
-                                        target_text,
-                                        font_id.clone(),
-                                        target_color,
-                                    );
-                                    if galley.size().x > name_rect.width() {
-                                        clipped.text(
-                                            egui::pos2(
-                                                name_rect.right() - 12.0,
-                                                name_rect.center().y,
-                                            ),
-                                            egui::Align2::LEFT_CENTER,
-                                            "\u{2026}",
-                                            font_id,
-                                            color32(fg),
-                                        );
-                                    }
-                                } else {
-                                    let galley = ui.painter().layout_no_wrap(
-                                        entry.name.clone(),
-                                        font_id.clone(),
-                                        color32(fg),
-                                    );
-                                    let clipped = ui.painter().with_clip_rect(name_rect);
-                                    clipped.text(
-                                        name_min,
-                                        egui::Align2::LEFT_CENTER,
-                                        &entry.name,
-                                        font_id.clone(),
-                                        color32(fg),
-                                    );
-                                    if galley.size().x > name_rect.width() {
-                                        clipped.text(
-                                            egui::pos2(
-                                                name_rect.right() - 12.0,
-                                                name_rect.center().y,
-                                            ),
-                                            egui::Align2::LEFT_CENTER,
-                                            "\u{2026}",
-                                            font_id,
-                                            color32(fg),
-                                        );
-                                    }
-                                }
+                                            if left_width > 0.0 {
+                                                ui.add_space(gap);
+                                            }
+                                            ui.allocate_ui_with_layout(
+                                                egui::Vec2::new(
+                                                    controls_width,
+                                                    ui.available_height(),
+                                                ),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    egui::ComboBox::from_id_salt(
+                                                        match panel_side {
+                                                            core::ActivePanel::Left => {
+                                                                "left_sort_mode"
+                                                            }
+                                                            core::ActivePanel::Right => {
+                                                                "right_sort_mode"
+                                                            }
+                                                        },
+                                                    )
+                                                    .selected_text(sort_mode_label(sort_mode))
+                                                    .show_ui(ui, |ui| {
+                                                        sort_changed |= ui
+                                                            .selectable_value(
+                                                                &mut sort_mode,
+                                                                core::SortMode::Name,
+                                                                "Name",
+                                                            )
+                                                            .changed();
+                                                        sort_changed |= ui
+                                                            .selectable_value(
+                                                                &mut sort_mode,
+                                                                core::SortMode::Date,
+                                                                "Date",
+                                                            )
+                                                            .changed();
+                                                        sort_changed |= ui
+                                                            .selectable_value(
+                                                                &mut sort_mode,
+                                                                core::SortMode::Size,
+                                                                "Size",
+                                                            )
+                                                            .changed();
+                                                        sort_changed |= ui
+                                                            .selectable_value(
+                                                                &mut sort_mode,
+                                                                core::SortMode::Raw,
+                                                                "Raw",
+                                                            )
+                                                            .changed();
+                                                    });
+                                                    let arrow = if sort_desc { "v" } else { "^" };
+                                                    if ui.small_button(arrow).clicked() {
+                                                        sort_desc = !sort_desc;
+                                                        sort_changed = true;
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.spacing_mut().item_spacing = prev_spacing;
 
-                                if response.clicked_by(egui::PointerButton::Primary) {
-                                    clicked_index = Some(idx);
-                                }
-                                if response.double_clicked_by(egui::PointerButton::Primary) {
-                                    clicked_index = Some(idx);
-                                    open_on_double_click = true;
-                                }
-                            }
-                        });
-                    },
-                );
-
-                if entries_len > 0 {
-                    new_top_index = Some(visible_range.start.min(entries_len - 1));
-                } else {
-                    new_top_index = Some(0);
-                }
-
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(ui.available_width(), footer_height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        egui::Frame::NONE
-                            .fill(color32(colors.footer_bg))
-                            .corner_radius(egui::CornerRadius::same(4))
-                            .show(ui, |ui| {
-                                if is_active && app.search_ui == app_state::SearchUiState::Open {
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(color32(colors.footer_fg), "Search:");
-                                        let response =
-                                            ui.text_edit_singleline(&mut app.search_query);
-                                        if app.search_focus {
-                                            response.request_focus();
-                                            app.search_focus = false;
+                                        if sort_changed {
+                                            browser.sort_mode = sort_mode;
+                                            browser.sort_desc = sort_desc;
+                                            if sort_mode == core::SortMode::Raw
+                                                && previous_sort_mode != core::SortMode::Raw
+                                            {
+                                                request_raw_reload = true;
+                                            } else {
+                                                resort_browser_entries(browser);
+                                            }
                                         }
                                     });
+                            },
+                        );
+
+                        if request_raw_reload {
+                            reload_panel(app, panel_side);
+                            let panel = app.panel(panel_side);
+                            let browser = panel.browser();
+                            entries_len = browser.entries.len();
+                            selected_index =
+                                browser.selected_index.min(entries_len.saturating_sub(1));
+                            selected_label = browser
+                                .entries
+                                .get(selected_index)
+                                .map(|e| e.name.clone())
+                                .unwrap_or_else(|| "-".to_string());
+                            loading = browser.loading;
+                        }
+
+                        let list_height =
+                            (ui.available_height() - footer_height - spacing).max(0.0);
+                        rows = window_rows_for(list_height, ui.spacing().item_spacing.y);
+                        let mut visible_range = 0..0;
+
+                        let mut scroll_target = None;
+                        if is_active && entries_len > 0 {
+                            let row_height = ROW_HEIGHT + ui.spacing().item_spacing.y;
+                            let total_height = (row_height * entries_len as f32
+                                - ui.spacing().item_spacing.y)
+                                .max(0.0);
+                            let ensure_visible = selected_index < top_index
+                                || selected_index >= top_index.saturating_add(rows);
+                            let center_offset = (list_height - row_height) * 0.5;
+                            let mut target =
+                                if ensure_visible || scroll_mode == ScrollMode::ForceActive {
+                                    selected_index as f32 * row_height - center_offset
+                                } else {
+                                    0.0
+                                };
+                            if total_height > list_height {
+                                let max_offset = (total_height - list_height).max(0.0);
+                                if target < 0.0 {
+                                    target = 0.0;
+                                } else if target > max_offset {
+                                    target = max_offset;
                                 }
-                            });
-                    },
-                );
-            });
-        });
+                            } else {
+                                target = 0.0;
+                            }
+                            if ensure_visible || scroll_mode == ScrollMode::ForceActive {
+                                scroll_target = Some(target);
+                            }
+                        }
+
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(ui.available_width(), list_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                let mut scroll = egui::ScrollArea::vertical()
+                                    .id_salt(match panel_side_for_closure {
+                                        core::ActivePanel::Left => "left_list",
+                                        core::ActivePanel::Right => "right_list",
+                                    })
+                                    .auto_shrink([false, false]);
+                                if let Some(offset) = scroll_target {
+                                    scroll = scroll.vertical_scroll_offset(offset);
+                                }
+                                scroll.show_rows(ui, ROW_HEIGHT, entries_len, |ui, row_range| {
+                                    visible_range = row_range.clone();
+                                    for idx in row_range {
+                                        let (entry, rename_active, is_marked) = {
+                                            let browser =
+                                                app.panel(panel_side_for_closure).browser();
+                                            let entry = browser.entries[idx].clone();
+                                            let rename_active = browser
+                                                .inline_rename
+                                                .as_ref()
+                                                .is_some_and(|rename| rename.index == idx);
+                                            let is_marked = browser.marked.contains(&entry.name);
+                                            (entry, rename_active, is_marked)
+                                        };
+                                        let is_selected = selected_index == idx;
+                                        let stripe = idx % 2 == 0;
+                                        let bg = if is_selected {
+                                            if is_active {
+                                                colors.row_bg_selected_active
+                                            } else {
+                                                colors.row_bg_selected_inactive
+                                            }
+                                        } else if stripe {
+                                            colors.row_bg_stripe
+                                        } else {
+                                            theme::Color::rgba(0.0, 0.0, 0.0, 0.0)
+                                        };
+                                        let fg = if is_selected && is_active {
+                                            colors.row_fg_selected
+                                        } else if is_active {
+                                            colors.row_fg_active
+                                        } else {
+                                            colors.row_fg_inactive
+                                        };
+                                        let mut fg = fg;
+                                        let is_hidden = entry.name.starts_with('.')
+                                            && entry.name.as_str() != "..";
+                                        let file_tint = if entry.is_dir {
+                                            None
+                                        } else if core::is_text_name(&entry.name) {
+                                            Some(theme::Color::rgba(0.22, 0.78, 0.56, 1.0))
+                                        } else if core::is_media_name(&entry.name) {
+                                            Some(theme::Color::rgba(0.32, 0.68, 1.0, 1.0))
+                                        } else {
+                                            Some(theme::Color::rgba(0.92, 0.68, 0.28, 1.0))
+                                        };
+                                        if !is_selected && let Some(tint) = file_tint {
+                                            let factor = if is_active { 0.42 } else { 0.32 };
+                                            fg = blend_color(fg, tint, factor);
+                                        }
+                                        if is_hidden && !is_selected {
+                                            fg = fade_color(fg, 0.55);
+                                        }
+                                        // Invert colors for marked entries
+                                        let (bg, fg) = if is_marked {
+                                            (fg, colors.preview_bg)
+                                        } else {
+                                            (bg, fg)
+                                        };
+
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
+                                            egui::Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            egui::CornerRadius::same(3),
+                                            color32(bg),
+                                        );
+
+                                        let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                        let icon_color = if is_marked {
+                                            fg
+                                        } else if entry.is_dir {
+                                            colors.panel_border_active
+                                        } else if is_selected {
+                                            fg
+                                        } else if let Some(tint) = file_tint {
+                                            blend_color(fg, tint, 0.85)
+                                        } else {
+                                            fg
+                                        };
+                                        let icon_color = if is_hidden && !is_selected && !is_marked
+                                        {
+                                            fade_color(icon_color, 0.55)
+                                        } else {
+                                            icon_color
+                                        };
+                                        let ic = color32(icon_color);
+                                        let center =
+                                            egui::pos2(rect.left() + 12.0, rect.center().y);
+                                        let painter = ui.painter();
+                                        draw_file_icon(painter, center, ic, &entry);
+
+                                        let mut size_text =
+                                            entry.size.map(core::format_size).unwrap_or_default();
+                                        if size_text.is_empty()
+                                            && entry.is_dir
+                                            && let core::EntryLocation::Fs(path) = &entry.location
+                                            && app.dir_size_pending.contains(path)
+                                        {
+                                            size_text = "…".to_string();
+                                        }
+                                        if !size_text.is_empty() {
+                                            ui.painter().text(
+                                                egui::pos2(rect.right() - 8.0, rect.center().y),
+                                                egui::Align2::RIGHT_CENTER,
+                                                size_text,
+                                                font_id.clone(),
+                                                color32(fg),
+                                            );
+                                        }
+                                        // Date column between name and size
+                                        if let Some(mtime) = entry.modified {
+                                            let date_text = core::format_date(mtime);
+                                            ui.painter().text(
+                                                egui::pos2(
+                                                    rect.right() - SIZE_COL_WIDTH - 4.0,
+                                                    rect.center().y,
+                                                ),
+                                                egui::Align2::RIGHT_CENTER,
+                                                date_text,
+                                                font_id.clone(),
+                                                color32(fade_color(fg, 0.7)),
+                                            );
+                                        }
+                                        let right_cols = SIZE_COL_WIDTH + DATE_COL_WIDTH;
+                                        let name_min =
+                                            rect.left_center() + egui::Vec2::new(22.0, 0.0);
+                                        let name_rect = egui::Rect::from_min_max(
+                                            egui::pos2(name_min.x, rect.top()),
+                                            egui::pos2(rect.right() - right_cols, rect.bottom()),
+                                        );
+                                        if rename_active {
+                                            ui.scope_builder(
+                                                egui::UiBuilder::new().max_rect(name_rect),
+                                                |ui| {
+                                                    ui.set_clip_rect(name_rect);
+                                                    let rename = app
+                                                        .panel_mut(panel_side_for_closure)
+                                                        .browser_mut()
+                                                        .inline_rename
+                                                        .as_mut()
+                                                        .expect("rename active");
+                                                    let response = ui.add_sized(
+                                                        name_rect.size(),
+                                                        egui::TextEdit::singleline(
+                                                            &mut rename.text,
+                                                        )
+                                                        .font(egui::TextStyle::Body)
+                                                        .id_source(match panel_side_for_closure {
+                                                            core::ActivePanel::Left => {
+                                                                "inline_rename_left"
+                                                            }
+                                                            core::ActivePanel::Right => {
+                                                                "inline_rename_right"
+                                                            }
+                                                        }),
+                                                    );
+                                                    if rename.focus {
+                                                        response.request_focus();
+                                                        if matches!(
+                                                            rename.kind,
+                                                            app_state::InlineEditKind::NewFile
+                                                                | app_state::InlineEditKind::NewDir
+                                                        ) && let Some(mut state) =
+                                                            egui::TextEdit::load_state(
+                                                                ui.ctx(),
+                                                                response.id,
+                                                            )
+                                                        {
+                                                            state.cursor.set_char_range(Some(
+                                                                egui::text::CCursorRange::two(
+                                                                    egui::text::CCursor::new(0),
+                                                                    egui::text::CCursor::new(
+                                                                        rename.text.len(),
+                                                                    ),
+                                                                ),
+                                                            ));
+                                                            state.store(ui.ctx(), response.id);
+                                                        }
+                                                        rename.focus = false;
+                                                    }
+                                                },
+                                            );
+                                        } else if entry.is_symlink {
+                                            let arrow_text = format!("{} -> ", entry.name);
+                                            let target_text =
+                                                entry.link_target.as_deref().unwrap_or("?");
+                                            let is_broken = entry.size.is_none() && !entry.is_dir;
+                                            let target_color = if is_broken {
+                                                color32(theme::Color::rgba(0.9, 0.3, 0.3, 1.0))
+                                            } else {
+                                                color32(fade_color(fg, 0.65))
+                                            };
+                                            let full = format!("{arrow_text}{target_text}");
+                                            let galley = ui.painter().layout_no_wrap(
+                                                full,
+                                                font_id.clone(),
+                                                color32(fg),
+                                            );
+                                            let arrow_galley = ui.painter().layout_no_wrap(
+                                                arrow_text.clone(),
+                                                font_id.clone(),
+                                                color32(fg),
+                                            );
+                                            let arrow_w = arrow_galley.size().x;
+                                            let clipped = ui.painter().with_clip_rect(name_rect);
+                                            clipped.text(
+                                                name_min,
+                                                egui::Align2::LEFT_CENTER,
+                                                arrow_text,
+                                                font_id.clone(),
+                                                color32(fg),
+                                            );
+                                            let target_pos =
+                                                name_min + egui::Vec2::new(arrow_w, 0.0);
+                                            clipped.text(
+                                                target_pos,
+                                                egui::Align2::LEFT_CENTER,
+                                                target_text,
+                                                font_id.clone(),
+                                                target_color,
+                                            );
+                                            if galley.size().x > name_rect.width() {
+                                                clipped.text(
+                                                    egui::pos2(
+                                                        name_rect.right() - 12.0,
+                                                        name_rect.center().y,
+                                                    ),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    "\u{2026}",
+                                                    font_id,
+                                                    color32(fg),
+                                                );
+                                            }
+                                        } else {
+                                            let galley = ui.painter().layout_no_wrap(
+                                                entry.name.clone(),
+                                                font_id.clone(),
+                                                color32(fg),
+                                            );
+                                            let clipped = ui.painter().with_clip_rect(name_rect);
+                                            clipped.text(
+                                                name_min,
+                                                egui::Align2::LEFT_CENTER,
+                                                &entry.name,
+                                                font_id.clone(),
+                                                color32(fg),
+                                            );
+                                            if galley.size().x > name_rect.width() {
+                                                clipped.text(
+                                                    egui::pos2(
+                                                        name_rect.right() - 12.0,
+                                                        name_rect.center().y,
+                                                    ),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    "\u{2026}",
+                                                    font_id,
+                                                    color32(fg),
+                                                );
+                                            }
+                                        }
+
+                                        if response.clicked_by(egui::PointerButton::Primary) {
+                                            clicked_index = Some(idx);
+                                        }
+                                        if response.double_clicked_by(egui::PointerButton::Primary)
+                                        {
+                                            clicked_index = Some(idx);
+                                            open_on_double_click = true;
+                                        }
+                                    }
+                                });
+                            },
+                        );
+
+                        if entries_len > 0 {
+                            new_top_index = Some(visible_range.start.min(entries_len - 1));
+                        } else {
+                            new_top_index = Some(0);
+                        }
+
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(ui.available_width(), footer_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                egui::Frame::NONE
+                                    .fill(color32(colors.footer_bg))
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .show(ui, |ui| {
+                                        if is_active
+                                            && app.search_ui == app_state::SearchUiState::Open
+                                        {
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(
+                                                    color32(colors.footer_fg),
+                                                    "Search:",
+                                                );
+                                                let response =
+                                                    ui.text_edit_singleline(&mut app.search_query);
+                                                if app.search_focus {
+                                                    response.request_focus();
+                                                    app.search_focus = false;
+                                                }
+                                            });
+                                        }
+                                    });
+                            },
+                        );
+                    });
+                })
+        })
+        .inner;
 
     if panel_response.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
         app.active_panel = panel_side;

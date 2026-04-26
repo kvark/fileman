@@ -1,0 +1,19 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    (key: "select:source.txt"),
+    (key: "F3"),
+    (key: "Wait"),
+  ],
+  asserts: (
+    snapshots: [
+      (
+        path: "target/test-artifacts/preview_text.png",
+        expected: "etc/snapshots/tests/preview_text.png",
+        max_channel_diff: 200,
+        max_pixel_fraction: 0.005,
+      ),
+    ],
+  ),
+)

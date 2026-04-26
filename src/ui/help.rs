@@ -12,88 +12,90 @@ pub fn draw_help(
 ) -> bool {
     let mut install_requested = false;
     let colors = theme.colors();
-    let version = env!("CARGO_PKG_VERSION");
-    let shortcuts = [
-        ("Enter", "Open"),
-        ("Shift+Enter", "Open with system default app"),
-        ("Tab", "Switch panels"),
-        ("Ctrl+T", "New tab"),
-        ("Ctrl+W", "Close tab"),
-        ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / prev tab"),
-        ("Ctrl+U", "Swap panels"),
-        ("Alt+Left / Alt+Right", "Back / forward"),
-        ("Backspace / Ctrl+PgUp", "Parent folder"),
-        ("Ctrl+PgDn", "Open selected"),
-        ("Ctrl+Left / Ctrl+Right", "Open selected dir in other panel"),
-        ("F3 / Ctrl+P", "Preview"),
-        ("F4 / Ctrl+E", "Edit"),
-        ("Shift+F4 / Ctrl+N", "New file"),
-        ("F7 / Ctrl+D", "New directory"),
-        ("Insert / Ctrl+I", "Mark / unmark"),
-        ("Shift+F6 / Ctrl+Shift+M", "Rename"),
-        ("F5 / Ctrl+C", "Copy"),
-        ("Alt+F5 / Ctrl+A", "Pack (create archive)"),
-        ("F6 / Ctrl+M", "Move"),
-        ("F8 / Ctrl+X", "Delete"),
-        ("Space", "Compute folder size"),
-        ("Alt+F7 / Ctrl+G", "Search"),
-        ("Alt+Enter", "Properties"),
-        ("F2 / Ctrl+R", "Refresh"),
-        ("Ctrl+G", "Quick jump"),
-        ("F9", "Toggle theme"),
-        ("F10", "Theme picker"),
-        ("F1 / Ctrl+H", "Help"),
-    ];
-    egui::Frame::NONE
-        .fill(color32(colors.preview_bg))
-        .stroke(egui::Stroke::new(
-            1.0,
-            color32(if is_focused {
-                colors.panel_border_active
-            } else {
-                colors.panel_border_inactive
-            }),
-        ))
-        .show(ui, |ui| {
-            ui.set_min_size(egui::Vec2::new(ui.available_width(), min_height));
-            egui::Frame::NONE
-                .fill(color32(colors.preview_header_bg))
-                .show(ui, |ui| {
-                    ui.colored_label(color32(colors.preview_header_fg), "Help (Tab to return)");
-                });
-            ui.add_space(8.0);
-            ui.colored_label(color32(colors.preview_text), format!("FileMan {version}"));
-            ui.colored_label(color32(colors.row_fg_inactive), "Author: Dzmitry Malyshau");
+    ui.push_id("help_panel", |ui| {
+        let version = env!("CARGO_PKG_VERSION");
+        let shortcuts = [
+            ("Enter", "Open"),
+            ("Shift+Enter", "Open with system default app"),
+            ("Tab", "Switch panels"),
+            ("Ctrl+T", "New tab"),
+            ("Ctrl+W", "Close tab"),
+            ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / prev tab"),
+            ("Ctrl+U", "Swap panels"),
+            ("Alt+Left / Alt+Right", "Back / forward"),
+            ("Backspace / Ctrl+PgUp", "Parent folder"),
+            ("Ctrl+PgDn", "Open selected"),
+            ("Ctrl+Left / Ctrl+Right", "Open selected dir in other panel"),
+            ("F3 / Ctrl+P", "Preview"),
+            ("F4 / Ctrl+E", "Edit"),
+            ("Shift+F4 / Ctrl+N", "New file"),
+            ("F7 / Ctrl+D", "New directory"),
+            ("Insert / Ctrl+I", "Mark / unmark"),
+            ("Shift+F6 / Ctrl+Shift+M", "Rename"),
+            ("F5 / Ctrl+C", "Copy"),
+            ("Alt+F5 / Ctrl+A", "Pack (create archive)"),
+            ("F6 / Ctrl+M", "Move"),
+            ("F8 / Ctrl+X", "Delete"),
+            ("Space", "Compute folder size"),
+            ("Alt+F7 / Ctrl+G", "Search"),
+            ("Alt+Enter", "Properties"),
+            ("F2 / Ctrl+R", "Refresh"),
+            ("Ctrl+G", "Quick jump"),
+            ("F9", "Toggle theme"),
+            ("F10", "Theme picker"),
+            ("F1 / Ctrl+H", "Help"),
+        ];
+        egui::Frame::NONE
+            .fill(color32(colors.preview_bg))
+            .stroke(egui::Stroke::new(
+                1.0,
+                color32(if is_focused {
+                    colors.panel_border_active
+                } else {
+                    colors.panel_border_inactive
+                }),
+            ))
+            .show(ui, |ui| {
+                ui.set_min_size(egui::Vec2::new(ui.available_width(), min_height));
+                egui::Frame::NONE
+                    .fill(color32(colors.preview_header_bg))
+                    .show(ui, |ui| {
+                        ui.colored_label(color32(colors.preview_header_fg), "Help (Tab to return)");
+                    });
+                ui.add_space(8.0);
+                ui.colored_label(color32(colors.preview_text), format!("FileMan {version}"));
+                ui.colored_label(color32(colors.row_fg_inactive), "Author: Dzmitry Malyshau");
 
-            ui.colored_label(
-                color32(colors.row_fg_inactive),
-                format!("GPU: {}", async_status.gpu_info),
-            );
+                ui.colored_label(
+                    color32(colors.row_fg_inactive),
+                    format!("GPU: {}", async_status.gpu_info),
+                );
 
-            // Update status
-            ui.add_space(6.0);
-            install_requested = draw_update_status(ui, &colors, &async_status.update);
+                // Update status
+                ui.add_space(6.0);
+                install_requested = draw_update_status(ui, &colors, &async_status.update);
 
-            // Async workers status
-            ui.add_space(10.0);
-            ui.colored_label(color32(colors.preview_text), "Async Workers");
-            ui.add_space(6.0);
-            draw_async_status(ui, &colors, async_status);
+                // Async workers status
+                ui.add_space(10.0);
+                ui.colored_label(color32(colors.preview_text), "Async Workers");
+                ui.add_space(6.0);
+                draw_async_status(ui, &colors, async_status);
 
-            ui.add_space(10.0);
-            ui.colored_label(color32(colors.preview_text), "Shortcuts");
-            ui.add_space(6.0);
-            for (keys, desc) in shortcuts {
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    ui.colored_label(
-                        color32(colors.row_fg_selected),
-                        egui::RichText::new(keys).monospace().strong(),
-                    );
-                    ui.colored_label(color32(colors.row_fg_inactive), desc);
-                });
-            }
-        });
+                ui.add_space(10.0);
+                ui.colored_label(color32(colors.preview_text), "Shortcuts");
+                ui.add_space(6.0);
+                for (keys, desc) in shortcuts {
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.colored_label(
+                            color32(colors.row_fg_selected),
+                            egui::RichText::new(keys).monospace().strong(),
+                        );
+                        ui.colored_label(color32(colors.row_fg_inactive), desc);
+                    });
+                }
+            });
+    });
     install_requested
 }
 
