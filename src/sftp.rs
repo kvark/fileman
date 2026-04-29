@@ -145,6 +145,53 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+#[cfg(unix)]
+fn set_tcp_keepalive(tcp: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = tcp.as_raw_fd();
+    unsafe {
+        let enable: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &enable as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        // Start probing after 15 seconds of idle
+        let idle: libc::c_int = 15;
+        #[cfg(target_os = "macos")]
+        const KEEPIDLE: libc::c_int = libc::TCP_KEEPALIVE;
+        #[cfg(not(target_os = "macos"))]
+        const KEEPIDLE: libc::c_int = libc::TCP_KEEPIDLE;
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            KEEPIDLE,
+            &idle as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        // Send a probe every 5 seconds
+        let interval: libc::c_int = 5;
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            &interval as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        // Give up after 3 failed probes (~15s after idle detection)
+        let count: libc::c_int = 3;
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            &count as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// Connect to an SSH host using config resolution. Tries ssh-agent, then key files.
 pub fn connect(
     host: &str,
@@ -162,6 +209,9 @@ pub fn connect(
     let addr = format!("{actual_host}:{port}");
     let tcp = TcpStream::connect(&addr).map_err(|e| format!("TCP connect to {addr}: {e}"))?;
     tcp.set_nodelay(true).ok();
+    // Enable TCP keepalive so the OS detects dead connections after sleep/network changes.
+    // Probe starts after 15s idle, then every 5s, giving up after ~30s total.
+    set_tcp_keepalive(&tcp);
 
     let mut session = Session::new().map_err(|e| format!("SSH session init: {e}"))?;
     session.set_tcp_stream(tcp);
@@ -169,6 +219,8 @@ pub fn connect(
         .handshake()
         .map_err(|e| format!("SSH handshake with {actual_host}: {e}"))?;
     session.set_timeout(30_000);
+    // SSH-level keepalive: send a probe every 15 seconds, expect a reply.
+    session.set_keepalive(true, 15);
 
     // Try ssh-agent first
     if session.userauth_agent(&user).is_ok() && session.authenticated() {
