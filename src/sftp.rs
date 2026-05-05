@@ -604,6 +604,10 @@ pub fn copy_remote_dir_to_local_via_tar(
         .exec(&src_cmd)
         .map_err(|e| format!("src exec: {e}"))?;
 
+    // Disable session timeout during tar streaming — tar may pause while
+    // reading directory contents, exceeding the normal 30s timeout.
+    src_session.set_timeout(0);
+
     let buf = io::BufReader::with_capacity(1 << 20, &mut src_ch);
     let reader = TrackedReader {
         inner: buf,
@@ -611,7 +615,7 @@ pub fn copy_remote_dir_to_local_via_tar(
         progress,
     };
     let mut archive = tar::Archive::new(reader);
-    archive.unpack(dst_dir).map_err(|e| {
+    let unpack_result = archive.unpack(dst_dir).map_err(|e| {
         if e.get_ref().is_some_and(|s| {
             is_cancel_err(
                 s.downcast_ref::<io::Error>()
@@ -622,7 +626,10 @@ pub fn copy_remote_dir_to_local_via_tar(
         } else {
             format!("tar extract: {e}")
         }
-    })?;
+    });
+
+    src_session.set_timeout(30_000);
+    unpack_result?;
 
     if name != src_name {
         std::fs::rename(dst_dir.join(src_name), dst_dir.join(name))
@@ -653,6 +660,10 @@ pub fn copy_local_dir_to_remote_via_tar(
         .exec(&dst_cmd)
         .map_err(|e| format!("dst exec: {e}"))?;
 
+    // Disable session timeout during tar streaming — large trees may cause
+    // pauses exceeding the normal 30s timeout.
+    dst_session.set_timeout(0);
+
     let buf = io::BufWriter::with_capacity(1 << 20, &mut dst_ch);
     let mut writer = TrackedWriter {
         inner: buf,
@@ -667,6 +678,8 @@ pub fn copy_local_dir_to_remote_via_tar(
 
     // Drop writer (and its BufWriter) to flush remaining data and release the &mut dst_ch borrow.
     drop(writer);
+
+    dst_session.set_timeout(30_000);
 
     match result {
         Ok(()) => {}
@@ -766,12 +779,14 @@ pub fn copy_cross_host_via_tar(
         src_parent
     };
 
+    // Use gzip compression to reduce bandwidth — data transits two SSH
+    // connections (source → local → destination).
     let src_cmd = format!(
-        "tar cf - -C {} {}",
+        "tar czf - -C {} {}",
         sh_quote(src_parent),
         sh_quote(src_name)
     );
-    let dst_cmd = format!("tar xf - -C {}", sh_quote(dst_dir));
+    let dst_cmd = format!("tar xzf - -C {}", sh_quote(dst_dir));
 
     let mut src_ch = src_session
         .channel_session()
@@ -786,6 +801,11 @@ pub fn copy_cross_host_via_tar(
     dst_ch
         .exec(&dst_cmd)
         .map_err(|e| format!("dst exec '{dst_cmd}': {e}"))?;
+
+    // Disable session timeouts during the relay — tar on the source may pause
+    // for longer than the normal 30s timeout while reading directory contents.
+    src_session.set_timeout(0);
+    dst_session.set_timeout(0);
 
     // Relay compressed tar stream from source to destination.
     let mut buf = vec![0u8; 256 * 1024];
@@ -804,9 +824,17 @@ pub fn copy_cross_host_via_tar(
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("relay read: {e}")),
+            Err(e) => {
+                src_session.set_timeout(30_000);
+                dst_session.set_timeout(30_000);
+                return Err(format!("relay read: {e}"));
+            }
         }
     }
+
+    // Restore session timeouts.
+    src_session.set_timeout(30_000);
+    dst_session.set_timeout(30_000);
 
     dst_ch.send_eof().map_err(|e| format!("send_eof: {e}"))?;
     dst_ch

@@ -71,6 +71,7 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                     return;
                 }
                 let mut text = std::mem::take(&mut edit.text);
+                let text_len_before = text.len();
                 let edit_ext = edit.ext.clone();
                 let theme_kind = theme.kind;
                 let mut key = edit.highlight_key.clone();
@@ -177,38 +178,45 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                     .map(|output| output.response.clone())
                     .unwrap_or_else(|| egui::AtomLayoutResponse::empty(ui.label(" ")));
                 // Auto-indent: if Enter was just pressed, copy leading whitespace
-                // from the previous line and insert it after the newline.
-                // Auto-indent: if Enter was just pressed, copy leading whitespace
-                // from the previous line. CCursor.index is a character offset.
-                let cursor_char = edit_output
-                    .as_ref()
-                    .and_then(|o| o.cursor_range)
-                    .map(|r| r.primary.index);
-                if let Some(char_pos) = cursor_char
-                    && char_pos > 0
-                {
-                    // Convert character offset to byte offset
-                    let byte_pos: usize = text
-                        .char_indices()
-                        .nth(char_pos)
-                        .map(|(i, _)| i)
-                        .unwrap_or(text.len());
-                    if byte_pos > 0 && text.as_bytes().get(byte_pos - 1) == Some(&b'\n') {
-                        let before = &text[..byte_pos - 1];
-                        let prev_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                        let prev_line = &before[prev_line_start..];
-                        let indent: String = prev_line
-                            .chars()
-                            .take_while(|c| *c == ' ' || *c == '\t')
-                            .collect();
-                        if !indent.is_empty() {
-                            let indent_chars = indent.chars().count();
-                            text.insert_str(byte_pos, &indent);
-                            if let Some(ref mut output) = edit_output
-                                && let Some(ref mut range) = output.cursor_range
-                            {
-                                range.primary.index += indent_chars;
-                                range.secondary.index += indent_chars;
+                // from the previous line. Only when text grew (not on deletion).
+                if response.changed() && text.len() > text_len_before {
+                    let cursor_char = edit_output
+                        .as_ref()
+                        .and_then(|o| o.cursor_range)
+                        .map(|r| r.primary.index);
+                    if let Some(char_pos) = cursor_char
+                        && char_pos > 0
+                    {
+                        // Convert character offset to byte offset
+                        let byte_pos: usize = text
+                            .char_indices()
+                            .nth(char_pos)
+                            .map(|(i, _)| i)
+                            .unwrap_or(text.len());
+                        if byte_pos > 0 && text.as_bytes().get(byte_pos - 1) == Some(&b'\n') {
+                            let before = &text[..byte_pos - 1];
+                            let prev_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                            let prev_line = &before[prev_line_start..];
+                            let indent: String = prev_line
+                                .chars()
+                                .take_while(|c| *c == ' ' || *c == '\t')
+                                .collect();
+                            if !indent.is_empty() {
+                                let indent_chars = indent.chars().count();
+                                text.insert_str(byte_pos, &indent);
+                                // Update egui's cursor state to account for the
+                                // inserted indent.
+                                let te_id = edit_output.as_ref().unwrap().response.id;
+                                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id)
+                                {
+                                    let new_pos = char_pos + indent_chars;
+                                    state.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::one(egui::text::CCursor::new(
+                                            new_pos,
+                                        )),
+                                    ));
+                                    state.store(ui.ctx(), te_id);
+                                }
                             }
                         }
                     }

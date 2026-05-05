@@ -600,9 +600,7 @@ pub fn start_io_worker(
                         (Some(src_arc), Some(dst_arc)) => {
                             let src_locked = src_arc.lock().unwrap();
                             let dst_locked = dst_arc.lock().unwrap();
-                            let total =
-                                crate::sftp::count_bytes_via_exec(&src_locked.session, &src_path);
-                            transfer_progress.reset(total);
+                            transfer_progress.reset(0);
                             if let Err(e) = crate::sftp::copy_cross_host_via_tar(
                                 &src_locked.session,
                                 &src_path,
