@@ -903,6 +903,7 @@ fn send_streaming_preview<R: Read>(
     let mut decided = force_text;
     let mut is_text = force_text;
     let mut bom_stripped = false;
+    let mut sent_any = false;
 
     while remaining > 0 {
         if !is_preview_current(current_id, id) {
@@ -947,10 +948,26 @@ fn send_streaming_preview<R: Read>(
                 },
             ));
         }
+        sent_any = true;
         if let Some(wake) = wake {
             wake();
         }
     }
+
+    // For 0-byte files: no chunks were sent, so send an empty text to resolve the preview.
+    if !sent_any {
+        let _ = tx.send((
+            id,
+            PreviewContent::TextChunk {
+                text: String::new(),
+                done: true,
+            },
+        ));
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
     Ok(())
 }
 
