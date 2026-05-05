@@ -13,6 +13,24 @@ use crate::core::{
 };
 use crate::theme::Theme;
 
+/// Determine the syntax-highlighting extension for a path.
+/// For files with known compound names (e.g. `CMakeLists.txt`), returns the
+/// semantic extension. Falls back to the file extension, or the full filename
+/// (lowercased) for extensionless files.
+pub fn syntax_ext_for_path(path: &std::path::Path) -> Option<String> {
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let lower = filename.to_ascii_lowercase();
+    // Compound filenames that need special routing
+    match lower.as_str() {
+        "cmakelists.txt" => return Some("cmake".to_string()),
+        _ => {}
+    }
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .or(Some(lower))
+}
+
 pub struct PanelState {
     pub tabs: Vec<BrowserState>,
     pub active_tab: usize,
@@ -971,24 +989,12 @@ impl AppState {
             }
             match entry.location.clone() {
                 EntryLocation::Fs(path) => {
-                    let ext = path
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            path.file_name()
-                                .and_then(|s| s.to_str())
-                                .map(|s| s.to_ascii_lowercase())
-                        });
+                    let ext = syntax_ext_for_path(&path);
                     (path.clone(), ext, None)
                 }
                 EntryLocation::Remote { ref host, ref path } => {
                     let remote_name = path.rsplit('/').next().unwrap_or("remote_file");
-                    let ext = std::path::Path::new(remote_name)
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| Some(remote_name.to_ascii_lowercase()));
+                    let ext = syntax_ext_for_path(std::path::Path::new(remote_name));
                     let synthetic = std::path::PathBuf::from(format!("/sftp/{host}{path}"));
                     (synthetic, ext, Some((host.clone(), path.clone())))
                 }
@@ -1061,18 +1067,7 @@ impl AppState {
                 return;
             }
             let entry = &browser.entries[browser.selected_index];
-            let ext = std::path::Path::new(&entry.name)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_string())
-                .or_else(|| {
-                    // For extensionless files (Makefile, Dockerfile, etc.),
-                    // pass the lowercased filename so syntax can match on it.
-                    std::path::Path::new(&entry.name)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_ascii_lowercase())
-                });
+            let ext = syntax_ext_for_path(std::path::Path::new(&entry.name));
             let key = match entry.location.clone() {
                 EntryLocation::Fs(path) => path.to_string_lossy().into_owned(),
                 EntryLocation::Container {

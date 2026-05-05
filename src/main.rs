@@ -329,6 +329,9 @@ fn highlight_text_job(
     if ext.as_deref() == Some("toml") {
         return fileman::syntax::toml::highlight_toml_job(text, theme_kind);
     }
+    if matches!(ext.as_deref(), Some("cmake" | "cmakelists.txt")) {
+        return fileman::syntax::cmake::highlight_cmake_job(text, theme_kind);
+    }
     if ext.as_deref() == Some("nix") {
         return fileman::syntax::nix::highlight_nix_job(text, theme_kind);
     }
@@ -368,14 +371,12 @@ fn highlight_text_job(
                 "glsl" | "vert" | "frag" | "hlsl" | "metal" | "wgsl" => {
                     SYNTAX_SET.find_syntax_by_name("C")
                 }
-                "cmake" => SYNTAX_SET.find_syntax_by_name("Makefile"),
                 // Extensionless filenames (lowercased by caller)
                 "makefile" | "gnumakefile" => SYNTAX_SET.find_syntax_by_name("Makefile"),
                 "dockerfile" => by_name_ci("bash"),
                 "vagrantfile" | "rakefile" | "gemfile" | "guardfile" | "fastfile" => {
                     SYNTAX_SET.find_syntax_by_name("Ruby")
                 }
-                "cmakelists.txt" => SYNTAX_SET.find_syntax_by_name("Makefile"),
                 _ => None,
             })
         })

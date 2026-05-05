@@ -1,3 +1,4 @@
+pub mod cmake;
 pub mod csv;
 pub mod nix;
 pub mod ron;
