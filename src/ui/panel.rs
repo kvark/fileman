@@ -807,10 +807,28 @@ pub fn draw_panel(
                                                     color32(colors.footer_fg),
                                                     "Search:",
                                                 );
-                                                let response =
-                                                    ui.text_edit_singleline(&mut app.search_query);
+                                                let id = ui.make_persistent_id("search_edit");
+                                                let response = egui::TextEdit::singleline(
+                                                    &mut app.search_query,
+                                                )
+                                                .id(id)
+                                                .show(ui);
                                                 if app.search_focus {
-                                                    response.request_focus();
+                                                    response.response.request_focus();
+                                                    // Select all so typing replaces the old query.
+                                                    if let Some(mut state) =
+                                                        egui::TextEdit::load_state(ui.ctx(), id)
+                                                    {
+                                                        state.cursor.set_char_range(Some(
+                                                            egui::text::CCursorRange::two(
+                                                                egui::text::CCursor::new(0),
+                                                                egui::text::CCursor::new(
+                                                                    app.search_query.len(),
+                                                                ),
+                                                            ),
+                                                        ));
+                                                        state.store(ui.ctx(), id);
+                                                    }
                                                     app.search_focus = false;
                                                 }
                                             });
