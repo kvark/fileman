@@ -44,8 +44,8 @@ serde_json = "1.0"
 serde_yml = "0.0.12"
 toml = "0.8"
 ron = "0.12"
-blade-egui = { git = "https://github.com/kvark/blade", rev = "3a72838" }
-blade-graphics = { git = "https://github.com/kvark/blade", rev = "3a72838" }
+blade-egui = { git = "https://github.com/kvark/blade", rev = "f1fbf2a" }
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "f1fbf2a" }
 egui = "0.34"
 egui-winit = "0.34"
 winit = "0.30.5"

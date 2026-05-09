@@ -211,6 +211,7 @@ pub fn connect(
     tcp.set_nodelay(true).ok();
     // Enable TCP keepalive so the OS detects dead connections after sleep/network changes.
     // Probe starts after 15s idle, then every 5s, giving up after ~30s total.
+    #[cfg(unix)]
     set_tcp_keepalive(&tcp);
 
     let mut session = Session::new().map_err(|e| format!("SSH session init: {e}"))?;
