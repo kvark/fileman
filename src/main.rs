@@ -799,6 +799,7 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
 fn pump_async(app: &mut app_state::AppState) -> bool {
     let mut changed = false;
     let mut stale_sessions: Vec<String> = Vec::new();
+    let mut reconnect_panels: Vec<(core::ActivePanel, String, String)> = Vec::new();
     for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
         let panel = app.panel_mut(side);
         let browser = panel.browser_mut();
@@ -808,9 +809,12 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 match rx.try_recv() {
                     Ok(batch) => {
                         if let core::DirBatch::ConnectionError(_) = &batch
-                            && let core::BrowserMode::Remote { ref host, .. } = browser.browser_mode
+                            && let core::BrowserMode::Remote {
+                                ref host, ref path, ..
+                            } = browser.browser_mode
                         {
                             stale_sessions.push(host.clone());
+                            reconnect_panels.push((side, host.clone(), path.clone()));
                         }
                         apply_dir_batch(browser, batch);
                         handled += 1;
@@ -892,6 +896,10 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         }
         if !removed.is_empty() {
             std::thread::spawn(move || drop(removed));
+        }
+        // Automatically reconnect panels that had stale sessions.
+        for (side, host, path) in reconnect_panels {
+            navigate_sftp(app, &host, &path, side);
         }
     }
 
