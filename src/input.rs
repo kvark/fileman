@@ -325,6 +325,13 @@ pub(crate) fn handle_keyboard(
                 egui::Key::M,
             )
         });
+    let ctrl_shift_c = !in_edit
+        && ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+                egui::Key::C,
+            )
+        });
     let f2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2));
 
     let f1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1));
@@ -939,6 +946,12 @@ pub(crate) fn handle_keyboard(
         app.prepare_copy_selected();
         ctx.request_repaint();
     }
+    if ctrl_shift_c
+        && let Some(text) = build_selected_paths(app)
+    {
+        ctx.copy_text(text);
+        ctx.request_repaint();
+    }
     // Modified F-key variants must be consumed before bare variants,
     // because egui's consume_key(NONE, ...) matches regardless of modifiers.
     let shift_f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4));
@@ -1267,4 +1280,44 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
         }
     }
     true
+}
+
+/// Build the clipboard text for "copy path" — all marked entries (one per line)
+/// or just the current selection if nothing is marked. `..` is always skipped.
+fn build_selected_paths(app: &app_state::AppState) -> Option<String> {
+    let panel = app.panel(app.active_panel);
+    let browser = panel.browser();
+    let format_entry = |entry: &core::DirEntry| -> Option<String> {
+        if entry.name == ".." {
+            return None;
+        }
+        match &entry.location {
+            core::EntryLocation::Fs(path) => Some(path.to_string_lossy().into_owned()),
+            core::EntryLocation::Remote { host, path } => Some(format!("{host}:{path}")),
+            core::EntryLocation::Container {
+                kind,
+                archive_path,
+                inner_path,
+            } => Some(core::container_display_path(*kind, archive_path, inner_path)),
+        }
+    };
+    let paths: Vec<String> = if browser.marked.is_empty() {
+        browser
+            .entries
+            .get(browser.selected_index)
+            .and_then(format_entry)
+            .into_iter()
+            .collect()
+    } else {
+        browser
+            .entries
+            .iter()
+            .filter(|e| browser.marked.contains(&e.name))
+            .filter_map(format_entry)
+            .collect()
+    };
+    if paths.is_empty() {
+        return None;
+    }
+    Some(paths.join("\n"))
 }
