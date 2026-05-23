@@ -33,6 +33,7 @@ pub fn draw_help(
             ("Insert / Ctrl+I", "Mark / unmark"),
             ("Shift+F6 / Ctrl+Shift+M", "Rename"),
             ("F5 / Ctrl+C", "Copy"),
+            ("Ctrl+Shift+C", "Copy path to clipboard"),
             ("Alt+F5 / Ctrl+A", "Pack (create archive)"),
             ("F6 / Ctrl+M", "Move"),
             ("F8 / Ctrl+X", "Delete"),
