@@ -1008,3 +1008,141 @@ pub(crate) fn run_snapshot(path: &PathBuf) -> anyhow::Result<()> {
     drain_async(&mut app, 50);
     render_snapshot(&mut app, &mut ui_cache, path)
 }
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    /// Tiny xorshift PRNG — no rand crate dependency, deterministic given a
+    /// seed so failing iterations can be re-run.
+    struct Xs64(u64);
+    impl Xs64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[(self.next() as usize) % xs.len()]
+        }
+    }
+
+    fn make_fuzz_tree(root: &std::path::Path) -> anyhow::Result<()> {
+        use std::fs;
+        fs::create_dir_all(root.join("alpha/sub1"))?;
+        fs::create_dir_all(root.join("alpha/sub2"))?;
+        fs::create_dir_all(root.join("beta"))?;
+        fs::create_dir_all(root.join("gamma/deep/deeper"))?;
+        fs::write(root.join("README.txt"), "hello")?;
+        fs::write(root.join("alpha/note.md"), "note")?;
+        fs::write(root.join("alpha/sub1/leaf.txt"), "leaf")?;
+        fs::write(root.join("beta/data.bin"), [0u8; 32])?;
+        fs::write(root.join("gamma/deep/x.txt"), "x")?;
+        fs::write(root.join("gamma/deep/deeper/y.txt"), "y")?;
+        Ok(())
+    }
+
+    fn check_invariants(app: &app_state::AppState, after: &str) {
+        for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
+            let panel = app.panel(side);
+            let browser = panel.browser();
+            // Inv 1: selected_index is in bounds.
+            if !browser.entries.is_empty() {
+                assert!(
+                    browser.selected_index < browser.entries.len(),
+                    "{after}: selected_index {} >= len {}",
+                    browser.selected_index,
+                    browser.entries.len()
+                );
+            }
+            // Inv 2: top_index never points past entries (allow == when empty).
+            assert!(
+                browser.top_index <= browser.entries.len(),
+                "{after}: top_index out of range"
+            );
+            // Inv 3: if a load is in flight its token must match dir_token.
+            //        (start_navigation paths re-stamp; staleness gets discarded
+            //        by pump_async, so a Loading state with stale token is OK
+            //        transiently — but after drain_async it must be gone.)
+            if let Some(token) = browser.load.token() {
+                assert_eq!(
+                    token, browser.dir_token,
+                    "{after}: load token {} != dir_token {}",
+                    token, browser.dir_token
+                );
+            }
+            // Inv 4: parent_cache entries store earlier paths (no future paths).
+            for cached in &browser.parent_cache {
+                assert_ne!(
+                    cached.current_path, browser.current_path,
+                    "{after}: parent_cache contains current dir"
+                );
+            }
+        }
+    }
+
+    fn random_key(rng: &mut Xs64) -> ReplayKey {
+        const KEYS: &[&str] = &[
+            "Down", "Down", "Up", "Up", "Home", "End", "PageDown", "PageUp",
+            "Enter", "Backspace", "Tab", "F2", "F1", "Insert",
+        ];
+        let key = (*rng.pick(KEYS)).to_string();
+        // Occasionally inject Ctrl+ shortcuts
+        let modifiers = if rng.next() % 10 == 0 {
+            vec!["Ctrl".to_string()]
+        } else {
+            Vec::new()
+        };
+        ReplayKey { key, modifiers }
+    }
+
+    #[test]
+    fn fuzz_navigation_invariants_hold() {
+        // 30 iterations of ~25 random keys each. Each iteration uses a
+        // distinct seed so a failure can be re-run with -- --nocapture and
+        // the seed printed alongside.
+        let tmp = std::env::temp_dir().join("fileman_fuzz_nav");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        make_fuzz_tree(&tmp).unwrap();
+
+        for seed in 0..30u64 {
+            let mut rng = Xs64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
+            let mut app =
+                init_headless_app(Some(tmp.clone())).expect("init_headless_app");
+            let mut ui_cache = UiCache {
+                left_rows: 12,
+                right_rows: 12,
+                scroll_mode: ScrollMode::Default,
+                last_left_selected: 0,
+                last_right_selected: 0,
+                last_active_panel: core::ActivePanel::Left,
+                last_left_dir_token: 0,
+                last_right_dir_token: 0,
+            };
+            let mut headless = HeadlessUi::new();
+            load_fs_directory_async(&mut app, tmp.clone(), core::ActivePanel::Left, None);
+            load_fs_directory_async(&mut app, tmp.clone(), core::ActivePanel::Right, None);
+            wait_for_idle(&mut headless, &mut app, &mut ui_cache, 200);
+            check_invariants(&app, &format!("seed={seed} initial"));
+
+            for step in 0..25 {
+                let key = random_key(&mut rng);
+                let key_for_msg = key.key.clone();
+                apply_replay_key(&mut headless, &mut app, &mut ui_cache, &key);
+                drain_async(&mut app, 50);
+                check_invariants(
+                    &app,
+                    &format!("seed={seed} step={step} key={key_for_msg}"),
+                );
+            }
+            // Drain anything left so the next iteration starts clean.
+            wait_for_idle(&mut headless, &mut app, &mut ui_cache, 200);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
