@@ -80,6 +80,108 @@ fn entry_tint(entry: &core::DirEntry) -> Option<theme::Color> {
     Some(theme::Color::rgba(0.85, 0.78, 0.60, 1.0))
 }
 
+/// Compact one-line panel footer status: marked-selection size, free space
+/// (for FS panels), and async-worker activity dots.
+fn draw_status_line(
+    ui: &mut egui::Ui,
+    app: &app_state::AppState,
+    panel_side: core::ActivePanel,
+    colors: &theme::ThemeColors,
+) {
+    let panel = app.panel(panel_side);
+    let browser = panel.browser();
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        let fg = color32(colors.footer_fg);
+        let dim = color32(fade_color(colors.footer_fg, 0.6));
+
+        // Marked selection: count + summed size
+        if !browser.marked.is_empty() {
+            let total: u64 = browser
+                .entries
+                .iter()
+                .filter(|e| browser.marked.contains(&e.name))
+                .filter_map(|e| e.size)
+                .sum();
+            let count = browser.marked.len();
+            let label = if total > 0 {
+                format!(
+                    "{} marked ({})",
+                    count,
+                    core::format_size(total)
+                )
+            } else {
+                format!("{count} marked")
+            };
+            ui.colored_label(fg, label);
+            ui.colored_label(dim, "·");
+        }
+
+        // FS panels: free space on the panel's drive. Cached per-frame —
+        // statvfs is cheap on Linux/macOS.
+        if let core::BrowserMode::Fs = browser.browser_mode
+            && let Some(free) = free_space_bytes(&browser.current_path)
+        {
+            ui.colored_label(
+                fg,
+                egui::RichText::new(format!("free: {}", core::format_size(free))).monospace(),
+            );
+            ui.colored_label(dim, "·");
+        }
+
+        // Async worker dots: io (copy/move/delete), dir (sized), search
+        let async_status = app.async_status();
+        ui.colored_label(dim, "io");
+        worker_dot(ui, async_status.io_in_flight > 0, colors);
+        ui.colored_label(dim, "dir");
+        worker_dot(ui, async_status.dir_size_pending > 0, colors);
+        ui.colored_label(dim, "search");
+        worker_dot(
+            ui,
+            matches!(async_status.search, app_state::SearchStatus::Running(_)),
+            colors,
+        );
+    });
+}
+
+/// Filled circle if active, hollow if idle.
+fn worker_dot(ui: &mut egui::Ui, active: bool, colors: &theme::ThemeColors) {
+    let size = 8.0;
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    let center = rect.center();
+    let r = size * 0.32;
+    if active {
+        ui.painter()
+            .circle_filled(center, r, color32(colors.panel_border_active));
+    } else {
+        ui.painter().circle_stroke(
+            center,
+            r,
+            egui::Stroke::new(1.0, color32(fade_color(colors.footer_fg, 0.5))),
+        );
+    }
+}
+
+#[cfg(unix)]
+fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    // statvfs widths vary by platform; multiply via u128 to avoid overflow.
+    let bavail = u128::from(stat.f_bavail);
+    let frsize = u128::from(stat.f_frsize);
+    Some((bavail * frsize).min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(not(unix))]
+fn free_space_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
 fn is_executable_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -930,9 +1032,12 @@ pub fn draw_panel(
                                     .fill(color32(colors.footer_bg))
                                     .corner_radius(egui::CornerRadius::same(4))
                                     .show(ui, |ui| {
-                                        if is_active
-                                            && app.search_ui == app_state::SearchUiState::Open
-                                        {
+                                        let search_open = is_active
+                                            && app.search_ui == app_state::SearchUiState::Open;
+                                        if !search_open {
+                                            draw_status_line(ui, app, panel_side_for_closure, &colors);
+                                        }
+                                        if search_open {
                                             ui.horizontal(|ui| {
                                                 ui.colored_label(
                                                     color32(colors.footer_fg),
