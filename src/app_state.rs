@@ -168,6 +168,11 @@ pub enum LoadState {
     Loading {
         rx: mpsc::Receiver<DirBatch>,
         progress: Option<(usize, Option<usize>)>,
+        /// The `dir_token` of the BrowserState at the moment this load was
+        /// started. If `BrowserState.dir_token` advances while this load is
+        /// still in-flight, the load is stale and its batches must be
+        /// discarded before they corrupt the new directory.
+        token: u64,
     },
     Failed(String),
 }
@@ -184,15 +189,36 @@ impl LoadState {
         }
     }
 
+    pub fn token(&self) -> Option<u64> {
+        match *self {
+            LoadState::Loading { token, .. } => Some(token),
+            _ => None,
+        }
+    }
+
+    /// Stamp this load with a new generation token. Used when a cached load
+    /// is re-attached to a fresh navigation so subsequent batches are not
+    /// discarded as stale.
+    pub fn retag(&mut self, new_token: u64) {
+        if let LoadState::Loading { ref mut token, .. } = *self {
+            *token = new_token;
+        }
+    }
+
     pub fn set_progress(&mut self, loaded: usize, total: Option<usize>) {
         if let LoadState::Loading { ref mut progress, .. } = *self {
             *progress = Some((loaded, total));
         }
     }
 
-    /// Begin a fresh load using the given receiver. Clears any prior progress.
-    pub fn start(rx: mpsc::Receiver<DirBatch>) -> Self {
-        LoadState::Loading { rx, progress: None }
+    /// Begin a fresh load using the given receiver, tagged with the
+    /// originating dir_token. Clears any prior progress.
+    pub fn start(rx: mpsc::Receiver<DirBatch>, token: u64) -> Self {
+        LoadState::Loading {
+            rx,
+            progress: None,
+            token,
+        }
     }
 
     pub fn finish(&mut self) {
