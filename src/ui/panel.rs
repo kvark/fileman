@@ -604,12 +604,8 @@ pub fn draw_panel(
                                         if is_hidden && !is_selected {
                                             fg = fade_color(fg, 0.55);
                                         }
-                                        // Invert colors for marked entries
-                                        let (bg, fg) = if is_marked {
-                                            (fg, colors.preview_bg)
-                                        } else {
-                                            (bg, fg)
-                                        };
+                                        // Marked entries get a colored gutter dot rather than
+                                        // a background invert — keeps marked+selected readable.
 
                                         let (rect, response) = ui.allocate_exact_size(
                                             egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
@@ -621,10 +617,21 @@ pub fn draw_panel(
                                             color32(bg),
                                         );
 
+                                        // Gutter dot for marked entries
+                                        if is_marked {
+                                            let dot_center = egui::pos2(
+                                                rect.left() + 3.5,
+                                                rect.center().y,
+                                            );
+                                            ui.painter().circle_filled(
+                                                dot_center,
+                                                2.5,
+                                                color32(colors.row_fg_selected),
+                                            );
+                                        }
+
                                         let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                        let icon_color = if is_marked {
-                                            fg
-                                        } else if entry.is_dir {
+                                        let icon_color = if entry.is_dir {
                                             colors.panel_border_active
                                         } else if is_selected {
                                             fg
@@ -633,8 +640,7 @@ pub fn draw_panel(
                                         } else {
                                             fg
                                         };
-                                        let icon_color = if is_hidden && !is_selected && !is_marked
-                                        {
+                                        let icon_color = if is_hidden && !is_selected {
                                             fade_color(icon_color, 0.55)
                                         } else {
                                             icon_color
