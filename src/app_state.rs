@@ -248,6 +248,15 @@ impl LoadState {
     }
 }
 
+/// Cap on the in-memory error log surfaced in the Help screen.
+pub const ERROR_LOG_CAP: usize = 100;
+
+pub struct ErrorLogEntry {
+    pub when: Instant,
+    pub source: String,
+    pub message: String,
+}
+
 pub enum InlineEditKind {
     Rename,
     NewFile,
@@ -471,6 +480,9 @@ pub struct AppState {
     pub gpu_info: String,
     pub quick_jump: Option<QuickJumpState>,
     pub error_message: Option<String>,
+    /// Persistent error log surfaced in the Help screen. New entries are
+    /// pushed via `record_error`; capped at `ERROR_LOG_CAP` entries.
+    pub error_log: Vec<ErrorLogEntry>,
     /// Permission error with retryable task — shown as elevation prompt.
     pub elevation_prompt: Option<(String, crate::core::IOTask)>,
     /// Active SFTP sessions keyed by hostname — local reference for quick lookups.
@@ -568,6 +580,24 @@ pub struct AsyncStatus {
 }
 
 impl AppState {
+    /// Append an entry to the persistent error log and also surface it as the
+    /// active toast/modal message. Caps the log at ERROR_LOG_CAP entries
+    /// (oldest evicted from the front).
+    pub fn record_error(&mut self, source: impl Into<String>, message: impl Into<String>) {
+        let source = source.into();
+        let message = message.into();
+        self.error_message = Some(message.clone());
+        self.error_log.push(ErrorLogEntry {
+            when: Instant::now(),
+            source,
+            message,
+        });
+        if self.error_log.len() > ERROR_LOG_CAP {
+            let overflow = self.error_log.len() - ERROR_LOG_CAP;
+            self.error_log.drain(..overflow);
+        }
+    }
+
     pub fn poll_update_status(&mut self) {
         if let Some(ref rx) = self.update_rx
             && let Ok(status) = rx.try_recv()
@@ -950,8 +980,10 @@ impl AppState {
                     path: path.clone(),
                 },
                 _ => {
-                    self.error_message =
-                        Some("Cannot create files inside archives or search results.".to_string());
+                    self.record_error(
+                        "new-file",
+                        "Cannot create files inside archives or search results.",
+                    );
                     return;
                 }
             }
@@ -1014,8 +1046,9 @@ impl AppState {
                     path: path.clone(),
                 },
                 _ => {
-                    self.error_message = Some(
-                        "Cannot create directories inside archives or search results.".to_string(),
+                    self.record_error(
+                        "mkdir",
+                        "Cannot create directories inside archives or search results.",
                     );
                     return;
                 }
@@ -1693,8 +1726,7 @@ impl AppState {
                             },
                         ) => {
                             if host != dst_host {
-                                self.error_message =
-                                    Some("Cross-host move is not supported.".to_string());
+                                self.record_error("move", "Cross-host move is not supported.");
                                 continue;
                             }
                             self.enqueue_io(IOTask::MoveRemoteSameHost {
