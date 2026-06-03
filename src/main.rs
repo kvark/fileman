@@ -1545,8 +1545,6 @@ fn load_sftp_directory_async(
                     browser.selected_index = cached.selected_index;
                     browser.top_index = cached.top_index;
                     browser.dir_token = browser.dir_token.wrapping_add(1);
-                    browser.load = cached.load;
-                    browser.load.retag(browser.dir_token);
                     browser.container_root = None;
                     browser.watching_archive = None;
                     browser.marked.clear();
@@ -1558,6 +1556,24 @@ fn load_sftp_directory_async(
                         browser.top_index = idx.saturating_sub(5);
                     }
                     browser.prefer_select_name = prefer_name;
+
+                    // Auto-freshness: kick off a background refresh so the
+                    // restored cache is replaced with current data the moment
+                    // the remote stat-and-readdir finishes. The cached entries
+                    // stay visible until first DirBatch::Replace arrives;
+                    // dir_token tagging guarantees stale batches from any
+                    // earlier in-flight load (cached.load was discarded just
+                    // above) cannot resurface.
+                    let (tx, rx) = mpsc::channel::<core::DirBatch>();
+                    browser.load = app_state::LoadState::start(rx, browser.dir_token);
+                    let wake = app.wake.clone();
+                    spawn_sftp_load_thread(
+                        Arc::clone(&session),
+                        host.to_string(),
+                        remote_path.to_string(),
+                        tx,
+                        wake,
+                    );
                     return;
                 }
             }
@@ -1599,15 +1615,27 @@ fn load_sftp_directory_async(
     browser.container_root = None;
     browser.watching_archive = None;
 
+    spawn_sftp_load_thread(session, host_owned, path_owned, tx, wake);
+}
+
+/// Spawn the SFTP directory-streaming loader thread. Extracted so both
+/// fresh-load and cache-restore-with-background-refresh code paths share
+/// the implementation.
+fn spawn_sftp_load_thread(
+    session: Arc<std::sync::Mutex<fileman::sftp::SftpSession>>,
+    host: String,
+    path: String,
+    tx: mpsc::Sender<core::DirBatch>,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+) {
     thread::spawn(move || {
         let locked = session.lock().unwrap();
         let mut first = true;
         let result = fileman::sftp::read_directory_streaming(
             &locked.sftp,
-            &host_owned,
-            &path_owned,
+            &host,
+            &path,
             |batch| {
-                // First batch replaces the "Loading..." placeholder; subsequent ones append.
                 let msg = if first {
                     first = false;
                     core::DirBatch::Replace(batch)
