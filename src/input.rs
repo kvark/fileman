@@ -131,9 +131,13 @@ fn sftp_streaming_player(name: &str) -> Option<&'static str> {
     if !core::is_media_name(name) {
         return None;
     }
-    // Probe each candidate; first available wins. mpv is preferred for video
-    // and audio (best seek, lowest overhead). vlc and ffplay are fallbacks.
-    ["mpv", "vlc", "ffplay"].iter().copied().find(|cand| {
+    // Probe each candidate; first available wins. Order matters:
+    //   mpv     — best seek, lowest overhead, accepts libavformat URL opts
+    //   ffplay  — same libavformat backend as mpv, also takes URL opts
+    //   vlc     — last resort: uses libssh2 directly with NO way to pass
+    //             a custom IdentityFile, so it can only auth via ssh-agent
+    //             or one of the default ~/.ssh/id_* paths.
+    ["mpv", "ffplay", "vlc"].iter().copied().find(|cand| {
         std::process::Command::new(cand)
             .arg("--version")
             .stdout(std::process::Stdio::null())
@@ -142,6 +146,33 @@ fn sftp_streaming_player(name: &str) -> Option<&'static str> {
             .status()
             .is_ok()
     })
+}
+
+/// Pick a likely default SSH private key from `~/.ssh/`, in OpenSSH's
+/// canonical search order. Returns None if `$HOME` is unset or none of the
+/// standard names exist. Used to give VLC's sftp module an explicit
+/// `--sftp-privkey-file` when the host has no IdentityFile in ssh_config —
+/// VLC won't auto-search these paths on its own.
+fn default_ssh_identity() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    for name in ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"] {
+        let candidate = format!("{home}/.ssh/{name}");
+        if std::path::Path::new(&candidate).is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Percent-encode a value for use as a URL query parameter — escapes the
+/// few chars that have syntactic meaning inside a query string.
+fn url_encode_value(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('&', "%26")
+        .replace('=', "%3D")
+        .replace('#', "%23")
+        .replace('?', "%3F")
 }
 
 /// Launch a media player with an sftp:// URL targeting `host:path`. Returns
@@ -164,9 +195,17 @@ fn try_launch_sftp_player(player: &str, host: &str, path: &str) -> anyhow::Resul
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "root".to_string());
     let port = cfg.and_then(|c| c.port).unwrap_or(22);
+    // Resolve the identity: prefer the host's configured IdentityFile, then
+    // fall back to the standard `~/.ssh/id_*` search list. mpv/ffplay don't
+    // need this fallback (libssh handles it), but VLC's libssh2 does NOT
+    // auto-search default key paths — its sftp access module only checks
+    // paths passed via `--sftp-privkey-file`. So without explicit detection,
+    // VLC silently drops to password prompt even when ~/.ssh/id_ed25519 sits
+    // right there.
     let identity = cfg
         .and_then(|c| c.identity_files.first())
-        .cloned();
+        .cloned()
+        .or_else(default_ssh_identity);
 
     // Best effort URL encoding for the path portion. Most paths only need
     // spaces and a few other chars escaped; we replace just the worst
@@ -181,16 +220,41 @@ fn try_launch_sftp_player(player: &str, host: &str, path: &str) -> anyhow::Resul
     } else {
         format!(":{port}")
     };
-    let url = format!("sftp://{user}@{real_host}{port_suffix}{encoded_path}");
+    // Append `?private_key=...` so libavformat-based players (mpv, ffplay)
+    // pick up the key — they read URL options. VLC uses libssh2 directly
+    // and silently ignores unknown URL params, so the same URL works for
+    // it as well; VLC will just fall back to ssh-agent / default key paths
+    // (and prompt if neither has the right key).
+    let key_query = identity
+        .as_ref()
+        .map(|k| format!("?private_key={}", url_encode_value(k)))
+        .unwrap_or_default();
+    let url = format!(
+        "sftp://{user}@{real_host}{port_suffix}{encoded_path}{key_query}"
+    );
 
     let mut cmd = std::process::Command::new(player);
-    // mpv: pass identity file through libavformat's sftp protocol option so
-    // libssh finds the key (it can't read ~/.ssh/config). vlc and ffplay
-    // don't have an equivalent — they rely on ssh-agent.
-    if player == "mpv"
-        && let Some(ref key) = identity
-    {
-        cmd.arg(format!("--demuxer-lavf-o=private_key={key}"));
+    // Pass the identity file in the way each player expects:
+    //   mpv     — libavformat URL option via --demuxer-lavf-o
+    //   ffplay  — ffmpeg-style -private_key CLI flag
+    //   vlc     — sftp module's --sftp-privkey-file / --sftp-pubkey-file
+    if let Some(ref key) = identity {
+        match player {
+            "mpv" => {
+                cmd.arg(format!("--demuxer-lavf-o=private_key={key}"));
+            }
+            "ffplay" => {
+                cmd.arg("-private_key").arg(key);
+            }
+            "vlc" => {
+                cmd.arg(format!("--sftp-privkey-file={key}"));
+                let pub_key = format!("{key}.pub");
+                if std::path::Path::new(&pub_key).exists() {
+                    cmd.arg(format!("--sftp-pubkey-file={pub_key}"));
+                }
+            }
+            _ => {}
+        }
     }
     cmd.arg(&url);
     cmd.stdout(std::process::Stdio::null());
