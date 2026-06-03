@@ -803,6 +803,15 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
     for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
         let panel = app.panel_mut(side);
         let browser = panel.browser_mut();
+        // Discard stale loads: a load whose token no longer matches the
+        // browser's current dir_token belongs to a previous navigation and
+        // must not be applied (would clobber the new directory's entries).
+        if let Some(token) = browser.load.token()
+            && token != browser.dir_token
+        {
+            browser.load.finish();
+            changed = true;
+        }
         let (batches, terminated) = browser.load.drain_batches(8);
         for batch in &batches {
             if let core::DirBatch::ConnectionError(_) = batch
@@ -1446,8 +1455,9 @@ fn load_sftp_directory_async(
                     browser.entries = cached.entries;
                     browser.selected_index = cached.selected_index;
                     browser.top_index = cached.top_index;
-                    browser.load = cached.load;
                     browser.dir_token = browser.dir_token.wrapping_add(1);
+                    browser.load = cached.load;
+                    browser.load.retag(browser.dir_token);
                     browser.container_root = None;
                     browser.watching_archive = None;
                     browser.marked.clear();
@@ -1494,9 +1504,9 @@ fn load_sftp_directory_async(
     });
     browser.selected_index = 0;
     browser.top_index = 0;
-    browser.load = app_state::LoadState::start(rx);
-    browser.prefer_select_name = prefer_name;
     browser.dir_token = browser.dir_token.wrapping_add(1);
+    browser.load = app_state::LoadState::start(rx, browser.dir_token);
+    browser.prefer_select_name = prefer_name;
     browser.container_root = None;
     browser.watching_archive = None;
 
@@ -1607,9 +1617,10 @@ fn load_fs_directory_async(
                     browser.entries = cached.entries;
                     browser.selected_index = cached.selected_index;
                     browser.top_index = cached.top_index;
-                    browser.load = cached.load;
                     browser.inline_rename = None;
                     browser.dir_token = browser.dir_token.wrapping_add(1);
+                    browser.load = cached.load;
+                    browser.load.retag(browser.dir_token);
                     browser.watching_archive = None;
                     browser.index_last_seen = 0;
                     browser.marked.clear();
@@ -1867,7 +1878,7 @@ fn load_fs_directory_async(
     browser.inline_rename = None;
     browser.dir_token = browser.dir_token.wrapping_add(1);
     browser.load = if initial_loading {
-        app_state::LoadState::start(rx)
+        app_state::LoadState::start(rx, browser.dir_token)
     } else {
         // Receiver is short-lived and immediately disconnected — discard.
         drop(rx);
@@ -2440,8 +2451,10 @@ fn load_container_directory_async(
         None
     };
     browser.index_last_seen = index_entry_count;
-    // Restore prior load state when resuming a cached cwd.
+    // Restore prior load state when resuming a cached cwd, retagging it
+    // with the new generation so its batches aren't discarded as stale.
     browser.load = resume_load.unwrap_or(app_state::LoadState::Idle);
+    browser.load.retag(browser.dir_token);
     // For shared-index watching there is no rx — surface progress via the
     // header overlay instead of LoadState (which requires a receiver).
     browser.progress_override = if watching {
