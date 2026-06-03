@@ -896,6 +896,18 @@ pub fn draw_panel(
         })
         .inner;
 
+    if is_active {
+        // 2px colored stripe down the left edge — reads as the active panel in
+        // peripheral vision faster than the surrounding border.
+        let rect = panel_response.response.rect;
+        let stripe = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.min.x + 2.0, rect.max.y),
+        );
+        ui.painter()
+            .rect_filled(stripe, egui::CornerRadius::ZERO, color32(colors.panel_border_active));
+    }
+
     if panel_response.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
         app.active_panel = panel_side;
     }
