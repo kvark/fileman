@@ -53,11 +53,10 @@ impl PanelState {
             current_path: current.current_path.clone(),
             selected_index: 0,
             entries: Vec::new(),
-            entries_rx: None,
+            load: LoadState::Idle,
+            progress_override: None,
             prefer_select_name: None,
             top_index: 0,
-            loading: false,
-            loading_progress: None,
             container_root: current.container_root.clone(),
             dir_token: 0,
             history_back: Vec::new(),
@@ -133,11 +132,13 @@ pub struct BrowserState {
     pub current_path: path::PathBuf, // For Fs mode: real fs path. For Container: archive path.
     pub selected_index: usize,
     pub entries: Vec<DirEntry>,
-    pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
+    pub load: LoadState,
+    /// Header progress overlay independent of `load` — used for activity
+    /// surfaced in the panel header that isn't directory loading (e.g. live
+    /// search progress). Cleared when the activity finishes.
+    pub progress_override: Option<(usize, Option<usize>)>,
     pub prefer_select_name: Option<String>,
     pub top_index: usize,
-    pub loading: bool,
-    pub loading_progress: Option<(usize, Option<usize>)>,
     pub container_root: Option<String>,
     pub dir_token: u64,
     pub history_back: Vec<PanelSnapshot>,
@@ -152,6 +153,73 @@ pub struct BrowserState {
     /// a child directory, popped when ascending back. Each entry may still
     /// carry an active `entries_rx` so its async loading continues.
     pub parent_cache: Vec<DirListingCache>,
+}
+
+/// Async-load state for a directory listing.
+///
+/// Replaces the previous trio of `loading: bool`, `loading_progress: Option<...>`,
+/// `entries_rx: Option<Receiver>` with a single value whose invariants are
+/// structural — a receiver only exists while the load is in-flight, progress
+/// only meaningful while loading, and a failed terminal state is explicit.
+#[derive(Default)]
+pub enum LoadState {
+    #[default]
+    Idle,
+    Loading {
+        rx: mpsc::Receiver<DirBatch>,
+        progress: Option<(usize, Option<usize>)>,
+    },
+    Failed(String),
+}
+
+impl LoadState {
+    pub fn is_loading(&self) -> bool {
+        matches!(self, LoadState::Loading { .. })
+    }
+
+    pub fn progress(&self) -> Option<(usize, Option<usize>)> {
+        match *self {
+            LoadState::Loading { progress, .. } => progress,
+            _ => None,
+        }
+    }
+
+    pub fn set_progress(&mut self, loaded: usize, total: Option<usize>) {
+        if let LoadState::Loading { ref mut progress, .. } = *self {
+            *progress = Some((loaded, total));
+        }
+    }
+
+    /// Begin a fresh load using the given receiver. Clears any prior progress.
+    pub fn start(rx: mpsc::Receiver<DirBatch>) -> Self {
+        LoadState::Loading { rx, progress: None }
+    }
+
+    pub fn finish(&mut self) {
+        *self = LoadState::Idle;
+    }
+
+    /// Drain up to `max` batches from the in-flight receiver. Returns the
+    /// drained batches and `true` if the channel disconnected (load complete).
+    /// State remains Loading throughout — caller is responsible for calling
+    /// `finish()` on termination and applying any batch side-effects.
+    pub fn drain_batches(&mut self, max: usize) -> (Vec<DirBatch>, bool) {
+        let mut batches = Vec::new();
+        let mut terminated = false;
+        if let LoadState::Loading { ref mut rx, .. } = *self {
+            for _ in 0..max {
+                match rx.try_recv() {
+                    Ok(b) => batches.push(b),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        (batches, terminated)
+    }
 }
 
 pub enum InlineEditKind {
@@ -198,9 +266,7 @@ pub struct ArchiveFullIndex {
 
 pub struct ContainerDirCache {
     pub entries: Vec<DirEntry>,
-    pub loading: bool,
-    pub loading_progress: Option<(usize, Option<usize>)>,
-    pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
+    pub load: LoadState,
     pub selected_index: usize,
     pub top_index: usize,
     pub root: Option<String>,
@@ -214,9 +280,7 @@ pub struct DirListingCache {
     pub entries: Vec<DirEntry>,
     pub selected_index: usize,
     pub top_index: usize,
-    pub loading: bool,
-    pub loading_progress: Option<(usize, Option<usize>)>,
-    pub entries_rx: Option<mpsc::Receiver<DirBatch>>,
+    pub load: LoadState,
     pub sort_mode: SortMode,
     pub sort_desc: bool,
     /// Modification time of the directory when the listing was captured.
@@ -706,9 +770,7 @@ impl AppState {
             let key = (archive_path.clone(), cwd.clone(), kind);
             let cache = ContainerDirCache {
                 entries: browser.entries.clone(),
-                loading: browser.loading,
-                loading_progress: browser.loading_progress,
-                entries_rx: browser.entries_rx.take(),
+                load: std::mem::take(&mut browser.load),
                 selected_index: browser.selected_index,
                 top_index: browser.top_index,
                 root: browser.container_root.clone(),

@@ -258,10 +258,8 @@ fn is_app_pending(app: &app_state::AppState) -> bool {
     let edit_loading = app.edit_panel().map(|edit| edit.loading).unwrap_or(false);
     let search_running = matches!(app.search_status, app_state::SearchStatus::Running(_));
     app.io_in_flight > 0
-        || left.loading
-        || right.loading
-        || left.entries_rx.is_some()
-        || right.entries_rx.is_some()
+        || left.load.is_loading()
+        || right.load.is_loading()
         || left.watching_archive.is_some()
         || right.watching_archive.is_some()
         || edit_loading
@@ -387,11 +385,10 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 current_path: root.clone(),
                 selected_index: 0,
                 entries: Vec::new(),
-                entries_rx: None,
+                load: app_state::LoadState::Idle,
+                progress_override: None,
                 prefer_select_name: None,
                 top_index: 0,
-                loading: false,
-                loading_progress: None,
                 container_root: None,
                 dir_token: 0,
                 history_back: Vec::new(),
@@ -413,11 +410,10 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 current_path: root.clone(),
                 selected_index: 0,
                 entries: Vec::new(),
-                entries_rx: None,
+                load: app_state::LoadState::Idle,
+                progress_override: None,
                 prefer_select_name: None,
                 top_index: 0,
-                loading: false,
-                loading_progress: None,
                 container_root: None,
                 dir_token: 0,
                 history_back: Vec::new(),
@@ -841,7 +837,7 @@ fn build_panel_dump(panel: &app_state::PanelState) -> PanelDump {
         selected_name,
         sort_mode: sort_mode.to_string(),
         sort_desc: browser.sort_desc,
-        loading: browser.loading,
+        loading: browser.load.is_loading(),
         marked,
         entries,
     }
