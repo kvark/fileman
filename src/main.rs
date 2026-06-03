@@ -678,8 +678,10 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
 
     match batch {
         core::DirBatch::Loading => {
-            browser.loading = true;
-            browser.loading_progress = None;
+            // Already Loading at this point (we drained from its rx); just clear progress.
+            if let app_state::LoadState::Loading { ref mut progress, .. } = browser.load {
+                *progress = None;
+            }
             return;
         }
         core::DirBatch::ContainerRoot(root) => {
@@ -751,13 +753,11 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
             browser.entries = entries;
             browser.selected_index = 0;
             browser.top_index = 0;
-            browser.loading = false;
-            browser.loading_progress = None;
+            browser.load.finish();
             return;
         }
         core::DirBatch::Progress { loaded, total } => {
-            browser.loading_progress = Some((loaded, total));
-            browser.loading = total.map(|t| loaded < t).unwrap_or(true);
+            browser.load.set_progress(loaded, total);
             return;
         }
         core::DirBatch::Append(mut new_entries) => {
@@ -803,78 +803,58 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
     for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
         let panel = app.panel_mut(side);
         let browser = panel.browser_mut();
-        if let Some(rx) = browser.entries_rx.take() {
-            let mut handled = 0usize;
-            while handled < 8 {
-                match rx.try_recv() {
-                    Ok(batch) => {
-                        if let core::DirBatch::ConnectionError(_) = &batch
-                            && let core::BrowserMode::Remote {
-                                ref host, ref path, ..
-                            } = browser.browser_mode
-                        {
-                            stale_sessions.push(host.clone());
-                            reconnect_panels.push((side, host.clone(), path.clone()));
-                        }
-                        apply_dir_batch(browser, batch);
-                        handled += 1;
-                        changed = true;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        browser.entries_rx = Some(rx);
-                        break;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        // Sender dropped — all batches received.
-                        browser.loading = false;
-                        browser.loading_progress = None;
-                        changed = true;
-                        break;
-                    }
-                }
+        let (batches, terminated) = browser.load.drain_batches(8);
+        for batch in &batches {
+            if let core::DirBatch::ConnectionError(_) = batch
+                && let core::BrowserMode::Remote {
+                    ref host, ref path, ..
+                } = browser.browser_mode
+            {
+                stale_sessions.push(host.clone());
+                reconnect_panels.push((side, host.clone(), path.clone()));
             }
+        }
+        if !batches.is_empty() {
+            changed = true;
+            for batch in batches {
+                apply_dir_batch(browser, batch);
+            }
+        }
+        if terminated {
+            browser.load.finish();
+            changed = true;
         }
 
         // Drain receivers for cached parent directories so their background
         // threads are not blocked and entries accumulate for later restoration.
         for cached in &mut browser.parent_cache {
-            if let Some(rx) = cached.entries_rx.take() {
-                let mut handled = 0usize;
-                while handled < 8 {
-                    match rx.try_recv() {
-                        Ok(batch) => {
-                            match batch {
-                                core::DirBatch::Append(mut new) => {
-                                    cached.entries.append(&mut new);
-                                }
-                                core::DirBatch::Replace(new) => {
-                                    cached.entries = new;
-                                }
-                                core::DirBatch::Loading => {
-                                    cached.loading = true;
-                                }
-                                core::DirBatch::Progress { loaded, total } => {
-                                    cached.loading_progress = Some((loaded, total));
-                                    cached.loading = total.map(|t| loaded < t).unwrap_or(true);
-                                }
-                                core::DirBatch::Error(_) | core::DirBatch::ConnectionError(_) => {
-                                    cached.loading = false;
-                                }
-                                core::DirBatch::ContainerRoot(_) => {}
-                            }
-                            handled += 1;
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {
-                            cached.entries_rx = Some(rx);
-                            break;
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            cached.loading = false;
-                            cached.loading_progress = None;
-                            break;
+            let (batches, terminated) = cached.load.drain_batches(8);
+            for batch in batches {
+                match batch {
+                    core::DirBatch::Append(mut new) => {
+                        cached.entries.append(&mut new);
+                    }
+                    core::DirBatch::Replace(new) => {
+                        cached.entries = new;
+                    }
+                    core::DirBatch::Loading => {
+                        if let app_state::LoadState::Loading { ref mut progress, .. } =
+                            cached.load
+                        {
+                            *progress = None;
                         }
                     }
+                    core::DirBatch::Progress { loaded, total } => {
+                        cached.load.set_progress(loaded, total);
+                    }
+                    core::DirBatch::Error(_) | core::DirBatch::ConnectionError(_) => {
+                        cached.load.finish();
+                    }
+                    core::DirBatch::ContainerRoot(_) => {}
                 }
+            }
+            if terminated {
+                cached.load.finish();
             }
         }
     }
@@ -950,7 +930,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         changed = true;
                     }
                     browser.index_last_seen = entry_count;
-                    browser.loading_progress = Some((entry_count, None));
+                    browser.progress_override = Some((entry_count, None));
                     if let Some(ref root) = root {
                         browser.container_root = Some(root.clone());
                         browser.browser_mode = core::BrowserMode::Container {
@@ -964,8 +944,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 if complete {
                     let browser = app.panel_mut(side).browser_mut();
                     browser.watching_archive = None;
-                    browser.loading = false;
-                    browser.loading_progress = None;
+                    browser.progress_override = None;
                     changed = true;
                 }
             }
@@ -1178,7 +1157,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                     });
                     resort_browser_entries(browser);
                     if let Some(progress) = progress_for_panel {
-                        browser.loading_progress = Some(progress);
+                        browser.progress_override = Some(progress);
                     }
                     changed = true;
                 }
@@ -1187,7 +1166,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 if id == app.search_request_id {
                     app.search_status = app_state::SearchStatus::Running(progress);
                     let panel = app.get_active_panel_mut();
-                    panel.browser_mut().loading_progress =
+                    panel.browser_mut().progress_override =
                         Some((progress.matched, Some(progress.scanned)));
                     changed = true;
                 }
@@ -1196,9 +1175,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 if id == app.search_request_id {
                     app.search_status = app_state::SearchStatus::Done(progress);
                     let panel = app.get_active_panel_mut();
-                    panel.browser_mut().loading = false;
-                    panel.browser_mut().loading_progress =
-                        Some((progress.matched, Some(progress.scanned)));
+                    panel.browser_mut().progress_override = None;
                     changed = true;
                 }
             }
@@ -1210,7 +1187,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         matched: 0,
                     });
                     let panel = app.get_active_panel_mut();
-                    panel.browser_mut().loading = false;
+                    panel.browser_mut().progress_override = None;
                     changed = true;
                 }
             }
@@ -1441,9 +1418,7 @@ fn load_sftp_directory_async(
                     entries: std::mem::take(&mut browser.entries),
                     selected_index: browser.selected_index,
                     top_index: browser.top_index,
-                    loading: browser.loading,
-                    loading_progress: browser.loading_progress,
-                    entries_rx: browser.entries_rx.take(),
+                    load: std::mem::take(&mut browser.load),
                     sort_mode: browser.sort_mode,
                     sort_desc: browser.sort_desc,
                     dir_mtime,
@@ -1471,9 +1446,7 @@ fn load_sftp_directory_async(
                     browser.entries = cached.entries;
                     browser.selected_index = cached.selected_index;
                     browser.top_index = cached.top_index;
-                    browser.loading = cached.loading;
-                    browser.loading_progress = cached.loading_progress;
-                    browser.entries_rx = cached.entries_rx;
+                    browser.load = cached.load;
                     browser.dir_token = browser.dir_token.wrapping_add(1);
                     browser.container_root = None;
                     browser.watching_archive = None;
@@ -1521,8 +1494,7 @@ fn load_sftp_directory_async(
     });
     browser.selected_index = 0;
     browser.top_index = 0;
-    browser.loading = true;
-    browser.entries_rx = Some(rx);
+    browser.load = app_state::LoadState::start(rx);
     browser.prefer_select_name = prefer_name;
     browser.dir_token = browser.dir_token.wrapping_add(1);
     browser.container_root = None;
@@ -1602,9 +1574,7 @@ fn load_fs_directory_async(
                 entries: std::mem::take(&mut browser.entries),
                 selected_index: browser.selected_index,
                 top_index: browser.top_index,
-                loading: browser.loading,
-                loading_progress: browser.loading_progress,
-                entries_rx: browser.entries_rx.take(),
+                load: std::mem::take(&mut browser.load),
                 sort_mode: browser.sort_mode,
                 sort_desc: browser.sort_desc,
                 dir_mtime,
@@ -1637,9 +1607,7 @@ fn load_fs_directory_async(
                     browser.entries = cached.entries;
                     browser.selected_index = cached.selected_index;
                     browser.top_index = cached.top_index;
-                    browser.loading = cached.loading;
-                    browser.loading_progress = cached.loading_progress;
-                    browser.entries_rx = cached.entries_rx;
+                    browser.load = cached.load;
                     browser.inline_rename = None;
                     browser.dir_token = browser.dir_token.wrapping_add(1);
                     browser.watching_archive = None;
@@ -1898,10 +1866,14 @@ fn load_fs_directory_async(
     browser.browser_mode = core::BrowserMode::Fs;
     browser.inline_rename = None;
     browser.dir_token = browser.dir_token.wrapping_add(1);
-    browser.entries_rx = Some(rx);
+    browser.load = if initial_loading {
+        app_state::LoadState::start(rx)
+    } else {
+        // Receiver is short-lived and immediately disconnected — discard.
+        drop(rx);
+        app_state::LoadState::Idle
+    };
     browser.prefer_select_name = remembered;
-    browser.loading = initial_loading;
-    browser.loading_progress = None;
     browser.watching_archive = None;
     browser.index_last_seen = 0;
 }
@@ -2169,8 +2141,8 @@ fn load_container_directory_async(
         }
     }
 
-    let resume_rx = cached.as_mut().and_then(|cache| cache.entries_rx.take());
-    let skip_loading = resume_rx.is_some() || cached.as_ref().is_some_and(|c| !c.loading);
+    let resume_load = cached.as_mut().map(|cache| std::mem::take(&mut cache.load));
+    let skip_loading = resume_load.is_some();
     let wake = app.wake.clone();
 
     // Check if a shared index already exists (even incomplete)
@@ -2433,9 +2405,9 @@ fn load_container_directory_async(
 
     let panel_state = app.panel_mut(target_panel);
     let browser = panel_state.browser_mut();
-    let initial_loading = cached
+    let initial_loading = resume_load
         .as_ref()
-        .map(|cache| cache.loading)
+        .map(|l| l.is_loading())
         .unwrap_or(!skip_loading);
 
     let same_dir = browser.current_path == archive_path
@@ -2461,7 +2433,6 @@ fn load_container_directory_async(
     }
     browser.inline_rename = None;
     browser.dir_token = browser.dir_token.wrapping_add(1);
-    browser.entries_rx = resume_rx.or(None);
     browser.prefer_select_name = remembered;
     browser.watching_archive = if watching {
         Some(archive_path.clone())
@@ -2469,15 +2440,18 @@ fn load_container_directory_async(
         None
     };
     browser.index_last_seen = index_entry_count;
-    browser.loading = if used_index && !watching {
-        false
-    } else {
-        initial_loading
-    };
-    browser.loading_progress = if used_index {
+    // Restore prior load state when resuming a cached cwd.
+    browser.load = resume_load.unwrap_or(app_state::LoadState::Idle);
+    // For shared-index watching there is no rx — surface progress via the
+    // header overlay instead of LoadState (which requires a receiver).
+    browser.progress_override = if watching {
+        Some((index_entry_count, None))
+    } else if used_index {
         None
+    } else if initial_loading {
+        Some((0, None))
     } else {
-        cached.and_then(|cache| cache.loading_progress)
+        None
     };
 }
 
@@ -2657,7 +2631,7 @@ fn apply_panel_snapshot(
                 }
             }));
             sort_entries(&mut browser.entries, browser.sort_mode, browser.sort_desc);
-            browser.entries_rx = None;
+            browser.load = app_state::LoadState::Idle;
             browser.selected_index = snapshot
                 .selected_name
                 .and_then(|name| {
@@ -2674,8 +2648,7 @@ fn apply_panel_snapshot(
                 })
                 .unwrap_or(0);
             browser.top_index = 0;
-            browser.loading = false;
-            browser.loading_progress = None;
+            browser.progress_override = None;
             browser.dir_token = browser.dir_token.wrapping_add(1);
         }
     }
@@ -2725,11 +2698,10 @@ fn start_search(app: &mut app_state::AppState) {
             case: search_case,
         };
         browser.entries.clear();
-        browser.entries_rx = None;
+        browser.load = app_state::LoadState::Idle;
+        browser.progress_override = Some((0, None));
         browser.selected_index = 0;
         browser.top_index = 0;
-        browser.loading = true;
-        browser.loading_progress = Some((0, None));
         browser.dir_token = browser.dir_token.wrapping_add(1);
         panel.mode = app_state::PanelMode::Browser;
     }
@@ -3475,11 +3447,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     current_path: left_local.clone(),
                     selected_index: 0,
                     entries: Vec::new(),
-                    entries_rx: None,
+                    load: app_state::LoadState::Idle,
+                    progress_override: None,
                     prefer_select_name: None,
                     top_index: 0,
-                    loading: false,
-                    loading_progress: None,
                     container_root: None,
                     dir_token: 0,
                     history_back: Vec::new(),
@@ -3501,11 +3472,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     current_path: right_local.clone(),
                     selected_index: 0,
                     entries: Vec::new(),
-                    entries_rx: None,
+                    load: app_state::LoadState::Idle,
+                    progress_override: None,
                     prefer_select_name: None,
                     top_index: 0,
-                    loading: false,
-                    loading_progress: None,
                     container_root: None,
                     dir_token: 0,
                     history_back: Vec::new(),
@@ -4630,8 +4600,10 @@ fn draw_root_ui(render: UiRender<'_>) {
     }
 
     // Animate loading indicators at ~3fps
-    let any_loading = app.left_panel.browser().loading
-        || app.right_panel.browser().loading
+    let any_loading = app.left_panel.browser().load.is_loading()
+        || app.right_panel.browser().load.is_loading()
+        || app.left_panel.browser().progress_override.is_some()
+        || app.right_panel.browser().progress_override.is_some()
         || app
             .preview_panel()
             .is_some_and(|p| p.loading_since.is_some());

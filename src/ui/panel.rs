@@ -177,8 +177,8 @@ pub fn draw_panel(
             selected_index,
             header_text,
             selected_label,
-            browser.loading,
-            browser.loading_progress,
+            browser.load.is_loading() || browser.progress_override.is_some(),
+            browser.load.progress().or(browser.progress_override),
             browser.top_index,
         )
     };
@@ -457,7 +457,7 @@ pub fn draw_panel(
                                 .get(selected_index)
                                 .map(|e| e.name.clone())
                                 .unwrap_or_else(|| "-".to_string());
-                            loading = browser.loading;
+                            loading = browser.load.is_loading();
                         }
 
                         let list_height =
