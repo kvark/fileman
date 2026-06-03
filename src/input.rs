@@ -147,7 +147,27 @@ fn sftp_streaming_player(name: &str) -> Option<&'static str> {
 /// Launch a media player with an sftp:// URL targeting `host:path`. Returns
 /// Err if spawning the process fails; success only means the player started,
 /// not that it could actually read the file.
+///
+/// `host` may be an `~/.ssh/config` alias; mpv/vlc/ffplay use libssh which
+/// does *not* parse `~/.ssh/config`, so we resolve the alias to a real
+/// `user@hostname:port` here and pass the IdentityFile (when configured)
+/// through mpv's libavformat option. Without this, the player would try to
+/// connect to the literal alias as a DNS name with $USER and prompt for a
+/// password.
 fn try_launch_sftp_player(player: &str, host: &str, path: &str) -> anyhow::Result<()> {
+    let ssh_config = fileman::sftp::load_ssh_config();
+    let cfg = ssh_config.get(host);
+    let real_host = cfg.and_then(|c| c.hostname.as_deref()).unwrap_or(host);
+    let user = cfg
+        .and_then(|c| c.user.as_deref())
+        .map(str::to_string)
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "root".to_string());
+    let port = cfg.and_then(|c| c.port).unwrap_or(22);
+    let identity = cfg
+        .and_then(|c| c.identity_files.first())
+        .cloned();
+
     // Best effort URL encoding for the path portion. Most paths only need
     // spaces and a few other chars escaped; we replace just the worst
     // offenders rather than depend on a full url crate.
@@ -156,8 +176,22 @@ fn try_launch_sftp_player(player: &str, host: &str, path: &str) -> anyhow::Resul
         .replace(' ', "%20")
         .replace('#', "%23")
         .replace('?', "%3F");
-    let url = format!("sftp://{host}{}", encoded_path);
+    let port_suffix = if port == 22 {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    let url = format!("sftp://{user}@{real_host}{port_suffix}{encoded_path}");
+
     let mut cmd = std::process::Command::new(player);
+    // mpv: pass identity file through libavformat's sftp protocol option so
+    // libssh finds the key (it can't read ~/.ssh/config). vlc and ffplay
+    // don't have an equivalent — they rely on ssh-agent.
+    if player == "mpv"
+        && let Some(ref key) = identity
+    {
+        cmd.arg(format!("--demuxer-lavf-o=private_key={key}"));
+    }
     cmd.arg(&url);
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
