@@ -9,7 +9,50 @@ use crate::{
     window_rows_for,
 };
 
+/// Pick a single-glyph icon for an entry. Renders via egui's bundled emoji
+/// font as single-color text — tint applies via the painter's color.
+fn entry_glyph(entry: &core::DirEntry) -> &'static str {
+    if entry.name == ".." {
+        return "⬆";
+    }
+    if entry.is_symlink {
+        return "🔗";
+    }
+    if entry.is_dir {
+        return "📁";
+    }
+    let name = entry.name.as_str();
+    if archive::is_container_path(std::path::Path::new(name)) {
+        return "🗜";
+    }
+    if core::is_image_name(name) {
+        return "🖼";
+    }
+    if core::is_video_name(name) {
+        return "🎬";
+    }
+    if core::is_audio_name(name) {
+        return "🎵";
+    }
+    if is_executable_name(name) {
+        return "⚙";
+    }
+    "📄"
+}
+
+fn is_executable_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some("sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "exe" | "py" | "rb" | "pl")
+    ) || matches!(
+        lower.as_str(),
+        "makefile" | "cmakelists.txt" | "dockerfile" | "justfile"
+    )
+}
+
 /// Draw a file-type icon at `center` using the painter.
+#[allow(dead_code)]
 fn draw_file_icon(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -599,8 +642,14 @@ pub fn draw_panel(
                                         let ic = color32(icon_color);
                                         let center =
                                             egui::pos2(rect.left() + 12.0, rect.center().y);
-                                        let painter = ui.painter();
-                                        draw_file_icon(painter, center, ic, &entry);
+                                        let glyph = entry_glyph(&entry);
+                                        ui.painter().text(
+                                            center,
+                                            egui::Align2::CENTER_CENTER,
+                                            glyph,
+                                            font_id.clone(),
+                                            ic,
+                                        );
 
                                         let mut size_text =
                                             entry.size.map(core::format_size).unwrap_or_default();
