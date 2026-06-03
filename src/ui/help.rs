@@ -36,6 +36,7 @@ pub fn draw_help(
             ("F5 / Ctrl+C", "Copy"),
             ("Ctrl+Shift+C", "Copy path to clipboard"),
             ("Ctrl+`", "Open shell in current directory"),
+            ("Ctrl+,", "Settings"),
             ("Alt+F5 / Ctrl+A", "Pack (create archive)"),
             ("F6 / Ctrl+M", "Move"),
             ("F8 / Ctrl+X", "Delete"),

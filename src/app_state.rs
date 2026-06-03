@@ -483,6 +483,12 @@ pub struct AppState {
     /// Persistent error log surfaced in the Help screen. New entries are
     /// pushed via `record_error`; capped at `ERROR_LOG_CAP` entries.
     pub error_log: Vec<ErrorLogEntry>,
+    /// User-editable settings persisted to RON at config_dir().
+    pub settings: crate::settings::Settings,
+    /// Settings modal open state (toggled by Ctrl+,). When Some, holds a
+    /// working copy edited by the UI; applied + persisted on save, dropped
+    /// on cancel.
+    pub settings_draft: Option<crate::settings::Settings>,
     /// Permission error with retryable task — shown as elevation prompt.
     pub elevation_prompt: Option<(String, crate::core::IOTask)>,
     /// Active SFTP sessions keyed by hostname — local reference for quick lookups.

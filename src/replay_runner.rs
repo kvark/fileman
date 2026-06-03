@@ -484,6 +484,8 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         quick_jump: None,
         error_message: None,
         error_log: Vec::new(),
+        settings: fileman::settings::Settings::default(),
+        settings_draft: None,
         elevation_prompt: None,
         sftp_sessions: std::collections::HashMap::new(),
         sftp_sessions_shared: sftp_sessions_shared.clone(),

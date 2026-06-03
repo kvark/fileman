@@ -328,6 +328,8 @@ pub fn draw_panel(
     let panel_height = available.y.max(0.0).max(min_height);
     let colors = app.theme.colors();
     let is_active = app.active_panel == panel_side;
+    let show_glyphs = app.settings.show_glyphs;
+    let row_striping = app.settings.row_striping;
 
     let (
         mut entries_len,
@@ -752,7 +754,7 @@ pub fn draw_panel(
                                             (entry, rename_active, is_marked)
                                         };
                                         let is_selected = selected_index == idx;
-                                        let stripe = idx % 2 == 0;
+                                        let stripe = row_striping && idx % 2 == 0;
                                         let bg = if is_selected {
                                             if is_active {
                                                 colors.row_bg_selected_active
@@ -826,7 +828,11 @@ pub fn draw_panel(
                                         let ic = color32(icon_color);
                                         let center =
                                             egui::pos2(rect.left() + 12.0, rect.center().y);
-                                        let glyph = entry_glyph(&entry);
+                                        let glyph = if show_glyphs {
+                                            entry_glyph(&entry)
+                                        } else {
+                                            ""
+                                        };
                                         ui.painter().text(
                                             center,
                                             egui::Align2::CENTER_CENTER,

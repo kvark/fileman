@@ -476,6 +476,8 @@ pub(crate) fn handle_keyboard(
         && ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::CTRL, egui::Key::Backtick)
         });
+    let ctrl_comma = !in_edit
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Comma));
     let f2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2));
 
     let f1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1));
@@ -1100,6 +1102,10 @@ pub(crate) fn handle_keyboard(
         spawn_shell_in_panel_cwd(app);
         ctx.request_repaint();
     }
+    if ctrl_comma {
+        crate::ui::settings::open(app);
+        ctx.request_repaint();
+    }
     // Modified F-key variants must be consumed before bare variants,
     // because egui's consume_key(NONE, ...) matches regardless of modifiers.
     let shift_f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4));
@@ -1480,7 +1486,7 @@ fn spawn_shell_in_panel_cwd(app: &mut app_state::AppState) {
         core::BrowserMode::Fs | core::BrowserMode::Search { .. } => {
             let dir = browser.current_path.clone();
             if let Err(e) = open_shell_in_dir(&dir) {
-                app.error_message = Some(format!("open shell: {e}"));
+                app.record_error("shell", format!("open shell: {e}"));
             }
         }
         core::BrowserMode::Container { archive_path, .. } => {
@@ -1489,7 +1495,7 @@ fn spawn_shell_in_panel_cwd(app: &mut app_state::AppState) {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             if let Err(e) = open_shell_in_dir(&parent) {
-                app.error_message = Some(format!("open shell: {e}"));
+                app.record_error("shell", format!("open shell: {e}"));
             }
         }
         core::BrowserMode::Remote { host, path } => {
@@ -1502,14 +1508,16 @@ fn spawn_shell_in_panel_cwd(app: &mut app_state::AppState) {
                     shell_escape(path),
                 );
                 if let Err(e) = open_terminal_running(&cmd) {
-                    app.error_message = Some(format!("open shell: {e}"));
+                    app.record_error("shell", format!("open shell: {e}"));
                 }
             }
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = (host, path);
-                app.error_message =
-                    Some("open remote shell: not implemented on this platform".to_string());
+                app.record_error(
+                    "shell",
+                    "open remote shell: not implemented on this platform",
+                );
             }
         }
     }
