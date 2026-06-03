@@ -1162,7 +1162,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
             }
             Err(msg) => {
                 app.sftp_pending_nav = None;
-                app.error_message = Some(msg);
+                app.record_error("sftp", msg);
                 // Continue with next queued navigation despite error
                 if let Some((next_host, next_path, next_panel)) = app.sftp_nav_queue.pop_front() {
                     navigate_sftp(app, &next_host, &next_path, next_panel);
@@ -3662,6 +3662,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             },
             quick_jump: None,
             error_message: None,
+            error_log: Vec::new(),
             elevation_prompt: None,
             sftp_sessions: HashMap::new(),
             sftp_sessions_shared: sftp_sessions_shared.clone(),
@@ -3801,7 +3802,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     completed += 1;
                 }
                 if !io_errors.is_empty() {
-                    runtime.app.error_message = Some(io_errors.join("\n"));
+                    runtime.app.record_error("io", io_errors.join("\n"));
                 }
                 if completed > 0 {
                     runtime.app.on_io_completed(completed);
@@ -4047,6 +4048,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                         is_focused,
                                         rect.height(),
                                         &async_status,
+                                        &runtime.app.error_log,
                                     ) {
                                         start_install(&mut runtime.app);
                                     }
@@ -4124,6 +4126,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                                         is_focused,
                                         rect.height(),
                                         &async_status,
+                                        &runtime.app.error_log,
                                     ) {
                                         start_install(&mut runtime.app);
                                     }
@@ -4587,7 +4590,7 @@ fn draw_root_ui(render: UiRender<'_>) {
                         let is_focused = app.active_panel == core::ActivePanel::Left;
                         let theme = app.theme.clone();
                         let async_status = app.async_status();
-                        ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
+                        ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status, &app.error_log);
                         ui_cache.left_rows
                     } else {
                         ui::panel::draw_panel(
@@ -4651,7 +4654,7 @@ fn draw_root_ui(render: UiRender<'_>) {
                         let is_focused = app.active_panel == core::ActivePanel::Right;
                         let theme = app.theme.clone();
                         let async_status = app.async_status();
-                        ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status);
+                        ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status, &app.error_log);
                         ui_cache.right_rows
                     } else {
                         ui::panel::draw_panel(

@@ -1,4 +1,4 @@
-use fileman::app_state::{AsyncStatus, SearchStatus, UpdateStatus};
+use fileman::app_state::{AsyncStatus, ErrorLogEntry, SearchStatus, UpdateStatus};
 use fileman::theme;
 
 use crate::color32;
@@ -9,6 +9,7 @@ pub fn draw_help(
     is_focused: bool,
     min_height: f32,
     async_status: &AsyncStatus,
+    error_log: &[ErrorLogEntry],
 ) -> bool {
     let mut install_requested = false;
     let colors = theme.colors();
@@ -83,6 +84,33 @@ pub fn draw_help(
                 ui.add_space(6.0);
                 draw_async_status(ui, &colors, async_status);
 
+                // Recent errors
+                if !error_log.is_empty() {
+                    ui.add_space(10.0);
+                    ui.colored_label(color32(colors.preview_text), "Recent Errors");
+                    ui.add_space(6.0);
+                    let now = std::time::Instant::now();
+                    let recent: Vec<&ErrorLogEntry> = error_log.iter().rev().take(10).collect();
+                    for entry in recent {
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.colored_label(
+                                color32(colors.row_fg_inactive),
+                                egui::RichText::new(relative_time(now, entry.when))
+                                    .monospace(),
+                            );
+                            ui.colored_label(
+                                color32(colors.row_fg_selected),
+                                egui::RichText::new(format!("[{}]", entry.source)).monospace(),
+                            );
+                            ui.colored_label(
+                                color32(colors.row_fg_inactive),
+                                entry.message.lines().next().unwrap_or(""),
+                            );
+                        });
+                    }
+                }
+
                 ui.add_space(10.0);
                 ui.colored_label(color32(colors.preview_text), "Shortcuts");
                 ui.add_space(6.0);
@@ -99,6 +127,20 @@ pub fn draw_help(
             });
     });
     install_requested
+}
+
+/// Compact relative-time format for the error log: "3s", "12m", "2h", "5d".
+fn relative_time(now: std::time::Instant, when: std::time::Instant) -> String {
+    let elapsed = now.saturating_duration_since(when).as_secs();
+    if elapsed < 60 {
+        format!("{elapsed:>3}s")
+    } else if elapsed < 3600 {
+        format!("{:>3}m", elapsed / 60)
+    } else if elapsed < 86400 {
+        format!("{:>3}h", elapsed / 3600)
+    } else {
+        format!("{:>3}d", elapsed / 86400)
+    }
 }
 
 fn draw_update_status(
