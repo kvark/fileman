@@ -25,6 +25,7 @@ pub mod app_state;
 pub mod archive;
 pub mod core;
 pub mod elevate;
+pub mod settings;
 pub mod sftp;
 pub mod snapshot;
 pub mod syntax;

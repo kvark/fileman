@@ -511,6 +511,44 @@ pub fn panel_path_segments(panel: &app_state::PanelState) -> PathSegments {
     }
 }
 
+/// Bring a Theme into agreement with a ThemePref. The theme keeps its
+/// loaded externals; only the active selection changes.
+pub fn apply_theme_preference(theme: &mut theme::Theme, pref: &fileman::settings::ThemePref) {
+    match pref {
+        fileman::settings::ThemePref::Dark => {
+            theme.kind = theme::ThemeKind::Dark;
+            theme.selected_external = None;
+        }
+        fileman::settings::ThemePref::Light => {
+            theme.kind = theme::ThemeKind::Light;
+            theme.selected_external = None;
+        }
+        fileman::settings::ThemePref::External(name) => {
+            if let Some(idx) = theme.external.iter().position(|(n, _)| n == name) {
+                theme.selected_external = Some(idx);
+            } else {
+                // Named external missing — fall back to Dark without losing
+                // the user's preference (don't overwrite on next save).
+                theme.kind = theme::ThemeKind::Dark;
+                theme.selected_external = None;
+            }
+        }
+    }
+}
+
+/// Encode the current theme selection as a serializable preference.
+pub fn current_theme_preference(theme: &theme::Theme) -> fileman::settings::ThemePref {
+    if let Some(idx) = theme.selected_external
+        && let Some((name, _)) = theme.external.get(idx)
+    {
+        return fileman::settings::ThemePref::External(name.clone());
+    }
+    match theme.kind {
+        theme::ThemeKind::Dark => fileman::settings::ThemePref::Dark,
+        theme::ThemeKind::Light => fileman::settings::ThemePref::Light,
+    }
+}
+
 fn panel_path_display(panel: &app_state::PanelState) -> String {
     let browser = panel.browser();
     let app_state::BrowserState {
@@ -1500,6 +1538,8 @@ fn load_sftp_directory_async(
 
     // Use the synthetic path for stack comparisons.
     let synthetic = PathBuf::from(format!("/sftp/{host}{remote_path}"));
+    let auto_refresh = app.settings.auto_refresh;
+    let wake_for_refresh = app.wake.clone();
     {
         let browser = app.panel_mut(target_panel).browser_mut();
         let same_dir = browser.current_path == synthetic;
@@ -1563,17 +1603,18 @@ fn load_sftp_directory_async(
                     // stay visible until first DirBatch::Replace arrives;
                     // dir_token tagging guarantees stale batches from any
                     // earlier in-flight load (cached.load was discarded just
-                    // above) cannot resurface.
-                    let (tx, rx) = mpsc::channel::<core::DirBatch>();
-                    browser.load = app_state::LoadState::start(rx, browser.dir_token);
-                    let wake = app.wake.clone();
-                    spawn_sftp_load_thread(
-                        Arc::clone(&session),
-                        host.to_string(),
-                        remote_path.to_string(),
-                        tx,
-                        wake,
-                    );
+                    // above) cannot resurface. Gated on settings.auto_refresh.
+                    if auto_refresh {
+                        let (tx, rx) = mpsc::channel::<core::DirBatch>();
+                        browser.load = app_state::LoadState::start(rx, browser.dir_token);
+                        spawn_sftp_load_thread(
+                            Arc::clone(&session),
+                            host.to_string(),
+                            remote_path.to_string(),
+                            tx,
+                            wake_for_refresh,
+                        );
+                    }
                     return;
                 }
             }
@@ -3570,6 +3611,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             });
         }
 
+        let loaded_settings = fileman::settings::load();
         let mut app = app_state::AppState {
             left_panel: app_state::PanelState {
                 tabs: vec![app_state::BrowserState {
@@ -3691,6 +3733,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             quick_jump: None,
             error_message: None,
             error_log: Vec::new(),
+            settings: loaded_settings,
+            settings_draft: None,
             elevation_prompt: None,
             sftp_sessions: HashMap::new(),
             sftp_sessions_shared: sftp_sessions_shared.clone(),
@@ -3702,6 +3746,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
         app.theme
             .load_external_from_dir(std::path::Path::new("./themes"));
+        apply_theme_preference(&mut app.theme, &app.settings.theme);
 
         // Navigate each panel to its startup path (local or remote)
         for (path_str, panel, local_path) in [
@@ -4185,6 +4230,23 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
                     if runtime.app.theme_picker_open {
                         ui::theme_picker::draw_theme_picker(&ctx, &mut runtime.app);
+                    }
+                    if runtime.app.settings_draft.is_some() {
+                        let outcome = {
+                            let externals = runtime.app.theme.external.clone();
+                            let theme_clone = runtime.app.theme.clone();
+                            let draft = runtime.app.settings_draft.as_mut().unwrap();
+                            ui::settings::draw_settings(&ctx, &theme_clone, &externals, draft)
+                        };
+                        match outcome {
+                            ui::settings::SettingsOutcome::Save => {
+                                ui::settings::save(&mut runtime.app);
+                            }
+                            ui::settings::SettingsOutcome::Cancel => {
+                                ui::settings::cancel(&mut runtime.app);
+                            }
+                            ui::settings::SettingsOutcome::Stay => {}
+                        }
                     }
                     if runtime.app.pending_op.is_some() {
                         ui::modals::draw_confirmation(&ctx, &mut runtime.app);
@@ -4709,6 +4771,19 @@ fn draw_root_ui(render: UiRender<'_>) {
             );
         }
     });
+    if app.settings_draft.is_some() {
+        let outcome = {
+            let externals = app.theme.external.clone();
+            let theme_clone = app.theme.clone();
+            let draft = app.settings_draft.as_mut().unwrap();
+            ui::settings::draw_settings(&ctx, &theme_clone, &externals, draft)
+        };
+        match outcome {
+            ui::settings::SettingsOutcome::Save => ui::settings::save(app),
+            ui::settings::SettingsOutcome::Cancel => ui::settings::cancel(app),
+            ui::settings::SettingsOutcome::Stay => {}
+        }
+    }
     if app.pending_op.is_some() {
         ui::modals::draw_confirmation(&ctx, app);
     }
