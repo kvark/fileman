@@ -5,8 +5,8 @@ use fileman::{app_state, archive, core, theme};
 use crate::input::open_selected;
 use crate::{
     DATE_COL_WIDTH, ImageCache, ImageRequest, ROW_HEIGHT, SIZE_COL_WIDTH, ScrollMode, blend_color,
-    color32, fade_color, panel_path_display, reload_panel, resort_browser_entries, sort_mode_label,
-    window_rows_for,
+    color32, fade_color, panel_path_segments, reload_panel, resort_browser_entries,
+    sort_mode_label, window_rows_for,
 };
 
 /// Pick a single-glyph icon for an entry. Renders via egui's bundled emoji
@@ -190,7 +190,8 @@ pub fn draw_panel(
     let (
         mut entries_len,
         mut selected_index,
-        header_text,
+        header_segments,
+        header_count_text,
         mut selected_label,
         mut loading,
         loading_progress,
@@ -200,9 +201,9 @@ pub fn draw_panel(
         let browser = panel.browser();
         let entries_len = browser.entries.len();
         let selected_index = browser.selected_index;
-        let header_text = format!(
-            "{}    {}/{}",
-            panel_path_display(panel),
+        let header_segments = panel_path_segments(panel);
+        let header_count_text = format!(
+            "    {}/{}",
             if entries_len == 0 {
                 0
             } else {
@@ -218,7 +219,8 @@ pub fn draw_panel(
         (
             entries_len,
             selected_index,
-            header_text,
+            header_segments,
+            header_count_text,
             selected_label,
             browser.load.is_loading() || browser.progress_override.is_some(),
             browser.load.progress().or(browser.progress_override),
@@ -379,28 +381,66 @@ pub fn draw_panel(
                                             // Reserve space for the active-panel dot
                                             let dot_space =
                                                 if is_active { header_font.size } else { 0.0 };
-                                            let suffix = if loading {
-                                                if let Some((loaded, total)) = loading_progress {
-                                                    if let Some(total) = total {
-                                                        format!("{header_text} ({loaded}/{total})")
-                                                    } else {
-                                                        format!("{header_text} ({loaded})")
-                                                    }
-                                                } else {
-                                                    header_text.clone()
-                                                }
-                                            } else {
-                                                header_text.clone()
-                                            };
-                                            job.append(
-                                                &suffix,
-                                                dot_space,
+                                            let sep_color = color32(fade_color(
+                                                colors.header_fg,
+                                                0.55,
+                                            ));
+                                            let text_fmt = |font: &egui::FontId, color| {
                                                 egui::text::TextFormat {
-                                                    font_id: header_font.clone(),
-                                                    color: header_color,
+                                                    font_id: font.clone(),
+                                                    color,
                                                     ..Default::default()
-                                                },
+                                                }
+                                            };
+
+                                            // Prefix (host:, drive:, archive!) — no separator
+                                            // before it, gets the dot leading space.
+                                            let mut leading = dot_space;
+                                            if !header_segments.prefix.is_empty() {
+                                                job.append(
+                                                    &header_segments.prefix,
+                                                    leading,
+                                                    text_fmt(&header_font, header_color),
+                                                );
+                                                leading = 0.0;
+                                            }
+
+                                            // Breadcrumb segments with colored ▸ separators.
+                                            for seg in &header_segments.segments {
+                                                job.append(
+                                                    " ▸ ",
+                                                    leading,
+                                                    text_fmt(&header_font, sep_color),
+                                                );
+                                                leading = 0.0;
+                                                job.append(
+                                                    seg,
+                                                    0.0,
+                                                    text_fmt(&header_font, header_color),
+                                                );
+                                            }
+
+                                            // Selection / total counter
+                                            job.append(
+                                                &header_count_text,
+                                                leading,
+                                                text_fmt(&header_font, header_color),
                                             );
+
+                                            // Progress suffix in parentheses
+                                            if loading
+                                                && let Some((loaded, total)) = loading_progress
+                                            {
+                                                let progress_str = match total {
+                                                    Some(total) => format!(" ({loaded}/{total})"),
+                                                    None => format!(" ({loaded})"),
+                                                };
+                                                job.append(
+                                                    &progress_str,
+                                                    0.0,
+                                                    text_fmt(&header_font, header_color),
+                                                );
+                                            }
                                             let galley = ui.fonts_mut(|f| f.layout_job(job));
                                             let painter = ui.painter().with_clip_rect(left_rect);
                                             let pos = egui::Align2::LEFT_CENTER.anchor_size(

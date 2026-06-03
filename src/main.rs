@@ -422,6 +422,95 @@ Try one of:\n\
 On Linux in CI or headless environments, Vulkan is often unavailable."
 }
 
+/// Path broken into segments for breadcrumb-style header rendering.
+pub struct PathSegments {
+    /// Lead-in displayed before the first separator (e.g. "host:", drive
+    /// letter on Windows, "archive.zip!"). Always rendered in the regular
+    /// header color and not prefixed by a separator.
+    pub prefix: String,
+    /// Path segments — rendered separated by a colored ▸ glyph.
+    pub segments: Vec<String>,
+}
+
+pub fn panel_path_segments(panel: &app_state::PanelState) -> PathSegments {
+    let browser = panel.browser();
+    let mode = &browser.browser_mode;
+    match mode {
+        core::BrowserMode::Fs => {
+            let path = browser.current_path.to_string_lossy();
+            let mut segments: Vec<String> = path
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            let prefix = if path.starts_with('/') {
+                String::new()
+            } else if let Some(rest) = path.strip_prefix("\\\\") {
+                let mut parts = rest.splitn(2, ['/', '\\']);
+                let server = parts.next().unwrap_or("");
+                format!("\\\\{server}")
+            } else if path.len() >= 2 && path.as_bytes()[1] == b':' {
+                let drive = segments
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+                if !segments.is_empty() {
+                    segments.remove(0);
+                }
+                drive
+            } else {
+                String::new()
+            };
+            PathSegments { prefix, segments }
+        }
+        core::BrowserMode::Remote { host, path } => {
+            let segments = path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            PathSegments {
+                prefix: format!("{host}:"),
+                segments,
+            }
+        }
+        core::BrowserMode::Container {
+            kind,
+            archive_path,
+            cwd,
+            root,
+        } => {
+            let archive_name = archive_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("archive")
+                .to_string();
+            let _ = kind;
+            let inner = if let Some(root) = root.as_ref()
+                && !root.is_empty()
+                && cwd.starts_with(root)
+            {
+                cwd[root.len()..].trim_start_matches('/').to_string()
+            } else {
+                cwd.clone()
+            };
+            let segments = inner
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            PathSegments {
+                prefix: format!("{archive_name}!"),
+                segments,
+            }
+        }
+        core::BrowserMode::Search { .. } => PathSegments {
+            prefix: panel_path_display(panel),
+            segments: Vec::new(),
+        },
+    }
+}
+
 fn panel_path_display(panel: &app_state::PanelState) -> String {
     let browser = panel.browser();
     let app_state::BrowserState {
