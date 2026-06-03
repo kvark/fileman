@@ -40,6 +40,46 @@ fn entry_glyph(entry: &core::DirEntry) -> &'static str {
     "📄"
 }
 
+/// Type-aware foreground tint blended into the row fg. Returns None for
+/// directories (which use the dedicated panel_border_active color). Order
+/// matters: more specific categories first.
+fn entry_tint(entry: &core::DirEntry) -> Option<theme::Color> {
+    if entry.is_dir || entry.name == ".." {
+        return None;
+    }
+    if entry.is_symlink {
+        // dimmed cyan — links read as references, not content
+        return Some(theme::Color::rgba(0.52, 0.82, 0.92, 1.0));
+    }
+    let name = entry.name.as_str();
+    if archive::is_container_path(std::path::Path::new(name)) {
+        // amber — archives
+        return Some(theme::Color::rgba(0.95, 0.75, 0.25, 1.0));
+    }
+    if core::is_image_name(name) {
+        // magenta — images
+        return Some(theme::Color::rgba(0.92, 0.55, 0.85, 1.0));
+    }
+    if core::is_video_name(name) {
+        // bright cyan — video
+        return Some(theme::Color::rgba(0.40, 0.78, 0.95, 1.0));
+    }
+    if core::is_audio_name(name) {
+        // soft purple — audio
+        return Some(theme::Color::rgba(0.72, 0.58, 0.95, 1.0));
+    }
+    if is_executable_name(name) {
+        // green — executable
+        return Some(theme::Color::rgba(0.45, 0.85, 0.45, 1.0));
+    }
+    if core::is_text_name(name) {
+        // muted sea-green — text/documents
+        return Some(theme::Color::rgba(0.32, 0.78, 0.62, 1.0));
+    }
+    // generic binary — neutral warm grey, very subtle
+    Some(theme::Color::rgba(0.85, 0.78, 0.60, 1.0))
+}
+
 fn is_executable_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -632,15 +672,7 @@ pub fn draw_panel(
                                         let mut fg = fg;
                                         let is_hidden = entry.name.starts_with('.')
                                             && entry.name.as_str() != "..";
-                                        let file_tint = if entry.is_dir {
-                                            None
-                                        } else if core::is_text_name(&entry.name) {
-                                            Some(theme::Color::rgba(0.22, 0.78, 0.56, 1.0))
-                                        } else if core::is_media_name(&entry.name) {
-                                            Some(theme::Color::rgba(0.32, 0.68, 1.0, 1.0))
-                                        } else {
-                                            Some(theme::Color::rgba(0.92, 0.68, 0.28, 1.0))
-                                        };
+                                        let file_tint = entry_tint(&entry);
                                         if !is_selected && let Some(tint) = file_tint {
                                             let factor = if is_active { 0.42 } else { 0.32 };
                                             fg = blend_color(fg, tint, factor);
