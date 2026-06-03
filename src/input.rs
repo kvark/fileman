@@ -114,6 +114,93 @@ fn open_with_default_app(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Spawn an interactive shell in a terminal window with cwd set to `dir`.
+/// On Linux, probes a list of common terminal emulators and spawns the
+/// first one that succeeds. On macOS uses Terminal.app, on Windows cmd.
+fn open_shell_in_dir(dir: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let dir_str = dir.to_string_lossy().into_owned();
+        // (binary_name, args)
+        let env_term = std::env::var("TERMINAL").unwrap_or_default();
+        let candidates: Vec<(String, Vec<String>)> = vec![
+            (env_term.clone(), Vec::new()),
+            ("x-terminal-emulator".into(), Vec::new()),
+            (
+                "alacritty".into(),
+                vec!["--working-directory".into(), dir_str.clone()],
+            ),
+            ("kitty".into(), vec!["--directory".into(), dir_str.clone()]),
+            (
+                "wezterm".into(),
+                vec!["start".into(), "--cwd".into(), dir_str.clone()],
+            ),
+            (
+                "gnome-terminal".into(),
+                vec![format!("--working-directory={dir_str}")],
+            ),
+            ("konsole".into(), vec!["--workdir".into(), dir_str.clone()]),
+            (
+                "xfce4-terminal".into(),
+                vec![format!("--working-directory={dir_str}")],
+            ),
+            (
+                "xterm".into(),
+                vec![
+                    "-e".into(),
+                    format!(
+                        "cd {} && exec ${{SHELL:-/bin/sh}}",
+                        shell_escape(&dir_str)
+                    ),
+                ],
+            ),
+        ];
+        for (cmd, args) in candidates {
+            if cmd.is_empty() {
+                continue;
+            }
+            let mut command = std::process::Command::new(&cmd);
+            command.args(&args).current_dir(dir);
+            match command.spawn() {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(anyhow::anyhow!("failed to launch {cmd}: {e}")),
+            }
+        }
+        anyhow::bail!("no terminal emulator found (tried $TERMINAL, x-terminal-emulator, alacritty, kitty, wezterm, gnome-terminal, konsole, xfce4-terminal, xterm)");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-a", "Terminal"])
+            .arg(dir)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("failed to open Terminal.app: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "cmd"])
+            .current_dir(dir)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("failed to launch cmd: {e}"))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn shell_escape(s: &str) -> String {
+    // Conservative single-quote wrap suitable for embedding inside a shell
+    // command run via `sh -c`. Escapes embedded single quotes.
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
 fn open_selected_from_to(
     app: &mut app_state::AppState,
     source: core::ActivePanel,
@@ -331,6 +418,10 @@ pub(crate) fn handle_keyboard(
                 egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
                 egui::Key::C,
             )
+        });
+    let ctrl_backtick = !in_edit
+        && ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL, egui::Key::Backtick)
         });
     let f2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2));
 
@@ -952,6 +1043,10 @@ pub(crate) fn handle_keyboard(
         ctx.copy_text(text);
         ctx.request_repaint();
     }
+    if ctrl_backtick {
+        spawn_shell_in_panel_cwd(app);
+        ctx.request_repaint();
+    }
     // Modified F-key variants must be consumed before bare variants,
     // because egui's consume_key(NONE, ...) matches regardless of modifiers.
     let shift_f4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4));
@@ -1320,4 +1415,99 @@ fn build_selected_paths(app: &app_state::AppState) -> Option<String> {
         return None;
     }
     Some(paths.join("\n"))
+}
+
+/// Spawn a shell in the active panel's directory. For remote panels, opens a
+/// terminal locally and runs `ssh host` so the user lands on the host shell.
+/// For containers, opens the archive's parent directory locally.
+fn spawn_shell_in_panel_cwd(app: &mut app_state::AppState) {
+    let panel = app.panel(app.active_panel);
+    let browser = panel.browser();
+    match &browser.browser_mode {
+        core::BrowserMode::Fs | core::BrowserMode::Search { .. } => {
+            let dir = browser.current_path.clone();
+            if let Err(e) = open_shell_in_dir(&dir) {
+                app.error_message = Some(format!("open shell: {e}"));
+            }
+        }
+        core::BrowserMode::Container { archive_path, .. } => {
+            let parent = archive_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            if let Err(e) = open_shell_in_dir(&parent) {
+                app.error_message = Some(format!("open shell: {e}"));
+            }
+        }
+        core::BrowserMode::Remote { host, path } => {
+            // Best-effort: open a local terminal and run `ssh -t host "cd path; exec \$SHELL"`.
+            #[cfg(target_os = "linux")]
+            {
+                let cmd = format!(
+                    "ssh -t {} 'cd {} && exec ${{SHELL:-/bin/sh}}'",
+                    shell_escape(host),
+                    shell_escape(path),
+                );
+                if let Err(e) = open_terminal_running(&cmd) {
+                    app.error_message = Some(format!("open shell: {e}"));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (host, path);
+                app.error_message =
+                    Some("open remote shell: not implemented on this platform".to_string());
+            }
+        }
+    }
+}
+
+/// Launch a terminal emulator and run an arbitrary shell command inside it.
+/// Used for opening an ssh session from a remote panel.
+#[cfg(target_os = "linux")]
+fn open_terminal_running(cmd: &str) -> anyhow::Result<()> {
+    let env_term = std::env::var("TERMINAL").unwrap_or_default();
+    let candidates: Vec<(String, Vec<String>)> = vec![
+        (env_term, vec!["-e".into(), cmd.to_string()]),
+        ("x-terminal-emulator".into(), vec!["-e".into(), cmd.to_string()]),
+        (
+            "alacritty".into(),
+            vec!["-e".into(), "sh".into(), "-c".into(), cmd.to_string()],
+        ),
+        (
+            "kitty".into(),
+            vec!["sh".into(), "-c".into(), cmd.to_string()],
+        ),
+        (
+            "wezterm".into(),
+            vec!["start".into(), "--".into(), "sh".into(), "-c".into(), cmd.to_string()],
+        ),
+        (
+            "gnome-terminal".into(),
+            vec!["--".into(), "sh".into(), "-c".into(), cmd.to_string()],
+        ),
+        (
+            "konsole".into(),
+            vec!["-e".into(), "sh".into(), "-c".into(), cmd.to_string()],
+        ),
+        (
+            "xfce4-terminal".into(),
+            vec![format!("--command=sh -c {}", shell_escape(cmd))],
+        ),
+        (
+            "xterm".into(),
+            vec!["-e".into(), "sh".into(), "-c".into(), cmd.to_string()],
+        ),
+    ];
+    for (bin, args) in candidates {
+        if bin.is_empty() {
+            continue;
+        }
+        match std::process::Command::new(&bin).args(&args).spawn() {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(anyhow::anyhow!("failed to launch {bin}: {e}")),
+        }
+    }
+    anyhow::bail!("no terminal emulator found")
 }
