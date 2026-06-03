@@ -38,6 +38,16 @@ pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
             if entry.is_dir || entry.name == ".." {
                 return;
             }
+            // Streaming fast-path: for known media types, hand an sftp:// URL
+            // directly to a media player that supports remote reads (mpv,
+            // vlc, ffplay). Avoids a full download, lets the player seek
+            // server-side. Falls through to download-then-open if no such
+            // player is found or the file isn't a known media type.
+            if let Some(player) = sftp_streaming_player(&entry.name)
+                && try_launch_sftp_player(player, &host, &path).is_ok()
+            {
+                return;
+            }
             let name = path.rsplit('/').next().unwrap_or(&entry.name).to_string();
             let tmp_dir = std::env::temp_dir().join("fileman_extract");
             if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
@@ -112,6 +122,49 @@ fn open_with_default_app(path: &Path) -> anyhow::Result<()> {
     }
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Pick a media player that can stream `sftp://` URLs for files of this
+/// type. Returns the binary name to invoke. Falls back to None for
+/// unsupported types or when no preferred player matches.
+fn sftp_streaming_player(name: &str) -> Option<&'static str> {
+    if !core::is_media_name(name) {
+        return None;
+    }
+    // Probe each candidate; first available wins. mpv is preferred for video
+    // and audio (best seek, lowest overhead). vlc and ffplay are fallbacks.
+    ["mpv", "vlc", "ffplay"].iter().copied().find(|cand| {
+        std::process::Command::new(cand)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
+
+/// Launch a media player with an sftp:// URL targeting `host:path`. Returns
+/// Err if spawning the process fails; success only means the player started,
+/// not that it could actually read the file.
+fn try_launch_sftp_player(player: &str, host: &str, path: &str) -> anyhow::Result<()> {
+    // Best effort URL encoding for the path portion. Most paths only need
+    // spaces and a few other chars escaped; we replace just the worst
+    // offenders rather than depend on a full url crate.
+    let encoded_path = path
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    let url = format!("sftp://{host}{}", encoded_path);
+    let mut cmd = std::process::Command::new(player);
+    cmd.arg(&url);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("failed to launch {player}: {e}"))
 }
 
 /// Spawn an interactive shell in a terminal window with cwd set to `dir`.
