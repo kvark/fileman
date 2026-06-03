@@ -348,11 +348,15 @@ pub fn draw_panel(
                                             if loading {
                                                 // Keep repainting so the spinner animates
                                                 ui.ctx().request_repaint_after(
-                                                    std::time::Duration::from_millis(200),
+                                                    std::time::Duration::from_millis(120),
                                                 );
                                                 let t = ui.ctx().input(|i| i.time);
+                                                let frames = [
+                                                    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧",
+                                                    "⠇", "⠏",
+                                                ];
                                                 let spinner =
-                                                    ["|", "/", "-", "\\"][((t * 6.0) as usize) % 4];
+                                                    frames[((t * 10.0) as usize) % frames.len()];
                                                 job.append(
                                                     spinner,
                                                     0.0,
