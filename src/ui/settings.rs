@@ -1,5 +1,5 @@
 use fileman::app_state;
-use fileman::settings::{Bookmark, MediaHandler, Settings, ThemePref};
+use fileman::settings::{Bookmark, Settings, ThemePref};
 use fileman::theme;
 
 use crate::color32;
@@ -80,10 +80,6 @@ pub fn draw_settings(
             ui.add_space(10.0);
             section_header(ui, &colors, "SFTP Bookmarks");
             bookmark_editor(ui, &colors, &mut draft.bookmarks);
-
-            ui.add_space(10.0);
-            section_header(ui, &colors, "Media Handlers");
-            media_handler_editor(ui, &colors, &mut draft.media_handlers);
 
             ui.add_space(14.0);
             ui.separator();
@@ -170,52 +166,6 @@ fn bookmark_editor(
         ui.colored_label(
             color32(colors.row_fg_inactive),
             egui::RichText::new("No bookmarks. Click + Add to create one.").small(),
-        );
-    }
-}
-
-fn media_handler_editor(
-    ui: &mut egui::Ui,
-    colors: &theme::ThemeColors,
-    handlers: &mut Vec<MediaHandler>,
-) {
-    let mut to_remove: Option<usize> = None;
-    for (i, h) in handlers.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut h.extension)
-                    .desired_width(80.0)
-                    .hint_text("ext"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut h.command)
-                    .desired_width(260.0)
-                    .hint_text("command (e.g. mpv {url})"),
-            );
-            if ui
-                .small_button(egui::RichText::new("✕").monospace())
-                .clicked()
-            {
-                to_remove = Some(i);
-            }
-        });
-    }
-    if let Some(i) = to_remove {
-        handlers.remove(i);
-    }
-    if ui.small_button("+ Add handler").clicked() {
-        handlers.push(MediaHandler {
-            extension: String::new(),
-            command: String::new(),
-        });
-    }
-    if handlers.is_empty() {
-        ui.colored_label(
-            color32(colors.row_fg_inactive),
-            egui::RichText::new(
-                "No overrides. Built-in mpv → vlc → ffplay probe is used.",
-            )
-            .small(),
         );
     }
 }
