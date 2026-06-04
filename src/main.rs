@@ -799,6 +799,22 @@ fn hexdump_job(
     job
 }
 
+/// True if `a` and `b` contain the same entries by name and dir/file kind,
+/// regardless of order. Used to suppress the visible re-populate when a
+/// cache-refresh confirms a directory hasn't changed. O(n) via a sorted
+/// name list; ignores `size`, `modified`, and other metadata that may
+/// legitimately drift without the user caring.
+fn entries_name_equivalent(a: &[core::DirEntry], b: &[core::DirEntry]) -> bool {
+    if a.len() != b.len() || a.is_empty() {
+        return false;
+    }
+    let mut a_keys: Vec<(&str, bool)> = a.iter().map(|e| (e.name.as_str(), e.is_dir)).collect();
+    let mut b_keys: Vec<(&str, bool)> = b.iter().map(|e| (e.name.as_str(), e.is_dir)).collect();
+    a_keys.sort_unstable();
+    b_keys.sort_unstable();
+    a_keys == b_keys
+}
+
 fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch) {
     let prior_index = browser.selected_index;
     let prior_selection = browser.entries.get(prior_index).map(|e| e.name.clone());
@@ -892,6 +908,14 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
             // loading flag stays true — cleared when the channel disconnects
         }
         core::DirBatch::Replace(new_entries) => {
+            // Skip the swap if the fresh listing is name-equivalent to what
+            // we already show. This eliminates the visible "re-populate"
+            // when a cache-refresh confirms the directory hasn't changed —
+            // the user sees zero disruption. Cheap: O(n) over a single
+            // pass once lengths match.
+            if entries_name_equivalent(&browser.entries, &new_entries) {
+                return;
+            }
             browser.entries = new_entries;
             browser.selected_index = 0;
             // loading flag stays true — cleared when the channel disconnects
@@ -1613,6 +1637,7 @@ fn load_sftp_directory_async(
                             remote_path.to_string(),
                             tx,
                             wake_for_refresh,
+                            true, // atomic — buffer + single Replace at end
                         );
                     }
                     return;
@@ -1656,27 +1681,40 @@ fn load_sftp_directory_async(
     browser.container_root = None;
     browser.watching_archive = None;
 
-    spawn_sftp_load_thread(session, host_owned, path_owned, tx, wake);
+    // Fresh load — stream for snappy first-paint, not atomic.
+    spawn_sftp_load_thread(session, host_owned, path_owned, tx, wake, false);
 }
 
-/// Spawn the SFTP directory-streaming loader thread. Extracted so both
-/// fresh-load and cache-restore-with-background-refresh code paths share
-/// the implementation.
+/// Spawn the SFTP directory-streaming loader thread. Shared between the
+/// fresh-load and cache-restore-with-background-refresh paths.
+///
+/// When `atomic` is true (cache-refresh case), the loader buffers every
+/// entry in memory and emits a single `Replace` at completion — the user
+/// sees one swap, not the streaming `Replace(first 64) + Append + ...`
+/// sequence that would otherwise flash partial contents on top of the
+/// already-shown cache. When `atomic` is false (initial fresh load), it
+/// streams as before for snappy first-paint.
 fn spawn_sftp_load_thread(
     session: Arc<std::sync::Mutex<fileman::sftp::SftpSession>>,
     host: String,
     path: String,
     tx: mpsc::Sender<core::DirBatch>,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    atomic: bool,
 ) {
     thread::spawn(move || {
         let locked = session.lock().unwrap();
+        let mut buffered: Vec<core::DirEntry> = Vec::new();
         let mut first = true;
         let result = fileman::sftp::read_directory_streaming(
             &locked.sftp,
             &host,
             &path,
             |batch| {
+                if atomic {
+                    buffered.extend(batch);
+                    return;
+                }
                 let msg = if first {
                     first = false;
                     core::DirBatch::Replace(batch)
@@ -1696,6 +1734,8 @@ fn spawn_sftp_load_thread(
                 core::DirBatch::Error(msg)
             };
             let _ = tx.send(batch);
+        } else if atomic {
+            let _ = tx.send(core::DirBatch::Replace(buffered));
         }
         if let Some(ref wake) = wake {
             wake();
