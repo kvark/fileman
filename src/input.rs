@@ -127,25 +127,60 @@ fn open_with_default_app(path: &Path) -> anyhow::Result<()> {
 /// Pick a media player that can stream `sftp://` URLs for files of this
 /// type. Returns the binary name to invoke. Falls back to None for
 /// unsupported types or when no preferred player matches.
+///
+/// VLC is special-cased: VLC 3.0 has no CLI option to pass an SSH key path
+/// (that arrived in VLC 4.x), so it can only authenticate via ssh-agent or
+/// the legacy `~/.ssh/id_rsa` auto-search path. If neither is available we
+/// skip VLC and fall through to the next candidate (or to download-and-open).
 fn sftp_streaming_player(name: &str) -> Option<&'static str> {
     if !core::is_media_name(name) {
         return None;
     }
-    // Probe each candidate; first available wins. Order matters:
+    // Probe each candidate; first viable wins. Order matters:
     //   mpv     — best seek, lowest overhead, accepts libavformat URL opts
     //   ffplay  — same libavformat backend as mpv, also takes URL opts
-    //   vlc     — last resort: uses libssh2 directly with NO way to pass
-    //             a custom IdentityFile, so it can only auth via ssh-agent
-    //             or one of the default ~/.ssh/id_* paths.
+    //   vlc     — last resort; gated on whether it'll actually be able to auth.
     ["mpv", "ffplay", "vlc"].iter().copied().find(|cand| {
-        std::process::Command::new(cand)
+        if std::process::Command::new(cand)
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
             .status()
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        if *cand == "vlc" && !vlc_can_auth() {
+            return false;
+        }
+        true
     })
+}
+
+/// Heuristic: can VLC 3.x authenticate against an SFTP host without a
+/// password prompt on this machine? True if ssh-agent has keys loaded OR
+/// `~/.ssh/id_rsa` exists (VLC 3's primary auto-search path — it does NOT
+/// auto-search id_ed25519). Returns false in agent-less ed25519-only setups,
+/// signalling the caller to fall through.
+fn vlc_can_auth() -> bool {
+    if let Ok(output) = std::process::Command::new("ssh-add")
+        .arg("-l")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .output()
+        && output.status.success()
+        && !output.stdout.is_empty()
+    {
+        return true;
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && std::path::Path::new(&format!("{home}/.ssh/id_rsa")).is_file()
+    {
+        return true;
+    }
+    false
 }
 
 /// Pick a likely default SSH private key from `~/.ssh/`, in OpenSSH's
@@ -237,7 +272,9 @@ fn try_launch_sftp_player(player: &str, host: &str, path: &str) -> anyhow::Resul
     // Pass the identity file in the way each player expects:
     //   mpv     — libavformat URL option via --demuxer-lavf-o
     //   ffplay  — ffmpeg-style -private_key CLI flag
-    //   vlc     — sftp module's --sftp-privkey-file / --sftp-pubkey-file
+    //   vlc     — NO way in VLC 3.0 to pass a key path; the
+    //             --sftp-privkey-file option only exists in VLC 4.x. VLC 3
+    //             relies on ssh-agent or the legacy ~/.ssh/id_rsa default.
     if let Some(ref key) = identity {
         match player {
             "mpv" => {
@@ -245,13 +282,6 @@ fn try_launch_sftp_player(player: &str, host: &str, path: &str) -> anyhow::Resul
             }
             "ffplay" => {
                 cmd.arg("-private_key").arg(key);
-            }
-            "vlc" => {
-                cmd.arg(format!("--sftp-privkey-file={key}"));
-                let pub_key = format!("{key}.pub");
-                if std::path::Path::new(&pub_key).exists() {
-                    cmd.arg(format!("--sftp-pubkey-file={pub_key}"));
-                }
             }
             _ => {}
         }
