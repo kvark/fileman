@@ -9,37 +9,6 @@ use crate::{
     sort_mode_label, window_rows_for,
 };
 
-/// Pick a single-glyph icon for an entry. Renders via egui's bundled emoji
-/// font as single-color text — tint applies via the painter's color.
-fn entry_glyph(entry: &core::DirEntry) -> &'static str {
-    if entry.name == ".." {
-        return "⬆";
-    }
-    if entry.is_symlink {
-        return "🔗";
-    }
-    if entry.is_dir {
-        return "📁";
-    }
-    let name = entry.name.as_str();
-    if archive::is_container_path(std::path::Path::new(name)) {
-        return "🗜";
-    }
-    if core::is_image_name(name) {
-        return "🖼";
-    }
-    if core::is_video_name(name) {
-        return "🎬";
-    }
-    if core::is_audio_name(name) {
-        return "🎵";
-    }
-    if is_executable_name(name) {
-        return "⚙";
-    }
-    "📄"
-}
-
 /// Type-aware foreground tint blended into the row fg. Returns None for
 /// directories (which use the dedicated panel_border_active color). Order
 /// matters: more specific categories first.
@@ -194,7 +163,6 @@ fn is_executable_name(name: &str) -> bool {
 }
 
 /// Draw a file-type icon at `center` using the painter.
-#[allow(dead_code)]
 fn draw_file_icon(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -549,10 +517,13 @@ pub fn draw_panel(
                                                 leading = 0.0;
                                             }
 
-                                            // Breadcrumb segments with colored ▸ separators.
+                                            // Breadcrumb segments with colored ASCII separators.
+                                            // (Was ▸, but egui's bundled fonts don't include
+                                            // U+25B8 on every system — fell back to '>' which is
+                                            // guaranteed to render.)
                                             for seg in &header_segments.segments {
                                                 job.append(
-                                                    " ▸ ",
+                                                    " > ",
                                                     leading,
                                                     text_fmt(&header_font, sep_color),
                                                 );
@@ -828,18 +799,13 @@ pub fn draw_panel(
                                         let ic = color32(icon_color);
                                         let center =
                                             egui::pos2(rect.left() + 12.0, rect.center().y);
-                                        let glyph = if show_glyphs {
-                                            entry_glyph(&entry)
-                                        } else {
-                                            ""
-                                        };
-                                        ui.painter().text(
-                                            center,
-                                            egui::Align2::CENTER_CENTER,
-                                            glyph,
-                                            font_id.clone(),
-                                            ic,
-                                        );
+                                        // Vector-drawn icons have no font dependency
+                                        // and render identically across systems —
+                                        // egui's bundled fonts don't include enough
+                                        // of the emoji set to use them reliably.
+                                        if show_glyphs {
+                                            draw_file_icon(ui.painter(), center, ic, &entry);
+                                        }
 
                                         let mut size_text =
                                             entry.size.map(core::format_size).unwrap_or_default();
