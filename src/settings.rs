@@ -30,11 +30,6 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub auto_refresh: bool,
 
-    /// Per-extension overrides for the "open remote with mpv/vlc/ffplay"
-    /// streaming path. Empty means the built-in probe order is used.
-    #[serde(default)]
-    pub media_handlers: Vec<MediaHandler>,
-
     /// Saved SFTP host bookmarks. Surfaced in the quick-jump dropdown so a
     /// labeled bookmark expands to (host, initial_path).
     #[serde(default)]
@@ -47,12 +42,6 @@ pub enum ThemePref {
     Dark,
     Light,
     External(String),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MediaHandler {
-    pub extension: String,
-    pub command: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,7 +62,6 @@ impl Default for Settings {
             show_glyphs: true,
             row_striping: true,
             auto_refresh: true,
-            media_handlers: Vec::new(),
             bookmarks: Vec::new(),
         }
     }
