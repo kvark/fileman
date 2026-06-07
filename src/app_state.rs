@@ -436,6 +436,10 @@ pub struct AppState {
     pub io_cancel_tx: mpsc::Sender<()>,
     pub io_cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     pub io_in_flight: usize,
+    /// Total tasks enqueued for the current batch — peak of io_in_flight
+    /// since the queue last emptied. Used by the progress modal to show
+    /// "file X of N". Reset to 0 when io_in_flight reaches 0.
+    pub io_batch_total: usize,
     pub io_cancel_requested: bool,
     /// Shared transfer progress for IO/preview/edit workers.
     pub transfer_progress: Arc<crate::core::TransferProgress>,
@@ -1591,6 +1595,11 @@ impl AppState {
             eprintln!("Failed to enqueue IO: {e}");
         } else {
             self.io_in_flight = self.io_in_flight.saturating_add(1);
+            // Peak tracking — io_in_flight only grows during enqueue, so
+            // taking the max here captures the batch's high-water mark.
+            if self.io_in_flight > self.io_batch_total {
+                self.io_batch_total = self.io_in_flight;
+            }
         }
     }
 
@@ -1823,6 +1832,7 @@ impl AppState {
             self.io_cancel_requested = false;
             self.io_cancel_flag
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.io_batch_total = 0;
         }
     }
 

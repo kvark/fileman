@@ -98,8 +98,10 @@ impl Theme {
                 // Catppuccin-inspired warm slate. Less stark, more depth.
                 divider: Color::rgba(0.20, 0.22, 0.28, 1.0),
                 row_bg_stripe: Color::rgba(1.0, 1.0, 1.0, 0.03),
-                row_bg_selected_active: Color::rgba(0.21, 0.36, 0.68, 1.0),
-                row_bg_selected_inactive: Color::rgba(0.17, 0.20, 0.26, 1.0),
+                // Selection: punchy enough to spot in peripheral vision
+                // against the dark slate panel bg.
+                row_bg_selected_active: Color::rgba(0.32, 0.55, 0.95, 1.0),
+                row_bg_selected_inactive: Color::rgba(0.24, 0.28, 0.36, 1.0),
                 row_fg_selected: Color::rgba(1.0, 1.0, 1.0, 1.0),
                 row_fg_active: Color::rgba(0.93, 0.95, 0.98, 1.0),
                 row_fg_inactive: Color::rgba(0.65, 0.70, 0.78, 1.0),
@@ -117,8 +119,9 @@ impl Theme {
             ThemeKind::Light => ThemeColors {
                 divider: Color::rgba(0.84, 0.86, 0.90, 1.0),
                 row_bg_stripe: Color::rgba(0.0, 0.0, 0.0, 0.03),
-                row_bg_selected_active: Color::rgba(0.52, 0.72, 0.98, 1.0),
-                row_bg_selected_inactive: Color::rgba(0.90, 0.92, 0.95, 1.0),
+                // Brighter, more saturated for at-a-glance contrast.
+                row_bg_selected_active: Color::rgba(0.32, 0.62, 0.98, 1.0),
+                row_bg_selected_inactive: Color::rgba(0.82, 0.86, 0.92, 1.0),
                 row_fg_selected: Color::rgba(0.04, 0.06, 0.10, 1.0),
                 row_fg_active: Color::rgba(0.13, 0.16, 0.22, 1.0),
                 row_fg_inactive: Color::rgba(0.40, 0.44, 0.52, 1.0),

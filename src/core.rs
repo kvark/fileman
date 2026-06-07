@@ -18,6 +18,10 @@ pub struct TransferProgress {
     pub bytes_total: AtomicU64,
     /// Items processed (e.g. files/dirs deleted); displayed when bytes are 0.
     pub items_done: AtomicU64,
+    /// Name of the item currently being transferred — set by the IO worker
+    /// at the start of each task, displayed in the progress modal. None
+    /// when no task is in flight.
+    pub current_name: std::sync::Mutex<Option<String>>,
 }
 
 impl TransferProgress {
@@ -26,6 +30,7 @@ impl TransferProgress {
             bytes_done: AtomicU64::new(0),
             bytes_total: AtomicU64::new(0),
             items_done: AtomicU64::new(0),
+            current_name: std::sync::Mutex::new(None),
         }
     }
 
@@ -48,6 +53,16 @@ impl TransferProgress {
             self.bytes_done.load(Ordering::Relaxed),
             self.bytes_total.load(Ordering::Relaxed),
         )
+    }
+
+    pub fn set_current_name(&self, name: Option<String>) {
+        if let Ok(mut g) = self.current_name.lock() {
+            *g = name;
+        }
+    }
+
+    pub fn current_name(&self) -> Option<String> {
+        self.current_name.lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -292,6 +307,53 @@ pub enum IOTask {
     },
     /// Re-run the inner task with OS-level privilege elevation.
     Elevated(Box<IOTask>),
+}
+
+impl IOTask {
+    /// Best-effort filename for display in the progress modal. Walks into
+    /// `Elevated` so a wrapped task still shows its target. Returns "…" for
+    /// tasks where no single name is meaningful (Pack, batched delete with
+    /// multiple items).
+    pub fn display_name(&self) -> String {
+        fn fs_name(p: &path::Path) -> String {
+            p.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned())
+        }
+        fn remote_name(p: &str) -> String {
+            p.rsplit('/').next().unwrap_or(p).to_string()
+        }
+        match *self {
+            IOTask::Copy { ref src, .. } => fs_name(src),
+            IOTask::Move { ref src, .. } => fs_name(src),
+            IOTask::Delete { ref target } => fs_name(target),
+            IOTask::Rename { ref src, .. } => fs_name(src),
+            IOTask::WriteFile { ref path, .. } => fs_name(path),
+            IOTask::Mkdir { ref path } => fs_name(path),
+            IOTask::SetProps { ref path, .. } => fs_name(path),
+            IOTask::CopyContainer { ref display_name, .. }
+            | IOTask::CopyContainerDir { ref display_name, .. }
+            | IOTask::CopyContainerAndOpen { ref display_name, .. } => display_name.clone(),
+            IOTask::Pack { ref archive_path, .. } => fs_name(archive_path),
+            IOTask::WriteRemoteFile { ref path, .. } => remote_name(path),
+            IOTask::CopyRemoteToLocal { ref name, .. } => name.clone(),
+            IOTask::CopyLocalToRemote { ref src, .. } => fs_name(src),
+            IOTask::DeleteRemote { ref items, .. } => {
+                if items.len() == 1 {
+                    remote_name(&items[0].0)
+                } else {
+                    format!("{} items", items.len())
+                }
+            }
+            IOTask::RenameRemote { ref src, .. } => remote_name(src),
+            IOTask::MkdirRemote { ref path, .. } => remote_name(path),
+            IOTask::CopyRemoteToLocalAndOpen { ref remote_path, .. } => remote_name(remote_path),
+            IOTask::CopyRemoteSameHost { ref name, .. }
+            | IOTask::MoveRemoteSameHost { ref name, .. } => name.clone(),
+            IOTask::CopyRemoteCrossHost { ref name, .. } => name.clone(),
+            IOTask::Elevated(ref inner) => inner.display_name(),
+        }
+    }
 }
 
 pub enum IOResult {

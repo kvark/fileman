@@ -110,15 +110,48 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
     egui::Window::new("Working")
         .collapsible(false)
         .resizable(false)
+        .default_width(420.0)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
             ui.add_space(6.0);
-            let label = if app.io_cancel_requested {
-                "Cancelling…"
+            let header = if app.io_cancel_requested {
+                "Cancelling…".to_string()
+            } else if app.io_batch_total > 1 {
+                let completed = app.io_batch_total.saturating_sub(app.io_in_flight);
+                let current = completed + 1;
+                format!(
+                    "Working — file {} of {}",
+                    current.min(app.io_batch_total),
+                    app.io_batch_total
+                )
             } else {
-                "Working…"
+                "Working…".to_string()
             };
-            ui.colored_label(color32(colors.row_fg_active), label);
+            ui.colored_label(color32(colors.row_fg_active), header);
+
+            // Current file name. Mid-truncate so the leading dir context
+            // and the filename suffix both stay visible.
+            if let Some(name) = app.transfer_progress.current_name() {
+                let display = if name.chars().count() > 64 {
+                    let head: String = name.chars().take(28).collect();
+                    let tail: String = name
+                        .chars()
+                        .rev()
+                        .take(28)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!("{head}…{tail}")
+                } else {
+                    name
+                };
+                ui.colored_label(
+                    color32(colors.row_fg_inactive),
+                    egui::RichText::new(display).monospace(),
+                );
+            }
+
             ui.add_space(8.0);
             let (done, total) = app.transfer_progress.snapshot();
             let items = app
