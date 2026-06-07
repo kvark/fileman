@@ -913,34 +913,60 @@ pub fn copy_remote_to_local_progress(
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
     let stat = sftp.stat(Path::new(remote_path)).ok();
+    let expected_size = stat.as_ref().and_then(|s| s.size);
     if let Some(p) = progress {
-        p.reset(stat.and_then(|s| s.size).unwrap_or(0));
+        p.reset(expected_size.unwrap_or(0));
     }
-    let mut remote_file = sftp
-        .open(Path::new(remote_path))
-        .map_err(|e| format!("open remote {remote_path}: {e}"))?;
-    let mut local_file = std::fs::File::create(local_dst)
-        .map_err(|e| format!("create local {}: {e}", local_dst.display()))?;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err("Cancelled".to_string());
-        }
-        match remote_file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                local_file
-                    .write_all(&buf[..n])
-                    .map_err(|e| format!("write local: {e}"))?;
-                if let Some(p) = progress {
-                    p.add(n as u64);
-                }
+    // Inner closure: any Err returned here causes the destination file to
+    // be removed before the error propagates. Keeps partial / zero-size
+    // artifacts from accumulating when a transfer fails or is cancelled.
+    let inner = || -> Result<(), String> {
+        let mut remote_file = sftp
+            .open(Path::new(remote_path))
+            .map_err(|e| format!("open remote {remote_path}: {e}"))?;
+        let mut local_file = std::fs::File::create(local_dst)
+            .map_err(|e| format!("create local {}: {e}", local_dst.display()))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut written: u64 = 0;
+        loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err("Cancelled".to_string());
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("read remote: {e}")),
+            match remote_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    local_file
+                        .write_all(&buf[..n])
+                        .map_err(|e| format!("write local: {e}"))?;
+                    written += n as u64;
+                    if let Some(p) = progress {
+                        p.add(n as u64);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("read remote: {e}")),
+            }
+        }
+        // Flush and verify final size against the source.
+        local_file
+            .sync_all()
+            .map_err(|e| format!("sync local: {e}"))?;
+        if let Some(expected) = expected_size
+            && written != expected
+        {
+            return Err(format!(
+                "size mismatch: wrote {written} bytes, expected {expected}"
+            ));
+        }
+        Ok(())
+    };
+    match inner() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(local_dst);
+            Err(e)
         }
     }
-    Ok(())
 }
 
 /// Copy a local file to a remote path.
@@ -959,35 +985,72 @@ pub fn copy_local_to_remote_progress(
     cancel: Option<&AtomicBool>,
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
+    let expected_size = std::fs::metadata(local_src).map(|m| m.len()).ok();
     if let Some(p) = progress {
-        let size = std::fs::metadata(local_src).map(|m| m.len()).unwrap_or(0);
-        p.reset(size);
+        p.reset(expected_size.unwrap_or(0));
     }
-    let mut local_file = std::fs::File::open(local_src)
-        .map_err(|e| format!("open local {}: {e}", local_src.display()))?;
-    let mut remote_file = sftp
-        .create(Path::new(remote_path))
-        .map_err(|e| format!("create remote {remote_path}: {e}"))?;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err("Cancelled".to_string());
-        }
-        match local_file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                remote_file
-                    .write_all(&buf[..n])
-                    .map_err(|e| format!("write remote: {e}"))?;
-                if let Some(p) = progress {
-                    p.add(n as u64);
-                }
+    // Inner closure pattern (mirror of copy_remote_to_local_progress): any
+    // Err triggers cleanup of the partial remote artifact before the error
+    // propagates to the worker.
+    let inner = || -> Result<(), String> {
+        let mut local_file = std::fs::File::open(local_src)
+            .map_err(|e| format!("open local {}: {e}", local_src.display()))?;
+        let mut remote_file = sftp
+            .create(Path::new(remote_path))
+            .map_err(|e| format!("create remote {remote_path}: {e}"))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut written: u64 = 0;
+        loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err("Cancelled".to_string());
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("read local: {e}")),
+            match local_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    remote_file
+                        .write_all(&buf[..n])
+                        .map_err(|e| format!("write remote: {e}"))?;
+                    written += n as u64;
+                    if let Some(p) = progress {
+                        p.add(n as u64);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("read local: {e}")),
+            }
+        }
+        // Close the remote handle by dropping so the server flushes, then
+        // stat to verify the on-disk size matches what we sent.
+        drop(remote_file);
+        if let Some(expected) = expected_size {
+            if written != expected {
+                return Err(format!(
+                    "size mismatch: read {written} bytes, expected {expected}"
+                ));
+            }
+            // Cross-check the destination — guards against a server-side
+            // short-write that the SFTP layer didn't already surface as
+            // a write error.
+            let actual = sftp
+                .stat(Path::new(remote_path))
+                .map_err(|e| format!("stat remote after copy: {e}"))?
+                .size
+                .unwrap_or(0);
+            if actual != expected {
+                return Err(format!(
+                    "size mismatch on remote: {actual} bytes, expected {expected}"
+                ));
+            }
+        }
+        Ok(())
+    };
+    match inner() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = sftp.unlink(Path::new(remote_path));
+            Err(e)
         }
     }
-    Ok(())
 }
 
 /// Copy a remote file to another path on the same host.

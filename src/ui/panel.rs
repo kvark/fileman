@@ -851,6 +851,23 @@ pub fn draw_panel(
                                                 egui::UiBuilder::new().max_rect(name_rect),
                                                 |ui| {
                                                     ui.set_clip_rect(name_rect);
+                                                    // Force a high-contrast selection
+                                                    // background. Without this override the
+                                                    // default egui selection.bg_fill is the
+                                                    // same family of blue as the selected-row
+                                                    // bg, so the user can't see what they've
+                                                    // highlighted while typing/editing.
+                                                    let sel_color = if is_selected {
+                                                        // Yellow on blue: maximum contrast.
+                                                        egui::Color32::from_rgba_unmultiplied(
+                                                            240, 200, 70, 180,
+                                                        )
+                                                    } else {
+                                                        egui::Color32::from_rgba_unmultiplied(
+                                                            80, 140, 220, 180,
+                                                        )
+                                                    };
+                                                    ui.visuals_mut().selection.bg_fill = sel_color;
                                                     let rename = app
                                                         .panel_mut(panel_side_for_closure)
                                                         .browser_mut()
