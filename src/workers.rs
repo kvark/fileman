@@ -330,6 +330,7 @@ pub fn start_io_worker(
                     name,
                     is_dir,
                 } => {
+                    let mut err_msg: Option<String> = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         let result = if is_dir {
@@ -357,12 +358,18 @@ pub fn start_io_worker(
                         if let Err(e) = result
                             && e != "Cancelled"
                         {
-                            eprintln!("Remote-to-local copy error: {e}");
+                            let msg = format!("Copy {name}: {e}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    // io_result stays Completed: content was added to the local dst
+                    if let Some(msg) = err_msg {
+                        io_result = IOResult::Error(msg);
+                    }
                 }
                 IOTask::CopyLocalToRemote {
                     src,
@@ -370,6 +377,7 @@ pub fn start_io_worker(
                     remote_dir,
                     is_dir,
                 } => {
+                    let mut err_msg: Option<String> = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         let result = if is_dir {
@@ -399,12 +407,23 @@ pub fn start_io_worker(
                         if let Err(e) = result
                             && e != "Cancelled"
                         {
-                            eprintln!("Local-to-remote copy error: {e}");
+                            let label = src
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| src.display().to_string());
+                            let msg = format!("Copy {label}: {e}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    io_result = IOResult::CompletedRemote(host);
+                    io_result = match err_msg {
+                        Some(msg) => IOResult::ErrorRemote(host, msg),
+                        None => IOResult::CompletedRemote(host),
+                    };
                 }
                 IOTask::DeleteRemote { host, items } => {
                     let mut err_msg = None;
@@ -492,6 +511,7 @@ pub fn start_io_worker(
                     remote_path,
                     local_path,
                 } => {
+                    let mut err_msg: Option<String> = None;
                     if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
                         let locked = session.lock().unwrap();
                         match crate::sftp::copy_remote_to_local_progress(
@@ -503,12 +523,21 @@ pub fn start_io_worker(
                         ) {
                             Ok(()) => open_with_default_app_bg(&local_path),
                             Err(e) if e == "Cancelled" => {}
-                            Err(e) => eprintln!("Remote-to-local copy error: {e}"),
+                            Err(e) => {
+                                let msg = format!("Open {remote_path}: {e}");
+                                eprintln!("{msg}");
+                                err_msg = Some(msg);
+                            }
                         }
                     } else {
-                        eprintln!("No SFTP session for host: {host}");
+                        let msg = format!("No SFTP session for host: {host}");
+                        eprintln!("{msg}");
+                        err_msg = Some(msg);
                     }
-                    io_result = IOResult::CompletedSilent;
+                    io_result = match err_msg {
+                        Some(msg) => IOResult::Error(msg),
+                        None => IOResult::CompletedSilent,
+                    };
                 }
                 IOTask::CopyRemoteSameHost {
                     host,
@@ -597,6 +626,7 @@ pub fn start_io_worker(
                     let src_session = sessions.get(&src_host).cloned();
                     let dst_session = sessions.get(&dst_host).cloned();
                     drop(sessions);
+                    let mut err_msg: Option<String> = None;
                     match (src_session, dst_session) {
                         (Some(src_arc), Some(dst_arc)) => {
                             let src_locked = src_arc.lock().unwrap();
@@ -612,13 +642,26 @@ pub fn start_io_worker(
                                 Some(&transfer_progress),
                             ) && e != "Cancelled"
                             {
-                                eprintln!("Cross-host copy error: {e}");
+                                let msg = format!("Copy {name}: {e}");
+                                eprintln!("{msg}");
+                                err_msg = Some(msg);
                             }
                         }
-                        (None, _) => eprintln!("No SFTP session for host: {src_host}"),
-                        (_, None) => eprintln!("No SFTP session for host: {dst_host}"),
+                        (None, _) => {
+                            let msg = format!("No SFTP session for host: {src_host}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
+                        }
+                        (_, None) => {
+                            let msg = format!("No SFTP session for host: {dst_host}");
+                            eprintln!("{msg}");
+                            err_msg = Some(msg);
+                        }
                     }
-                    io_result = IOResult::CompletedRemote(dst_host);
+                    io_result = match err_msg {
+                        Some(msg) => IOResult::ErrorRemote(dst_host, msg),
+                        None => IOResult::CompletedRemote(dst_host),
+                    };
                 }
                 IOTask::Elevated(inner) => match crate::elevate::execute_elevated(&inner) {
                     Ok(()) => {}
