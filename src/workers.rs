@@ -62,6 +62,7 @@ pub fn start_io_worker(
             }
             cancel_flag.store(false, Ordering::Relaxed);
             transfer_progress.reset(0);
+            transfer_progress.set_current_name(Some(task.display_name()));
             // Default: refresh local Fs panels. Remote/silent ops override below.
             let mut io_result = IOResult::Completed;
             let task_clone = task.clone();
@@ -627,6 +628,7 @@ pub fn start_io_worker(
                     }
                 },
             }
+            transfer_progress.set_current_name(None);
             let _ = result_tx.send(io_result);
             if let Some(ref wake) = wake {
                 wake();
