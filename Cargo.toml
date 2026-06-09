@@ -61,6 +61,12 @@ semver = { version = "1", optional = true }
 libc = "0.2"
 users = "0.11"
 
+# For showing a fatal-error MessageBox when GPU init fails. Windows GUI
+# subsystem apps have no attached stderr, so without this the user just
+# sees the window fail to appear with no explanation.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
 [package.metadata.deb]
 maintainer = "Dzmitry Malyshau"
 section = "utils"
