@@ -954,6 +954,7 @@ dependencies = [
  "tar",
  "toml 0.8.23",
  "users",
+ "windows-sys 0.59.0",
  "winit",
  "winresource",
  "zip",

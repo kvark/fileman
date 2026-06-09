@@ -422,6 +422,91 @@ Try one of:\n\
 On Linux in CI or headless environments, Vulkan is often unavailable."
 }
 
+/// Show a fatal error to the user via a native message box, then exit.
+/// Critical for GUI-subsystem apps on Windows that have no attached stderr:
+/// without a dialog the process would just exit silently after a failed
+/// GPU/surface init, with the only diagnostic going nowhere.
+///
+/// Also writes the same text to a crash file in the user's temp dir so a
+/// later session (or a support request) can recover the message.
+fn fatal_error_dialog(title: &str, body: &str) {
+    let full = format!("{title}\n\n{body}");
+    eprintln!("{full}");
+
+    let temp = std::env::temp_dir().join("fileman_crash.txt");
+    let _ = std::fs::write(&temp, &full);
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MB_ICONERROR, MB_OK, MessageBoxW,
+        };
+        // Convert to UTF-16 NUL-terminated for MessageBoxW.
+        let to_wide = |s: &str| -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        };
+        let wide_title = to_wide(title);
+        let wide_body = to_wide(body);
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                wide_body.as_ptr(),
+                wide_title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // AppleScript dialog via osascript — no extra deps.
+        let escaped = body.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display dialog \"{escaped}\" with title \"{title}\" buttons {{\"OK\"}} with icon stop"
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .status();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Try common Linux dialog tools in order. Each takes the body as
+        // an arg or via stdin; if none are present, the eprintln + crash
+        // file above is the only surface — but a terminal user invoking
+        // fileman from a shell will see the eprintln there.
+        let tried = [
+            (
+                "zenity",
+                vec![
+                    "--error".to_string(),
+                    "--title".to_string(),
+                    title.to_string(),
+                    "--text".to_string(),
+                    body.to_string(),
+                ],
+            ),
+            (
+                "kdialog",
+                vec![
+                    "--title".to_string(),
+                    title.to_string(),
+                    "--error".to_string(),
+                    body.to_string(),
+                ],
+            ),
+            (
+                "xmessage",
+                vec!["-center".to_string(), format!("{title}\n\n{body}")],
+            ),
+        ];
+        for (bin, args) in tried {
+            if std::process::Command::new(bin).args(&args).status().is_ok() {
+                break;
+            }
+        }
+    }
+}
+
 /// Path broken into segments for breadcrumb-style header rendering.
 pub struct PathSegments {
     /// Lead-in displayed before the first separator (e.g. "host:", drive
@@ -3249,8 +3334,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             }) {
                 Ok(context) => context,
                 Err(err) => {
-                    eprintln!("Failed to init GPU context: {err:?}");
-                    eprintln!("{}", surface_error_help());
+                    let body = format!(
+                        "Failed to initialize GPU context:\n{err:?}\n\n{}",
+                        surface_error_help()
+                    );
+                    fatal_error_dialog("FileMan: GPU initialization failed", &body);
                     event_loop.exit();
                     return;
                 }
@@ -3269,8 +3357,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let surface = match context.create_surface_configured(&window, surface_config) {
             Ok(surface) => surface,
             Err(err) => {
-                eprintln!("Failed to create GPU surface: {err:?}");
-                eprintln!("{}", surface_error_help());
+                let body = format!(
+                    "Failed to create GPU surface:\n{err:?}\n\n{}",
+                    surface_error_help()
+                );
+                fatal_error_dialog("FileMan: GPU surface creation failed", &body);
                 event_loop.exit();
                 return;
             }
