@@ -1,9 +1,10 @@
 use egui;
-use users;
 
 use fileman::{app_state, core};
 
-use crate::{color32, refresh_active_panel};
+use crate::color32;
+#[cfg(unix)]
+use crate::refresh_active_panel;
 
 pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
     let Some(dialog) = app.props_dialog.as_mut() else {
@@ -18,21 +19,20 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
         egui::Color32::from_black_alpha(140),
     );
 
-    let original_perms = dialog.original.mode & 0o777;
-    let user_changed = dialog.current.user.trim() != dialog.original.user_label;
-    let group_changed = dialog.current.group.trim() != dialog.original.group_label;
-    let changed_color = color32(colors.row_fg_selected);
     let normal_color = color32(colors.row_fg_active);
 
-    let mut action: Option<(&'static str, bool)> = None;
-    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
     let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-    let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
     if escape {
         app.props_dialog = None;
         return;
     }
 
+    #[cfg(unix)]
+    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+
+    #[cfg(unix)]
+    let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+    #[cfg(unix)]
     if tab_pressed {
         if ctx.memory(|mem| mem.has_focus(egui::Id::new("props_owner_user"))) {
             ctx.memory_mut(|mem| mem.request_focus(egui::Id::new("props_owner_group")));
@@ -40,6 +40,17 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
             ctx.memory_mut(|mem| mem.request_focus(egui::Id::new("props_owner_user")));
         }
     }
+
+    #[cfg(unix)]
+    let original_perms = dialog.original.mode & 0o777;
+    #[cfg(unix)]
+    let user_changed = dialog.current.user.trim() != dialog.original.user_label;
+    #[cfg(unix)]
+    let group_changed = dialog.current.group.trim() != dialog.original.group_label;
+    #[cfg(unix)]
+    let changed_color = color32(colors.row_fg_selected);
+
+    let mut action: Option<(&'static str, bool)> = None;
 
     egui::Window::new("Properties")
         .collapsible(false)
@@ -54,86 +65,101 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
                     ui.colored_label(color32(colors.row_fg_inactive), "Type");
-                    ui.colored_label(color32(colors.row_fg_active), &dialog.original.file_type);
+                    ui.colored_label(normal_color, &dialog.original.file_type);
                     ui.end_row();
-                    ui.colored_label(
-                        if user_changed {
-                            changed_color
-                        } else {
-                            normal_color
-                        },
-                        "Owner (user)",
-                    );
-                    let user_response = ui.add(
-                        egui::TextEdit::singleline(&mut dialog.current.user)
-                            .desired_width(220.0)
-                            .id(egui::Id::new("props_owner_user")),
-                    );
-                    ui.end_row();
-                    ui.colored_label(
-                        if group_changed {
-                            changed_color
-                        } else {
-                            normal_color
-                        },
-                        "Owner (group)",
-                    );
-                    let group_response = ui.add(
-                        egui::TextEdit::singleline(&mut dialog.current.group)
-                            .desired_width(220.0)
-                            .id(egui::Id::new("props_owner_group")),
-                    );
-                    if user_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-                        group_response.request_focus();
+
+                    if let Some(size) = dialog.original.size {
+                        ui.colored_label(color32(colors.row_fg_inactive), "Size");
+                        ui.colored_label(normal_color, format_size(size));
+                        ui.end_row();
                     }
-                    ui.end_row();
-                    ui.colored_label(normal_color, "Permissions");
-                    ui.vertical(|ui| {
-                        let perm_colors = PermRowColors {
-                            original_mode: original_perms,
-                            changed_color,
-                            normal_color,
-                        };
-                        egui::Grid::new("perm_grid")
-                            .spacing([8.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.colored_label(color32(colors.row_fg_inactive), "");
-                                ui.label("Read");
-                                ui.label("Write");
-                                ui.label("Exec");
-                                ui.end_row();
-                                perms_row(
-                                    ui,
-                                    "User",
-                                    0o400,
-                                    0o200,
-                                    0o100,
-                                    &mut dialog.current.mode,
-                                    perm_colors,
-                                );
-                                perms_row(
-                                    ui,
-                                    "Group",
-                                    0o040,
-                                    0o020,
-                                    0o010,
-                                    &mut dialog.current.mode,
-                                    perm_colors,
-                                );
-                                perms_row(
-                                    ui,
-                                    "Other",
-                                    0o004,
-                                    0o002,
-                                    0o001,
-                                    &mut dialog.current.mode,
-                                    perm_colors,
-                                );
-                            });
-                    });
-                    ui.end_row();
-                    if user_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-                        group_response.request_focus();
+
+                    if let Some(ts) = dialog.original.modified {
+                        ui.colored_label(color32(colors.row_fg_inactive), "Modified");
+                        ui.colored_label(normal_color, format_timestamp(ts));
+                        ui.end_row();
+                    }
+
+                    #[cfg(unix)]
+                    {
+                        ui.colored_label(
+                            if user_changed {
+                                changed_color
+                            } else {
+                                normal_color
+                            },
+                            "Owner (user)",
+                        );
+                        let user_response = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.current.user)
+                                .desired_width(220.0)
+                                .id(egui::Id::new("props_owner_user")),
+                        );
+                        ui.end_row();
+                        ui.colored_label(
+                            if group_changed {
+                                changed_color
+                            } else {
+                                normal_color
+                            },
+                            "Owner (group)",
+                        );
+                        let group_response = ui.add(
+                            egui::TextEdit::singleline(&mut dialog.current.group)
+                                .desired_width(220.0)
+                                .id(egui::Id::new("props_owner_group")),
+                        );
+                        if user_response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Tab))
+                        {
+                            group_response.request_focus();
+                        }
+                        ui.end_row();
+                        ui.colored_label(normal_color, "Permissions");
+                        ui.vertical(|ui| {
+                            let perm_colors = PermRowColors {
+                                original_mode: original_perms,
+                                changed_color,
+                                normal_color,
+                            };
+                            egui::Grid::new("perm_grid")
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.colored_label(color32(colors.row_fg_inactive), "");
+                                    ui.label("Read");
+                                    ui.label("Write");
+                                    ui.label("Exec");
+                                    ui.end_row();
+                                    perms_row(
+                                        ui,
+                                        "User",
+                                        0o400,
+                                        0o200,
+                                        0o100,
+                                        &mut dialog.current.mode,
+                                        perm_colors,
+                                    );
+                                    perms_row(
+                                        ui,
+                                        "Group",
+                                        0o040,
+                                        0o020,
+                                        0o010,
+                                        &mut dialog.current.mode,
+                                        perm_colors,
+                                    );
+                                    perms_row(
+                                        ui,
+                                        "Other",
+                                        0o004,
+                                        0o002,
+                                        0o001,
+                                        &mut dialog.current.mode,
+                                        perm_colors,
+                                    );
+                                });
+                        });
+                        ui.end_row();
                     }
                 });
             if let Some(error) = dialog.error.as_ref() {
@@ -143,18 +169,22 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                let apply = ui.add(egui::Button::new("Apply").min_size(egui::vec2(110.0, 0.0)));
-                if dialog.original.is_dir {
-                    let recursive =
-                        ui.add(egui::Button::new("Recursive").min_size(egui::vec2(130.0, 0.0)));
-                    if recursive.clicked() {
-                        action = Some(("apply", true));
+                #[cfg(unix)]
+                {
+                    let apply =
+                        ui.add(egui::Button::new("Apply").min_size(egui::vec2(110.0, 0.0)));
+                    if dialog.original.is_dir {
+                        let recursive =
+                            ui.add(egui::Button::new("Recursive").min_size(egui::vec2(130.0, 0.0)));
+                        if recursive.clicked() {
+                            action = Some(("apply", true));
+                        }
+                    }
+                    if apply.clicked() || enter {
+                        action = Some(("apply", false));
                     }
                 }
-                let cancel = ui.add(egui::Button::new("Cancel").min_size(egui::vec2(110.0, 0.0)));
-                if apply.clicked() || enter {
-                    action = Some(("apply", false));
-                }
+                let cancel = ui.add(egui::Button::new("Close").min_size(egui::vec2(110.0, 0.0)));
                 if cancel.clicked() {
                     action = Some(("cancel", false));
                 }
@@ -163,6 +193,7 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
 
     if let Some((what, recursive)) = action {
         match what {
+            #[cfg(unix)]
             "apply" => apply_props_dialog(app, recursive),
             "cancel" => app.props_dialog = None,
             _ => {}
@@ -170,6 +201,55 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
     }
 }
 
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn format_timestamp(secs: u64) -> String {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    let (y, doy) = {
+        let mut y = 1970u64;
+        let mut rem = days;
+        loop {
+            let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+            let year_days = if leap { 366 } else { 365 };
+            if rem < year_days {
+                break (y, rem);
+            }
+            rem -= year_days;
+            y += 1;
+        }
+    };
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let mdays: [u64; 12] = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut mo = 0;
+    let mut d = doy;
+    for (i, &md) in mdays.iter().enumerate() {
+        if d < md {
+            mo = i + 1;
+            break;
+        }
+        d -= md;
+    }
+    format!("{y:04}-{mo:02}-{:02} {h:02}:{m:02}:{s:02}", d + 1)
+}
+
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct PermRowColors {
     original_mode: u32,
@@ -177,6 +257,7 @@ struct PermRowColors {
     normal_color: egui::Color32,
 }
 
+#[cfg(unix)]
 fn perms_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -223,6 +304,7 @@ fn perms_row(
     ui.end_row();
 }
 
+#[cfg(unix)]
 fn apply_props_dialog(app: &mut app_state::AppState, recursive: bool) {
     let Some(dialog) = app.props_dialog.as_mut() else {
         return;
@@ -266,6 +348,7 @@ fn apply_props_dialog(app: &mut app_state::AppState, recursive: bool) {
     refresh_active_panel(app);
 }
 
+#[cfg(unix)]
 fn parse_user_value(input: &str) -> Result<u32, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -279,6 +362,7 @@ fn parse_user_value(input: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("Unknown user: {trimmed}"))
 }
 
+#[cfg(unix)]
 fn parse_group_value(input: &str) -> Result<u32, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {

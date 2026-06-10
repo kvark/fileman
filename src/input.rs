@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use fileman::{app_state, archive, core};
 
-#[cfg(unix)]
 use crate::open_props_dialog;
 use crate::{
     ContainerLoadMode, UiCache, active_window_rows, apply_panel_snapshot, cancel_search,
@@ -574,7 +573,6 @@ pub(crate) fn handle_keyboard(
             ctx.request_repaint();
         }
     }
-    #[cfg(unix)]
     {
         let alt_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter));
         if alt_enter {
