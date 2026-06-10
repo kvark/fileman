@@ -146,7 +146,27 @@ fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
     Some((bavail * frsize).min(u128::from(u64::MAX)) as u64)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+    let mut free_available: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_available, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if ok != 0 { Some(free_available) } else { None }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn free_space_bytes(_path: &std::path::Path) -> Option<u64> {
     None
 }

@@ -91,5 +91,9 @@ vendored-openssl = ["ssh2/vendored-openssl"]
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+[profile.release]
+lto = "thin"
+strip = true
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(gles)'] }

@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use ssh2::{self, Session, Sftp};
+use ssh2::{self, CheckResult, KnownHostFileKind, KnownHostKeyFormat, Session, Sftp};
 
 use crate::core::{DirEntry, EntryLocation};
 
@@ -137,12 +137,75 @@ pub fn parse_ssh_config(content: &str) -> HashMap<String, SshHostConfig> {
 }
 
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}/{rest}");
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return format!("{}/{rest}", home.display());
+        }
     }
     path.to_string()
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .ok()
+            .map(std::path::PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    }
+}
+
+fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<(), String> {
+    let (key, key_type) = session
+        .host_key()
+        .ok_or_else(|| "Server did not provide a host key".to_string())?;
+
+    let mut known_hosts = session
+        .known_hosts()
+        .map_err(|e| format!("Known-hosts init: {e}"))?;
+
+    let kh_path = home_dir()
+        .map(|h| h.join(".ssh").join("known_hosts"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+
+    if kh_path.exists() {
+        let _ = known_hosts.read_file(&kh_path, KnownHostFileKind::OpenSSH);
+    }
+
+    let check = if port == 22 {
+        known_hosts.check(host, key)
+    } else {
+        known_hosts.check_port(host, port, key)
+    };
+
+    match check {
+        CheckResult::Match => Ok(()),
+        CheckResult::Mismatch => Err(format!(
+            "HOST KEY MISMATCH for {host}! The server's key has changed. \
+             This could indicate a man-in-the-middle attack. \
+             If the key change is expected, remove the old entry from {}.",
+            kh_path.display()
+        )),
+        CheckResult::NotFound => {
+            eprintln!("Host key for {host} not found in known_hosts; accepting (TOFU).");
+            let fmt: KnownHostKeyFormat = key_type.into();
+            if known_hosts.add(host, key, host, fmt).is_ok() {
+                if let Some(parent) = kh_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = known_hosts.write_file(&kh_path, KnownHostFileKind::OpenSSH);
+            }
+            Ok(())
+        }
+        CheckResult::Failure => {
+            eprintln!("Known-hosts check failed for {host}; proceeding.");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -222,6 +285,8 @@ pub fn connect(
     session.set_timeout(30_000);
     // SSH-level keepalive: send a probe every 15 seconds, expect a reply.
     session.set_keepalive(true, 15);
+
+    verify_host_key(&session, actual_host, port)?;
 
     // Try ssh-agent first
     if session.userauth_agent(&user).is_ok() && session.authenticated() {

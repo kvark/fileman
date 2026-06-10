@@ -160,10 +160,11 @@ pub fn start_io_worker(
                                 eprintln!("{msg}");
                                 io_result = IOResult::Error(msg);
                             }
-                        } else if let Err(remove_err) = if src.is_dir() {
-                            std::fs::remove_dir_all(&src)
-                        } else {
-                            std::fs::remove_file(&src)
+                        } else if let Err(remove_err) = match std::fs::symlink_metadata(&src) {
+                            Ok(ref m) if m.is_dir() && !m.file_type().is_symlink() => {
+                                std::fs::remove_dir_all(&src)
+                            }
+                            _ => std::fs::remove_file(&src),
                         } {
                             if remove_err.kind() == std::io::ErrorKind::PermissionDenied {
                                 let msg =
@@ -179,16 +180,14 @@ pub fn start_io_worker(
                                 io_result = IOResult::Error(msg);
                             }
                         }
-                        if matches!(io_result, IOResult::Completed) {
-                            eprintln!("Move error (rename failed, copy succeeded): {e}");
-                        }
                     }
                 }
                 IOTask::Delete { target } => {
-                    let res = if target.is_dir() {
-                        std::fs::remove_dir_all(&target)
-                    } else {
-                        std::fs::remove_file(&target)
+                    let res = match std::fs::symlink_metadata(&target) {
+                        Ok(ref m) if m.is_dir() && !m.file_type().is_symlink() => {
+                            std::fs::remove_dir_all(&target)
+                        }
+                        _ => std::fs::remove_file(&target),
                     };
                     if let Err(e) = res {
                         if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -223,7 +222,14 @@ pub fn start_io_worker(
                     }
                 }
                 IOTask::WriteFile { path, contents } => {
-                    if let Err(e) = std::fs::write(&path, &contents) {
+                    let write_result = (|| -> std::io::Result<()> {
+                        use std::io::Write;
+                        let mut f = std::fs::File::create(&path)?;
+                        f.write_all(&contents)?;
+                        f.sync_all()?;
+                        Ok(())
+                    })();
+                    if let Err(e) = write_result {
                         if e.kind() == std::io::ErrorKind::PermissionDenied {
                             let msg = format!("Permission denied: write {}", path.display());
                             eprintln!("{msg}");

@@ -23,27 +23,35 @@ FileMan is a fast, responsive two-panel file manager built with Rust, egui, and 
 | Shift+Enter | Open with system default app |
 | Tab / Ctrl+I | Switch panels |
 | Ctrl+U | Swap panels |
+| Ctrl+T | New tab |
+| Ctrl+W | Close tab |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Alt+Left / Alt+Right | Back / forward |
 | Backspace / Ctrl+PgUp | Parent folder |
 | Ctrl+PgDn | Open selected |
 | Ctrl+Left / Ctrl+Right | Open selected dir in other panel |
 | F1 | Help |
+| F2 / Ctrl+R | Refresh |
 | F3 | Preview |
+| Ctrl+F | Find in preview |
 | F4 | Edit |
 | Shift+F4 | New file |
-| F7 | New directory |
-| Insert | Mark / unmark |
-| Shift+F6 | Rename |
+| Alt+F5 | Pack (create archive) |
 | F5 | Copy |
 | F6 | Move |
+| Shift+F6 | Rename |
+| F7 | New directory |
+| Alt+F7 | Search by name |
+| Shift+Alt+F7 | Search by content |
 | F8 | Delete |
-| Space | Compute folder size |
-| Alt+F7 | Search |
-| Alt+Enter | Properties |
-| Ctrl+R | Refresh |
-| Ctrl+G | Quick jump |
 | F9 | Toggle theme |
 | F10 | Theme picker |
+| Insert | Mark / unmark |
+| Space | Compute folder size |
+| Alt+Enter | Properties |
+| Ctrl+G | Quick jump |
+| Ctrl+Shift+C | Copy path to clipboard |
+| Ctrl+, | Settings |
 
 ## Build and Run
 ```bash
