@@ -29,6 +29,32 @@ type RemoteDirSizeChannels = (
     mpsc::Receiver<(String, String, u64)>,
 );
 
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn with_sftp<F, R>(sessions: &SftpSessions, host: &str, f: F) -> Result<R, String>
+where
+    F: FnOnce(&ssh2::Sftp) -> Result<R, String>,
+{
+    with_sftp_session(sessions, host, |s| f(&s.sftp))
+}
+
+fn with_sftp_session<F, R>(sessions: &SftpSessions, host: &str, f: F) -> Result<R, String>
+where
+    F: FnOnce(&SftpSession) -> Result<R, String>,
+{
+    let session_arc = lock_or_recover(sessions)
+        .get(host)
+        .cloned()
+        .ok_or_else(|| format!("No SFTP session for host: {host}"))?;
+    let locked = lock_or_recover(&session_arc);
+    f(&locked)
+}
+
 const PREVIEW_CHUNK_BYTES: usize = 16 * 1024;
 
 pub fn start_io_worker(
@@ -311,17 +337,12 @@ pub fn start_io_worker(
                     contents,
                 } => {
                     let mut err_msg = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
-                        if let Err(e) = crate::sftp::write_file(&locked.sftp, &path, &contents) {
-                            let msg = format!("Remote write error: {e}");
-                            eprintln!("{msg}");
-                            err_msg = Some(msg);
-                        }
-                    } else {
-                        let msg = format!("No SFTP session for host: {host}");
-                        eprintln!("{msg}");
-                        err_msg = Some(msg);
+                    if let Err(e) = with_sftp(&sftp_sessions, &host, |sftp| {
+                        crate::sftp::write_file(sftp, &path, &contents)
+                            .map_err(|e| format!("Remote write error: {e}"))
+                    }) {
+                        eprintln!("{e}");
+                        err_msg = Some(e);
                     }
                     io_result = if let Some(msg) = err_msg {
                         IOResult::ErrorRemote(host, msg)
@@ -337,8 +358,8 @@ pub fn start_io_worker(
                     is_dir,
                 } => {
                     let mut err_msg: Option<String> = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
+                    if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
+                        let locked = lock_or_recover(&session);
                         let result = if is_dir {
                             let total =
                                 crate::sftp::count_bytes_via_exec(&locked.session, &remote_path);
@@ -384,8 +405,8 @@ pub fn start_io_worker(
                     is_dir,
                 } => {
                     let mut err_msg: Option<String> = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
+                    if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
+                        let locked = lock_or_recover(&session);
                         let result = if is_dir {
                             let total = crate::sftp::count_bytes_local(&src);
                             transfer_progress.reset(total);
@@ -433,8 +454,8 @@ pub fn start_io_worker(
                 }
                 IOTask::DeleteRemote { host, items } => {
                     let mut err_msg = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
+                    if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
+                        let locked = lock_or_recover(&session);
                         for item in items.iter() {
                             if let Err(e) = crate::sftp::recursive_delete(
                                 &locked.sftp,
@@ -464,8 +485,8 @@ pub fn start_io_worker(
                     new_name,
                 } => {
                     let mut err_msg = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
+                    if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
+                        let locked = lock_or_recover(&session);
                         let parent = if let Some(pos) = src.rfind('/') {
                             &src[..pos]
                         } else {
@@ -494,8 +515,8 @@ pub fn start_io_worker(
                 }
                 IOTask::MkdirRemote { host, path } => {
                     let mut err_msg = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
+                    if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
+                        let locked = lock_or_recover(&session);
                         if let Err(e) = crate::sftp::mkdir(&locked.sftp, &path) {
                             let msg = format!("Remote mkdir error: {e}");
                             eprintln!("{msg}");
@@ -518,8 +539,8 @@ pub fn start_io_worker(
                     local_path,
                 } => {
                     let mut err_msg: Option<String> = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
+                    if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
+                        let locked = lock_or_recover(&session);
                         match crate::sftp::copy_remote_to_local_progress(
                             &locked.sftp,
                             &remote_path,
@@ -552,8 +573,8 @@ pub fn start_io_worker(
                     name,
                 } => {
                     let mut err_msg = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
+                    if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
+                        let locked = lock_or_recover(&session);
                         if let Err(e) = crate::sftp::recursive_copy_remote(
                             &locked.sftp,
                             &src_path,
@@ -582,8 +603,8 @@ pub fn start_io_worker(
                     name,
                 } => {
                     let mut err_msg = None;
-                    if let Some(session) = sftp_sessions.lock().unwrap().get(&host).cloned() {
-                        let locked = session.lock().unwrap();
+                    if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
+                        let locked = lock_or_recover(&session);
                         let dst_path = format!("{}/{}", dst_dir.trim_end_matches('/'), name);
                         if let Err(e) = crate::sftp::rename(&locked.sftp, &src_path, &dst_path) {
                             let msg = format!("Remote move error: {e}");
@@ -628,15 +649,15 @@ pub fn start_io_worker(
                     name,
                     is_dir: _,
                 } => {
-                    let sessions = sftp_sessions.lock().unwrap();
+                    let sessions = lock_or_recover(&sftp_sessions);
                     let src_session = sessions.get(&src_host).cloned();
                     let dst_session = sessions.get(&dst_host).cloned();
                     drop(sessions);
                     let mut err_msg: Option<String> = None;
                     match (src_session, dst_session) {
                         (Some(src_arc), Some(dst_arc)) => {
-                            let src_locked = src_arc.lock().unwrap();
-                            let dst_locked = dst_arc.lock().unwrap();
+                            let src_locked = lock_or_recover(&src_arc);
+                            let dst_locked = lock_or_recover(&dst_arc);
                             transfer_progress.reset(0);
                             if let Err(e) = crate::sftp::copy_cross_host_via_tar(
                                 &src_locked.session,
@@ -842,9 +863,9 @@ pub fn start_preview_worker(
                         }
                         EntryLocation::Remote { host, path } => {
                             let force_text = is_text_name(&path);
-                            let session = sftp_sessions.lock().unwrap().get(&host).cloned();
+                            let session = lock_or_recover(&sftp_sessions).get(&host).cloned();
                             if let Some(session) = session {
-                                let locked = session.lock().unwrap();
+                                let locked = lock_or_recover(&session);
                                 match crate::sftp::open_remote_reader(&locked.sftp, &path) {
                                     Ok(reader) => {
                                         if let Err(err) = send_streaming_preview(
@@ -1437,7 +1458,7 @@ fn run_remote_search(
         }
     };
 
-    let session_arc = match sftp_sessions.lock().unwrap().get(host).cloned() {
+    let session_arc = match lock_or_recover(sftp_sessions).get(host).cloned() {
         Some(arc) => arc,
         None => {
             let _ = result_tx.send(SearchEvent::Error {
@@ -1453,7 +1474,7 @@ fn run_remote_search(
     };
 
     let cmd = build_remote_search_cmd(remote_root, &request.needle, request.case, request.mode);
-    let locked = session_arc.lock().unwrap();
+    let locked = lock_or_recover(&session_arc);
 
     let mut channel = match locked.session.channel_session() {
         Ok(ch) => ch,
@@ -1547,9 +1568,9 @@ pub fn start_remote_dir_size_worker(
     thread::spawn(move || {
         while let Ok((host, path)) = rx.recv() {
             let size = {
-                let session_arc = sftp_sessions.lock().unwrap().get(&host).cloned();
+                let session_arc = lock_or_recover(&sftp_sessions).get(&host).cloned();
                 if let Some(arc) = session_arc {
-                    let locked = arc.lock().unwrap();
+                    let locked = lock_or_recover(&arc);
                     crate::sftp::count_bytes_via_exec(&locked.session, &path)
                 } else {
                     0

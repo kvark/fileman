@@ -1111,7 +1111,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
     if !stale_sessions.is_empty() {
         let mut removed = Vec::new();
         {
-            let mut shared = app.sftp_sessions_shared.lock().unwrap();
+            let mut shared = app.sftp_sessions_shared.lock().unwrap_or_else(|p| p.into_inner());
             for host in stale_sessions {
                 if let Some(s) = app.sftp_sessions.remove(&host) {
                     removed.push(s);
@@ -1135,7 +1135,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
             && let Some(shared) = app.archive_index.get(archive_path).cloned()
         {
             let (entry_count, complete, root) = {
-                let idx = shared.lock().unwrap();
+                let idx = shared.lock().unwrap_or_else(|p| p.into_inner());
                 (idx.entries.len(), idx.complete, idx.root.clone())
             };
             let panel = app.panel_mut(side);
@@ -1151,7 +1151,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 {
                     let cwd = cwd.clone();
                     let archive_path = archive_path.clone();
-                    let idx = shared.lock().unwrap();
+                    let idx = shared.lock().unwrap_or_else(|p| p.into_inner());
                     let mut listing = build_listing_from_index(&idx, &archive_path, kind, &cwd);
                     drop(idx);
                     sort_entries(&mut listing, browser.sort_mode, browser.sort_desc);
@@ -1788,7 +1788,7 @@ fn spawn_sftp_load_thread(
     atomic: bool,
 ) {
     thread::spawn(move || {
-        let locked = session.lock().unwrap();
+        let locked = session.lock().unwrap_or_else(|p| p.into_inner());
         let mut buffered: Vec<core::DirEntry> = Vec::new();
         let mut first = true;
         let result = fileman::sftp::read_directory_streaming(
@@ -2443,7 +2443,7 @@ fn load_container_directory_async(
     let mut used_index = false;
     let mut watching = false;
     if !skip_loading && let Some(shared) = app.archive_index.get(&archive_path).cloned() {
-        let idx = shared.lock().unwrap();
+        let idx = shared.lock().unwrap_or_else(|p| p.into_inner());
         let mut listing = build_listing_from_index(&idx, &archive_path, kind, &cwd);
         let browser = app.panel(target_panel).browser();
         sort_entries(&mut listing, browser.sort_mode, browser.sort_desc);
@@ -2533,7 +2533,7 @@ fn load_container_directory_async(
                 if batch.is_empty() {
                     return;
                 }
-                let mut idx = shared.lock().unwrap();
+                let mut idx = shared.lock().unwrap_or_else(|p| p.into_inner());
                 idx.entries.append(batch);
                 if idx.root.is_none() && root.is_some() {
                     idx.root = root.clone();
@@ -2651,7 +2651,7 @@ fn load_container_directory_async(
             };
 
             if indexing_result.is_err() {
-                let mut idx = shared.lock().unwrap();
+                let mut idx = shared.lock().unwrap_or_else(|p| p.into_inner());
                 idx.complete = true;
                 if let Some(ref wake) = wake {
                     wake();
@@ -2669,7 +2669,7 @@ fn load_container_directory_async(
 
             // Mark complete
             {
-                let mut idx = shared.lock().unwrap();
+                let mut idx = shared.lock().unwrap_or_else(|p| p.into_inner());
                 if idx.root.is_none() && implicit_root.is_some() {
                     idx.root = implicit_root;
                 }
@@ -2691,7 +2691,7 @@ fn load_container_directory_async(
     let index_entry_count = if used_index || watching {
         app.archive_index
             .get(&archive_path)
-            .map(|shared| shared.lock().unwrap().entries.len())
+            .map(|shared| shared.lock().unwrap_or_else(|p| p.into_inner()).entries.len())
             .unwrap_or(0)
     } else {
         0
@@ -3499,9 +3499,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 // can be sent before the full file has downloaded.
                 if let ImageSource::Remote { ref host, ref path } = req.source {
                     let key = req.key.clone();
-                    let session = image_sftp.lock().unwrap().get(host).cloned();
+                    let session = image_sftp.lock().unwrap_or_else(|p| p.into_inner()).get(host).cloned();
                     let data = session.and_then(|s| {
-                        let locked = s.lock().unwrap();
+                        let locked = s.lock().unwrap_or_else(|p| p.into_inner());
                         let stat = locked.sftp.stat(std::path::Path::new(path)).ok();
                         image_progress.reset(stat.and_then(|s| s.size).unwrap_or(0));
                         let mut file =
@@ -3703,10 +3703,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             thread::spawn(move || {
                 while let Ok(req) = edit_rx.recv() {
                     let text = if let Some((host, remote_path)) = req.remote {
-                        let session = sftp_sessions.lock().unwrap().get(&host).cloned();
+                        let session = sftp_sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&host).cloned();
                         match session {
                             Some(session) => {
-                                let locked = session.lock().unwrap();
+                                let locked = session.lock().unwrap_or_else(|p| p.into_inner());
                                 match fileman::sftp::read_file_full(&locked.sftp, &remote_path) {
                                     Ok(bytes) => match String::from_utf8(bytes) {
                                         Ok(text) => text,
