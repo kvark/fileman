@@ -242,10 +242,10 @@ fn cursor_row_col(text: &str, cursor: usize) -> (usize, usize) {
     (row, col)
 }
 
-static SYNTAX_SET: once_cell::sync::Lazy<syntect::parsing::SyntaxSet> =
-    once_cell::sync::Lazy::new(syntect::parsing::SyntaxSet::load_defaults_newlines);
-static THEME_SET: once_cell::sync::Lazy<syntect::highlighting::ThemeSet> =
-    once_cell::sync::Lazy::new(syntect::highlighting::ThemeSet::load_defaults);
+static SYNTAX_SET: std::sync::LazyLock<syntect::parsing::SyntaxSet> =
+    std::sync::LazyLock::new(syntect::parsing::SyntaxSet::load_defaults_newlines);
+static THEME_SET: std::sync::LazyLock<syntect::highlighting::ThemeSet> =
+    std::sync::LazyLock::new(syntect::highlighting::ThemeSet::load_defaults);
 
 fn apply_theme(ctx: &egui::Context, colors: &theme::ThemeColors) {
     let mut style = (*ctx.global_style()).clone();
