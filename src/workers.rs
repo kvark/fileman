@@ -943,13 +943,26 @@ pub fn start_dir_size_worker(
 ) -> (mpsc::Sender<PathBuf>, mpsc::Receiver<(PathBuf, u64)>) {
     let (tx, rx) = mpsc::channel::<PathBuf>();
     let (result_tx, result_rx) = mpsc::channel::<(PathBuf, u64)>();
+    let max_concurrent = 4usize;
     thread::spawn(move || {
+        let mut active: Vec<thread::JoinHandle<()>> = Vec::new();
         while let Ok(path) = rx.recv() {
-            let size = compute_dir_size(&path);
-            let _ = result_tx.send((path, size));
-            if let Some(ref wake) = wake {
-                wake();
+            active.retain(|h| !h.is_finished());
+            if active.len() >= max_concurrent {
+                let _ = active.remove(0).join();
             }
+            let result_tx = result_tx.clone();
+            let wake = wake.clone();
+            active.push(thread::spawn(move || {
+                let size = compute_dir_size(&path);
+                let _ = result_tx.send((path, size));
+                if let Some(ref w) = wake {
+                    w();
+                }
+            }));
+        }
+        for handle in active {
+            let _ = handle.join();
         }
     });
     (tx, result_rx)
@@ -1565,21 +1578,35 @@ pub fn start_remote_dir_size_worker(
 ) -> RemoteDirSizeChannels {
     let (tx, rx) = mpsc::channel::<(String, String)>();
     let (result_tx, result_rx) = mpsc::channel::<(String, String, u64)>();
+    let max_concurrent = 4usize;
     thread::spawn(move || {
+        let mut active: Vec<thread::JoinHandle<()>> = Vec::new();
         while let Ok((host, path)) = rx.recv() {
-            let size = {
-                let session_arc = lock_or_recover(&sftp_sessions).get(&host).cloned();
-                if let Some(arc) = session_arc {
-                    let locked = lock_or_recover(&arc);
-                    crate::sftp::count_bytes_via_exec(&locked.session, &path)
-                } else {
-                    0
-                }
-            };
-            let _ = result_tx.send((host, path, size));
-            if let Some(ref w) = wake {
-                w();
+            active.retain(|h| !h.is_finished());
+            if active.len() >= max_concurrent {
+                let _ = active.remove(0).join();
             }
+            let sessions = sftp_sessions.clone();
+            let result_tx = result_tx.clone();
+            let wake = wake.clone();
+            active.push(thread::spawn(move || {
+                let size = {
+                    let session_arc = lock_or_recover(&sessions).get(&host).cloned();
+                    if let Some(arc) = session_arc {
+                        let locked = lock_or_recover(&arc);
+                        crate::sftp::count_bytes_via_exec(&locked.session, &path)
+                    } else {
+                        0
+                    }
+                };
+                let _ = result_tx.send((host, path, size));
+                if let Some(ref w) = wake {
+                    w();
+                }
+            }));
+        }
+        for handle in active {
+            let _ = handle.join();
         }
     });
     (tx, result_rx)
