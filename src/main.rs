@@ -3180,6 +3180,17 @@ fn open_props_dialog(app: &mut app_state::AppState) {
         .map(|group| group.name().to_string_lossy().into_owned())
         .unwrap_or_else(|| gid.to_string());
 
+    let size = if meta.is_file() {
+        Some(meta.len())
+    } else {
+        None
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
     app.props_dialog = Some(app_state::PropsDialog {
         target: path.clone(),
         original: app_state::FileProps {
@@ -3190,6 +3201,8 @@ fn open_props_dialog(app: &mut app_state::AppState) {
             is_dir,
             user_label: user_label.clone(),
             group_label: group_label.clone(),
+            size,
+            modified,
         },
         current: app_state::FilePropsEdit {
             mode: mode & 0o777,
@@ -3200,7 +3213,6 @@ fn open_props_dialog(app: &mut app_state::AppState) {
     });
 }
 
-#[cfg(unix)]
 fn file_type_label(meta: &std::fs::Metadata) -> String {
     let file_type = meta.file_type();
     if file_type.is_dir() {
@@ -3209,17 +3221,78 @@ fn file_type_label(meta: &std::fs::Metadata) -> String {
         "Regular file".to_string()
     } else if file_type.is_symlink() {
         "Symlink".to_string()
-    } else if file_type.is_block_device() {
-        "Block device".to_string()
-    } else if file_type.is_char_device() {
-        "Character device".to_string()
-    } else if file_type.is_fifo() {
-        "FIFO".to_string()
-    } else if file_type.is_socket() {
-        "Socket".to_string()
     } else {
+        #[cfg(unix)]
+        {
+            if file_type.is_block_device() {
+                return "Block device".to_string();
+            }
+            if file_type.is_char_device() {
+                return "Character device".to_string();
+            }
+            if file_type.is_fifo() {
+                return "FIFO".to_string();
+            }
+            if file_type.is_socket() {
+                return "Socket".to_string();
+            }
+        }
         "Unknown".to_string()
     }
+}
+
+#[cfg(not(unix))]
+fn open_props_dialog(app: &mut app_state::AppState) {
+    let panel = app.get_active_panel();
+    let browser = panel.browser();
+    if browser.entries.is_empty() {
+        return;
+    }
+    let entry = &browser.entries[browser.selected_index];
+    if entry.name == ".." {
+        return;
+    }
+    let core::EntryLocation::Fs(path) = &entry.location else {
+        return;
+    };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to read metadata: {e}");
+            return;
+        }
+    };
+    let file_type = file_type_label(&meta);
+    let size = if meta.is_file() {
+        Some(meta.len())
+    } else {
+        None
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    app.props_dialog = Some(app_state::PropsDialog {
+        target: path.clone(),
+        original: app_state::FileProps {
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            file_type,
+            is_dir: meta.is_dir(),
+            user_label: String::new(),
+            group_label: String::new(),
+            size,
+            modified,
+        },
+        current: app_state::FilePropsEdit {
+            mode: 0,
+            user: String::new(),
+            group: String::new(),
+        },
+        error: None,
+    });
 }
 
 struct Runtime {
@@ -4388,7 +4461,6 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     {
                         ui::modals::draw_discard_modal(&ctx, &mut runtime.app);
                     }
-                    #[cfg(unix)]
                     if runtime.app.props_dialog.is_some() {
                         ui::props_dialog::draw_props_modal(&ctx, &mut runtime.app);
                     }
@@ -4924,7 +4996,6 @@ fn draw_root_ui(render: UiRender<'_>) {
     {
         ui::modals::draw_discard_modal(&ctx, app);
     }
-    #[cfg(unix)]
     if app.props_dialog.is_some() {
         ui::props_dialog::draw_props_modal(&ctx, app);
     }

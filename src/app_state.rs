@@ -105,6 +105,8 @@ pub struct FileProps {
     pub is_dir: bool,
     pub user_label: String,
     pub group_label: String,
+    pub size: Option<u64>,
+    pub modified: Option<u64>,
 }
 
 pub struct FilePropsEdit {
