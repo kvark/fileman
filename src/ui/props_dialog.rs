@@ -1,10 +1,12 @@
 use egui;
 
-use fileman::{app_state, core};
+use fileman::app_state;
 
 use crate::color32;
 #[cfg(unix)]
 use crate::refresh_active_panel;
+#[cfg(unix)]
+use fileman::core;
 
 pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
     let Some(dialog) = app.props_dialog.as_mut() else {
@@ -191,13 +193,12 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
             });
         });
 
-    if let Some((what, recursive)) = action {
-        match what {
-            #[cfg(unix)]
-            "apply" => apply_props_dialog(app, recursive),
-            "cancel" => app.props_dialog = None,
-            _ => {}
-        }
+    #[cfg(unix)]
+    if let Some(("apply", recursive)) = action {
+        apply_props_dialog(app, recursive);
+    }
+    if let Some(("cancel", _)) = action {
+        app.props_dialog = None;
     }
 }
 
