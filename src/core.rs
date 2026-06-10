@@ -440,20 +440,46 @@ pub enum SearchEvent {
 }
 
 pub fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {
+    let src_name = src
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?;
+
+    // Prevent copying a directory into itself (infinite recursion / disk fill).
     if src.is_dir() {
-        let dest = dst_dir.join(src.file_name().unwrap());
+        if let (Ok(canon_src), Ok(canon_dst)) = (src.canonicalize(), dst_dir.canonicalize()) {
+            if canon_dst.starts_with(&canon_src) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot copy a directory into itself",
+                ));
+            }
+        }
+    }
+
+    let meta = fs::symlink_metadata(src)?;
+
+    if meta.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            let target = fs::read_link(src)?;
+            let dest = dst_dir.join(src_name);
+            std::os::unix::fs::symlink(&target, &dest)?;
+        }
+        #[cfg(not(unix))]
+        {
+            // On Windows, copy the target rather than recreating the link.
+            let dest = dst_dir.join(src_name);
+            fs::copy(src, &dest)?;
+        }
+    } else if meta.is_dir() {
+        let dest = dst_dir.join(src_name);
         fs::create_dir_all(&dest)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                copy_recursively(&path, &dest)?;
-            } else {
-                fs::copy(&path, dest.join(entry.file_name()))?;
-            }
+            copy_recursively(&entry.path(), &dest)?;
         }
     } else {
-        let dest = dst_dir.join(src.file_name().unwrap());
+        let dest = dst_dir.join(src_name);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }

@@ -27,7 +27,7 @@ pub fn draw_command_bar(ui: &mut egui::Ui, app: &app_state::AppState, colors: &t
                         draw_key_cap(ui, k!("F1", "^H"), "Help", colors);
                         draw_key_cap(ui, k!("F2", "^R"), "Refresh", colors);
                         let (mut f3, f4, mut f5, mut f6, f7, f8) = if modifiers.alt {
-                            ("", "", "Pack", "Unpack", "Search", "Command")
+                            ("", "", "Pack", "Unpack", "Search", "")
                         } else if modifiers.shift {
                             ("", "New", "Copy", "Rename", "", "")
                         } else {

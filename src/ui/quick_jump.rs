@@ -172,10 +172,20 @@ fn refilter(qj: &mut app_state::QuickJumpState) {
 }
 
 fn expand_tilde(input: &str) -> String {
-    if (input.starts_with("~/") || input == "~")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return input.replacen('~', &home, 1);
+    if input.starts_with("~/") || input == "~" {
+        let home = {
+            #[cfg(windows)]
+            {
+                std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()
+            }
+            #[cfg(not(windows))]
+            {
+                std::env::var("HOME").ok()
+            }
+        };
+        if let Some(h) = home {
+            return input.replacen('~', &h, 1);
+        }
     }
     input.to_string()
 }
