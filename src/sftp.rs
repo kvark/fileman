@@ -753,13 +753,15 @@ pub fn copy_local_dir_to_remote_via_tar(
         Err(e) => return Err(format!("tar create: {e}")),
     }
 
-    dst_ch.send_eof().map_err(|e| format!("send_eof: {e}"))?;
-    dst_ch
-        .wait_close()
-        .map_err(|e| format!("dst wait_close: {e}"))?;
-    let exit = dst_ch.exit_status().unwrap_or(-1);
+    let (exit, stderr) = finalize_writing_channel(&mut dst_ch)
+        .map_err(|e| format!("dst {e}"))?;
     if exit != 0 {
-        return Err(format!("remote tar xf exited with status {exit}"));
+        let tail = stderr.trim();
+        return if tail.is_empty() {
+            Err(format!("remote tar xf exited with status {exit}"))
+        } else {
+            Err(format!("remote tar xf exited with status {exit}: {tail}"))
+        };
     }
     Ok(())
 }
@@ -767,6 +769,41 @@ pub fn copy_local_dir_to_remote_via_tar(
 /// Shell-quote a string with single quotes, escaping any internal single quotes.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Properly tear down a libssh2 exec channel after the local end is done
+/// writing. libssh2's `wait_close()` precondition is `channel->remote.eof`
+/// — it returns LIBSSH2_ERROR_INVAL (-34) with the message
+/// "libssh2_channel_wait_closed() invoked when channel is not in EOF state"
+/// when the remote hasn't sent its EOF yet.
+///
+/// To force that EOF: send our own EOF, then drain stdout (and stderr) until
+/// the remote naturally closes its end. read_to_end returning Ok(0) is the
+/// signal that the remote side has sent SSH_MSG_CHANNEL_EOF, which sets
+/// `remote.eof` and unblocks wait_close. Only then do we wait_close and
+/// pull exit_status.
+///
+/// Captures whatever the command printed to stderr so the caller can fold
+/// it into an error message — tar emits useful diagnostics there.
+fn finalize_writing_channel(ch: &mut ssh2::Channel) -> Result<(i32, String), String> {
+    ch.send_eof().map_err(|e| format!("send_eof: {e}"))?;
+    let mut stdout = Vec::new();
+    let _ = ch.read_to_end(&mut stdout);
+    let mut stderr = String::new();
+    let _ = ch.stderr().read_to_string(&mut stderr);
+    ch.wait_close().map_err(|e| format!("wait_close: {e}"))?;
+    Ok((ch.exit_status().unwrap_or(-1), stderr))
+}
+
+/// Same as `finalize_writing_channel` but for read-only / no-stdin commands
+/// like `mv`. Skips the `send_eof` step (we never wrote anything to drain).
+fn finalize_readonly_channel(ch: &mut ssh2::Channel) -> Result<(i32, String), String> {
+    let mut stdout = Vec::new();
+    let _ = ch.read_to_end(&mut stdout);
+    let mut stderr = String::new();
+    let _ = ch.stderr().read_to_string(&mut stderr);
+    ch.wait_close().map_err(|e| format!("wait_close: {e}"))?;
+    Ok((ch.exit_status().unwrap_or(-1), stderr))
 }
 
 /// Return the total byte size of a remote path via SSH exec.
@@ -902,13 +939,15 @@ pub fn copy_cross_host_via_tar(
     src_session.set_timeout(30_000);
     dst_session.set_timeout(30_000);
 
-    dst_ch.send_eof().map_err(|e| format!("send_eof: {e}"))?;
-    dst_ch
-        .wait_close()
-        .map_err(|e| format!("dst wait_close: {e}"))?;
-    let exit = dst_ch.exit_status().unwrap_or(-1);
+    let (exit, stderr) = finalize_writing_channel(&mut dst_ch)
+        .map_err(|e| format!("dst {e}"))?;
     if exit != 0 {
-        return Err(format!("tar xzf exited with status {exit}"));
+        let tail = stderr.trim();
+        return if tail.is_empty() {
+            Err(format!("tar xzf exited with status {exit}"))
+        } else {
+            Err(format!("tar xzf exited with status {exit}: {tail}"))
+        };
     }
 
     // Rename on destination if the target name differs from the source name.
@@ -922,12 +961,15 @@ pub fn copy_cross_host_via_tar(
             .channel_session()
             .map_err(|e| format!("mv channel: {e}"))?;
         mv_ch.exec(&mv_cmd).map_err(|e| format!("mv exec: {e}"))?;
-        mv_ch
-            .wait_close()
-            .map_err(|e| format!("mv wait_close: {e}"))?;
-        let mv_exit = mv_ch.exit_status().unwrap_or(-1);
+        let (mv_exit, mv_stderr) =
+            finalize_readonly_channel(&mut mv_ch).map_err(|e| format!("mv {e}"))?;
         if mv_exit != 0 {
-            return Err(format!("mv exited with status {mv_exit}"));
+            let tail = mv_stderr.trim();
+            return if tail.is_empty() {
+                Err(format!("mv exited with status {mv_exit}"))
+            } else {
+                Err(format!("mv exited with status {mv_exit}: {tail}"))
+            };
         }
     }
 
