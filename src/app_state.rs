@@ -1554,7 +1554,10 @@ impl AppState {
                 if skip_types.contains(&fs_type) {
                     continue;
                 }
-                if skip_paths.iter().any(|p| mount_point.starts_with(p)) {
+                // udisks2 mounts removable drives under /run/media/<user>/<label> —
+                // keep those even though /run itself is skipped.
+                let is_removable = mount_point.starts_with("/run/media/");
+                if !is_removable && skip_paths.iter().any(|p| mount_point.starts_with(p)) {
                     continue;
                 }
                 let mp = path::PathBuf::from(mount_point);

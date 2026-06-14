@@ -1094,7 +1094,7 @@ mod fuzz {
         ];
         let key = (*rng.pick(KEYS)).to_string();
         // Occasionally inject Ctrl+ shortcuts
-        let modifiers = if rng.next() % 10 == 0 {
+        let modifiers = if rng.next().is_multiple_of(10) {
             vec!["Ctrl".to_string()]
         } else {
             Vec::new()
