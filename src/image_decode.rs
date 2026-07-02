@@ -24,6 +24,16 @@ pub fn is_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8
 }
 
+/// Upper bound on decoded pixel count for the preview decoders that allocate
+/// straight from header dimensions. A crafted header can claim up to
+/// 65535×65535; without this cap that is a multi-gigabyte allocation / OOM from
+/// merely previewing a tiny malicious file.
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+
+fn dimensions_ok(width: usize, height: usize) -> bool {
+    width != 0 && height != 0 && (width as u64) * (height as u64) <= MAX_IMAGE_PIXELS
+}
+
 /// Extract the EXIF thumbnail — near-instant, ~160×120.
 pub fn decode_jpeg_exif_thumbnail(
     bytes: &[u8],
@@ -47,7 +57,7 @@ pub fn decode_gif_first_frame(
     let mut decoder = options.read_info(cursor).ok()?;
     let screen_w = decoder.width() as usize;
     let screen_h = decoder.height() as usize;
-    if screen_w == 0 || screen_h == 0 {
+    if !dimensions_ok(screen_w, screen_h) {
         return None;
     }
     let frame = decoder.read_next_frame().ok()??;
@@ -146,7 +156,7 @@ fn decode_gif_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
     let mut decoder = options.read_info(cursor).ok()?;
     let screen_w = decoder.width() as usize;
     let screen_h = decoder.height() as usize;
-    if screen_w == 0 || screen_h == 0 {
+    if !dimensions_ok(screen_w, screen_h) {
         return None;
     }
 
@@ -236,12 +246,15 @@ fn decode_gif_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
 fn decode_webp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageMeta)> {
     let cursor = io::Cursor::new(bytes);
     let mut decoder = image_webp::WebPDecoder::new(cursor).ok()?;
-    let size = decoder.output_buffer_size()?;
-    let mut data = vec![0u8; size];
-    decoder.read_image(&mut data).ok()?;
     let (width, height) = decoder.dimensions();
     let width = width as usize;
     let height = height as usize;
+    if !dimensions_ok(width, height) {
+        return None;
+    }
+    let size = decoder.output_buffer_size()?;
+    let mut data = vec![0u8; size];
+    decoder.read_image(&mut data).ok()?;
     let has_alpha = decoder.has_alpha();
     let rgba = if has_alpha {
         data
@@ -270,7 +283,7 @@ fn decode_dds_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
     let size = decoder.main_size();
     let width = size.width as usize;
     let height = size.height as usize;
-    if width == 0 || height == 0 {
+    if !dimensions_ok(width, height) {
         return None;
     }
     let pixel_count = width.checked_mul(height)?;
@@ -315,7 +328,7 @@ fn decode_hdr_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
         _ => return None,
     };
 
-    if width == 0 || height == 0 {
+    if !dimensions_ok(width, height) {
         return None;
     }
 
@@ -448,7 +461,7 @@ fn decode_tga_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, ImageM
     let descriptor = bytes[17];
     let top_origin = descriptor & 0x20 != 0;
 
-    if width == 0 || height == 0 {
+    if !dimensions_ok(width, height) {
         return None;
     }
 
