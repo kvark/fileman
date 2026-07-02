@@ -107,12 +107,20 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path target/release/fileman.exe -DestinationPath dist/fileman-windows-x86_64.zip
 
+      - name: Install WiX Toolset (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: choco install wixtoolset --version 3.11.2 -y --no-progress
+
       - name: Package MSI (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          cargo install cargo-wix
-          cargo wix init --force -B target/release/fileman.exe
+          cargo install cargo-wix --version 0.3 --locked
+          # Build the MSI from the committed wix/main.wxs. Do NOT run
+          # `cargo wix init --force`, which regenerates main.wxs from the stock
+          # template and discards the checked-in Start-Menu shortcut, ARP icon,
+          # and dialog customizations.
           cargo wix --no-build --nocapture
           Copy-Item target/wix/*.msi dist/
 
