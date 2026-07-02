@@ -1363,8 +1363,9 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         app_state::SearchStatus::Idle => None,
                     };
                     let search_host = app.search_remote_host.clone();
-                    let panel = app.get_active_panel_mut();
-                    let browser = panel.browser_mut();
+                    let Some(browser) = app.search_target_browser_mut() else {
+                        continue;
+                    };
                     let app_state::BrowserState {
                         browser_mode: ref mode,
                         ..
@@ -1417,17 +1418,19 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
             core::SearchEvent::Progress { id, progress } => {
                 if id == app.search_request_id {
                     app.search_status = app_state::SearchStatus::Running(progress);
-                    let panel = app.get_active_panel_mut();
-                    panel.browser_mut().progress_override =
-                        Some((progress.matched, Some(progress.scanned)));
+                    if let Some(browser) = app.search_target_browser_mut() {
+                        browser.progress_override =
+                            Some((progress.matched, Some(progress.scanned)));
+                    }
                     changed = true;
                 }
             }
             core::SearchEvent::Done { id, progress } => {
                 if id == app.search_request_id {
                     app.search_status = app_state::SearchStatus::Done(progress);
-                    let panel = app.get_active_panel_mut();
-                    panel.browser_mut().progress_override = None;
+                    if let Some(browser) = app.search_target_browser_mut() {
+                        browser.progress_override = None;
+                    }
                     changed = true;
                 }
             }
@@ -1438,8 +1441,9 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         scanned: 0,
                         matched: 0,
                     });
-                    let panel = app.get_active_panel_mut();
-                    panel.browser_mut().progress_override = None;
+                    if let Some(browser) = app.search_target_browser_mut() {
+                        browser.progress_override = None;
+                    }
                     changed = true;
                 }
             }
@@ -2971,6 +2975,7 @@ fn start_search(app: &mut app_state::AppState) {
     let search_case = app.search_case;
     let id = app.search_request_id.wrapping_add(1);
     app.search_request_id = id;
+    app.search_target = Some((app.active_panel, app.get_active_panel().active_tab));
     app.search_results.clear();
     app.search_selected = 0;
     app.search_status = app_state::SearchStatus::Running(core::SearchProgress {
@@ -3927,6 +3932,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             search_results: Vec::new(),
             search_selected: 0,
             search_request_id: 0,
+            search_target: None,
             search_status: app_state::SearchStatus::Idle,
             search_ui: app_state::SearchUiState::Closed,
             search_tx,
@@ -4673,9 +4679,14 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         format!("sftp://{host}{path}")
                     }
                 };
-                if runtime.image_cache.pending.contains(&key)
-                    || !runtime.image_cache.textures.contains_key(&key)
-                {
+                // Keep repainting only while the decode is unresolved: still in
+                // flight (animate the spinner), or not yet dispatched. Once the
+                // key resolves to a texture OR a failure, stop — otherwise a
+                // decode failure (key in `failures`, never in `textures`) would
+                // force a redraw every frame forever, pinning the CPU/GPU.
+                let resolved = runtime.image_cache.textures.contains_key(&key)
+                    || runtime.image_cache.failures.contains_key(&key);
+                if runtime.image_cache.pending.contains(&key) || !resolved {
                     runtime.needs_redraw = true;
                 }
             }
