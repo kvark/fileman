@@ -809,7 +809,12 @@ fn open_with_default_app_bg(path: &Path) {
 fn apply_props(path: &Path, mode: u32, uid: u32, gid: u32) -> std::io::Result<()> {
     let permissions = std::fs::Permissions::from_mode(mode);
     std::fs::set_permissions(path, permissions)?;
-    let res = unsafe { libc::chown(path.as_os_str().as_bytes().as_ptr().cast(), uid, gid) };
+    // `OsStr::as_bytes()` is not NUL-terminated; passing its pointer straight to
+    // chown() reads past the buffer and can operate on the wrong path. Build a
+    // proper C string (which also rejects interior NULs).
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let res = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
     if res != 0 {
         return Err(std::io::Error::last_os_error());
     }
