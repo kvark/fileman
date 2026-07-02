@@ -64,7 +64,7 @@ pub fn check_for_update() -> anyhow::Result<Option<Release>> {
         .find(|a| {
             a["name"]
                 .as_str()
-                .map_or(false, |n: &str| n.ends_with(suffix) && !n.contains("-gles"))
+                .is_some_and(|n: &str| n.ends_with(suffix) && !n.contains("-gles"))
         })
         .ok_or_else(|| anyhow::anyhow!("no matching asset for suffix '{suffix}'"))?;
 
@@ -138,7 +138,7 @@ fn extract_from_tar_gz(data: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        if path.file_name().map_or(false, |f| f == name) {
+        if path.file_name().is_some_and(|f| f == name) {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf)?;
             return Ok(buf);
@@ -154,7 +154,7 @@ fn extract_from_zip(data: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         let path = PathBuf::from(file.name());
-        if path.file_name().map_or(false, |f| f == name) {
+        if path.file_name().is_some_and(|f| f == name) {
             let mut buf = Vec::new();
             file.read_to_end(&mut buf)?;
             return Ok(buf);
@@ -203,7 +203,7 @@ fn find_app_bundle(exe: &std::path::Path) -> Option<PathBuf> {
     let contents = exe.parent()?; // MacOS
     let contents = contents.parent()?; // Contents
     let app = contents.parent()?; // FileMan.app
-    if app.extension().map_or(false, |e| e == "app") {
+    if app.extension().is_some_and(|e| e == "app") {
         Some(app.to_path_buf())
     } else {
         None
