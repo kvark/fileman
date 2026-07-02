@@ -177,9 +177,11 @@ pub fn highlight_ron_job(text: &str, theme_kind: ThemeKind) -> egui::text::Layou
                 );
                 continue;
             }
-            // Everything else (punctuation, whitespace)
+            // Everything else (punctuation, whitespace). Advance by a whole
+            // UTF-8 character: `i` may point at a multi-byte lead byte here, and
+            // slicing a single byte would split a codepoint and panic.
             let start = i;
-            i += 1;
+            i += line[i..].chars().next().map_or(1, |c| c.len_utf8());
             job.append(
                 &line[start..i],
                 0.0,
@@ -193,4 +195,24 @@ pub fn highlight_ron_job(text: &str, theme_kind: ThemeKind) -> egui::text::Layou
     }
 
     job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::ThemeKind;
+
+    #[test]
+    fn non_ascii_does_not_panic() {
+        for s in [
+            "(name: \"x\", v: é)",
+            "// café —\nfoo: 1",
+            "emoji: 😀",
+            "ключ: 2",
+            "\u{201c}curly\u{201d}",
+        ] {
+            let _ = highlight_ron_job(s, ThemeKind::Dark);
+            let _ = highlight_ron_job(s, ThemeKind::Light);
+        }
+    }
 }

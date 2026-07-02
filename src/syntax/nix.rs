@@ -120,8 +120,12 @@ pub fn highlight_nix_job(text: &str, theme_kind: ThemeKind) -> egui::text::Layou
                 continue;
             }
 
-            append(&mut job, &line[i..i + 1], text_color, font_id.clone());
-            i += 1;
+            // Advance by a whole UTF-8 character, not one byte: `i` may point at
+            // a multi-byte lead byte here, and slicing `line[i..i + 1]` would
+            // split a codepoint and panic.
+            let ch_len = line[i..].chars().next().map_or(1, |c| c.len_utf8());
+            append(&mut job, &line[i..i + ch_len], text_color, font_id.clone());
+            i += ch_len;
         }
     }
 
@@ -138,4 +142,26 @@ fn append(job: &mut egui::text::LayoutJob, text: &str, color: Color32, font_id: 
             ..Default::default()
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::ThemeKind;
+
+    #[test]
+    fn non_ascii_does_not_panic() {
+        // Multi-byte codepoints outside strings/comments used to slice a single
+        // byte and panic on a char boundary.
+        for s in [
+            "let x = é;",
+            "# café —\nfoo = 1;",
+            "emoji = 😀;",
+            "мир = 2;",
+            "\u{201c}curly\u{201d}",
+        ] {
+            let _ = highlight_nix_job(s, ThemeKind::Dark);
+            let _ = highlight_nix_job(s, ThemeKind::Light);
+        }
+    }
 }
