@@ -356,12 +356,12 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
 
     thread::spawn(move || {
         while let Ok(req) = edit_rx.recv() {
-            let text = match std::fs::read(&req.path) {
+            let (text, failed) = match std::fs::read(&req.path) {
                 Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(text) => text,
-                    Err(_) => "Refusing to edit binary file.".to_string(),
+                    Ok(text) => (text, false),
+                    Err(_) => ("Refusing to edit binary file.".to_string(), true),
                 },
-                Err(e) => format!("Failed to read file: {e}"),
+                Err(e) => (format!("Failed to read file: {e}"), true),
             };
             let crlf = text.contains("\r\n");
             let text = if crlf {
@@ -374,6 +374,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
                 path: req.path,
                 text,
                 crlf,
+                failed,
             });
         }
     });

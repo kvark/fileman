@@ -1324,6 +1324,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
             && result.id == edit.request_id
         {
             edit.loading = false;
+            edit.load_failed = result.failed;
             edit.text = result.text;
             edit.crlf = result.crlf;
             edit.highlight_hash = hash_text(&edit.text);
@@ -3775,28 +3776,31 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             let sftp_sessions = sftp_sessions_shared.clone();
             thread::spawn(move || {
                 while let Ok(req) = edit_rx.recv() {
-                    let text = if let Some((host, remote_path)) = req.remote {
+                    // `failed` distinguishes an explanatory message (binary /
+                    // unreadable / no session) from real file contents, so the
+                    // editor can refuse to save over the file.
+                    let (text, failed) = if let Some((host, remote_path)) = req.remote {
                         let session = sftp_sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&host).cloned();
                         match session {
                             Some(session) => {
                                 let locked = session.lock().unwrap_or_else(|p| p.into_inner());
                                 match fileman::sftp::read_file_full(&locked.sftp, &remote_path) {
                                     Ok(bytes) => match String::from_utf8(bytes) {
-                                        Ok(text) => text,
-                                        Err(_) => "Refusing to edit binary file.".to_string(),
+                                        Ok(text) => (text, false),
+                                        Err(_) => ("Refusing to edit binary file.".to_string(), true),
                                     },
-                                    Err(e) => format!("Failed to read remote file: {e}"),
+                                    Err(e) => (format!("Failed to read remote file: {e}"), true),
                                 }
                             }
-                            None => format!("No SFTP session for host: {host}"),
+                            None => (format!("No SFTP session for host: {host}"), true),
                         }
                     } else {
                         match std::fs::read(&req.path) {
                             Ok(bytes) => match String::from_utf8(bytes) {
-                                Ok(text) => text,
-                                Err(_) => "Refusing to edit binary file.".to_string(),
+                                Ok(text) => (text, false),
+                                Err(_) => ("Refusing to edit binary file.".to_string(), true),
                             },
-                            Err(e) => format!("Failed to read file: {e}"),
+                            Err(e) => (format!("Failed to read file: {e}"), true),
                         }
                     };
                     let crlf = text.contains("\r\n");
@@ -3810,6 +3814,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         path: req.path,
                         text,
                         crlf,
+                        failed,
                     });
                 }
             });

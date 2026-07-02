@@ -476,7 +476,10 @@ pub(crate) fn handle_keyboard(
         if !input.events.is_empty() {
             ctx.request_repaint();
         }
-        if ctrl_s {
+        // Never save while the file is still loading (the buffer is empty and
+        // would truncate the file) or when the load failed (the buffer holds an
+        // error message, not the file's contents).
+        if ctrl_s && !edit.loading && !edit.load_failed {
             if let Some(path) = edit.path.clone() {
                 // Restore CRLF line endings if the original file used them.
                 let save_text = if edit.crlf {
