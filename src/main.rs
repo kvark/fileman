@@ -1172,6 +1172,12 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         {
                             browser.selected_index = pos;
                         }
+                        // The re-indexed listing may be shorter than before and
+                        // the prior name may be gone; clamp so selected_index
+                        // can't dangle past the end and panic on the next access.
+                        if browser.selected_index >= browser.entries.len() {
+                            browser.selected_index = browser.entries.len().saturating_sub(1);
+                        }
                         changed = true;
                     }
                     browser.index_last_seen = entry_count;
