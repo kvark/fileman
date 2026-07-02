@@ -232,7 +232,18 @@ pub fn start_io_worker(
                 }
                 IOTask::Rename { src, new_name } => {
                     let target = src.with_file_name(&new_name);
-                    if let Err(e) = std::fs::rename(&src, &target) {
+                    // Refuse to rename onto an existing different entry, which
+                    // std::fs::rename would silently replace. A no-op rename and
+                    // a case-only rename on a case-insensitive filesystem (where
+                    // target resolves to the same file as src) are allowed.
+                    let onto_existing = target != src
+                        && target.symlink_metadata().is_ok()
+                        && target.canonicalize().ok() != src.canonicalize().ok();
+                    if onto_existing {
+                        let msg = format!("Already exists: {}", target.display());
+                        eprintln!("{msg}");
+                        io_result = IOResult::Error(msg);
+                    } else if let Err(e) = std::fs::rename(&src, &target) {
                         if e.kind() == std::io::ErrorKind::PermissionDenied {
                             let msg = format!("Permission denied: rename {}", src.display());
                             eprintln!("{msg}");
@@ -247,12 +258,45 @@ pub fn start_io_worker(
                         }
                     }
                 }
-                IOTask::WriteFile { path, contents } => {
+                IOTask::WriteFile {
+                    path,
+                    contents,
+                    exclusive,
+                } => {
                     let write_result = (|| -> std::io::Result<()> {
                         use std::io::Write;
-                        let mut f = std::fs::File::create(&path)?;
-                        f.write_all(&contents)?;
-                        f.sync_all()?;
+                        if exclusive {
+                            // New file: create_new fails if the path exists,
+                            // rather than truncating an existing file.
+                            let mut f = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&path)?;
+                            f.write_all(&contents)?;
+                            f.sync_all()?;
+                        } else {
+                            // Overwrite (editor save): write a sibling temp file,
+                            // fsync it, then rename over the target so a crash or
+                            // ENOSPC can never leave the original truncated.
+                            let dir = path.parent().unwrap_or_else(|| Path::new("."));
+                            let fname = path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "file".to_string());
+                            let tmp = dir.join(format!(
+                                ".{fname}.fileman-tmp.{}",
+                                std::process::id()
+                            ));
+                            {
+                                let mut f = std::fs::File::create(&tmp)?;
+                                f.write_all(&contents)?;
+                                f.sync_all()?;
+                            }
+                            if let Err(e) = std::fs::rename(&tmp, &path) {
+                                let _ = std::fs::remove_file(&tmp);
+                                return Err(e);
+                            }
+                        }
                         Ok(())
                     })();
                     if let Err(e) = write_result {
@@ -263,6 +307,10 @@ pub fn start_io_worker(
                                 message: msg,
                                 task: task_clone,
                             };
+                        } else if exclusive && e.kind() == std::io::ErrorKind::AlreadyExists {
+                            let msg = format!("File already exists: {}", path.display());
+                            eprintln!("{msg}");
+                            io_result = IOResult::Error(msg);
                         } else {
                             let msg = format!("Write error: {e}");
                             eprintln!("{msg}");

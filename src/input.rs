@@ -518,7 +518,11 @@ pub(crate) fn handle_keyboard(
             }
             ctx.request_repaint();
             if let Some((path, contents)) = save_payload {
-                let _ = io_tx.send(core::IOTask::WriteFile { path, contents });
+                let _ = io_tx.send(core::IOTask::WriteFile {
+                    path,
+                    contents,
+                    exclusive: false,
+                });
             }
             if close_editor {
                 let return_focus = edit.return_focus;
@@ -1205,6 +1209,7 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
                     action = Some(fileman::core::IOTask::WriteFile {
                         path: path.clone(),
                         contents: Vec::new(),
+                        exclusive: true,
                     });
                     next_selection = Some((dir, new_name.to_string()));
                     if rename.index < browser.entries.len() {
