@@ -18,6 +18,10 @@ jobs:
         run: cargo test
       - name: Clippy
         run: cargo clippy -- -D warnings
+      # Compile the release-only self-update feature here so breakage surfaces
+      # on every push rather than for the first time at tag/release time.
+      - name: Clippy (self-update feature)
+        run: cargo clippy --features self-update -- -D warnings
 
   build-gles:
     runs-on: ubuntu-latest
