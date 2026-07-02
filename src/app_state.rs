@@ -1629,6 +1629,7 @@ impl AppState {
                                 host: host.clone(),
                                 remote_dir: path.clone(),
                                 is_dir: item.kind == CopyKind::Directory,
+                                delete_source_on_success: false,
                             }
                         }
                         // Container → Local
@@ -1665,6 +1666,7 @@ impl AppState {
                             dst_dir: dst_dir.clone(),
                             name: item.src.display_name(),
                             is_dir: item.kind == CopyKind::Directory,
+                            delete_source_on_success: false,
                         },
                         // Remote → Remote
                         (
@@ -1708,19 +1710,19 @@ impl AppState {
                                 dst_dir: dst_dir.clone(),
                             });
                         }
-                        // Local → Remote: copy + delete local
+                        // Local → Remote: copy, then delete local only on success.
+                        // The delete is folded into the copy task so it cannot
+                        // run if the upload fails (which would lose the source).
                         (&EntryLocation::Fs(ref src), &CopyDest::Remote { ref host, ref path }) => {
                             self.enqueue_io(IOTask::CopyLocalToRemote {
                                 src: src.clone(),
                                 host: host.clone(),
                                 remote_dir: path.clone(),
                                 is_dir: item.kind == CopyKind::Directory,
-                            });
-                            self.enqueue_io(IOTask::Delete {
-                                target: src.clone(),
+                                delete_source_on_success: true,
                             });
                         }
-                        // Remote → Local: copy + delete remote
+                        // Remote → Local: copy, then delete remote only on success.
                         (
                             &EntryLocation::Remote { ref host, ref path },
                             &CopyDest::Local(ref dst_dir),
@@ -1731,10 +1733,7 @@ impl AppState {
                                 dst_dir: dst_dir.clone(),
                                 name: item.src.display_name(),
                                 is_dir: item.kind == CopyKind::Directory,
-                            });
-                            self.enqueue_io(IOTask::DeleteRemote {
-                                host: host.clone(),
-                                items: vec![(path.clone(), item.kind == CopyKind::Directory)],
+                                delete_source_on_success: true,
                             });
                         }
                         // Remote → Remote same host: use SFTP rename

@@ -356,6 +356,7 @@ pub fn start_io_worker(
                     dst_dir,
                     name,
                     is_dir,
+                    delete_source_on_success,
                 } => {
                     let mut err_msg: Option<String> = None;
                     if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
@@ -382,27 +383,53 @@ pub fn start_io_worker(
                                 Some(&transfer_progress),
                             )
                         };
-                        if let Err(e) = result
-                            && e != "Cancelled"
-                        {
-                            let msg = format!("Copy {name}: {e}");
-                            eprintln!("{msg}");
-                            err_msg = Some(msg);
+                        match result {
+                            // Only a fully successful copy may delete the source
+                            // (this is the move half). A cancel returns Err and
+                            // therefore leaves the source untouched.
+                            Ok(()) => {
+                                if delete_source_on_success
+                                    && let Err(e) = crate::sftp::recursive_delete(
+                                        &locked.sftp,
+                                        &remote_path,
+                                        is_dir,
+                                        Some(&transfer_progress),
+                                    )
+                                {
+                                    let msg = format!(
+                                        "Move {name}: copied but failed to remove source: {e}"
+                                    );
+                                    eprintln!("{msg}");
+                                    err_msg = Some(msg);
+                                }
+                            }
+                            Err(ref e) if e == "Cancelled" => {}
+                            Err(e) => {
+                                let msg = format!("Copy {name}: {e}");
+                                eprintln!("{msg}");
+                                err_msg = Some(msg);
+                            }
                         }
                     } else {
                         let msg = format!("No SFTP session for host: {host}");
                         eprintln!("{msg}");
                         err_msg = Some(msg);
                     }
-                    if let Some(msg) = err_msg {
-                        io_result = IOResult::Error(msg);
-                    }
+                    io_result = match err_msg {
+                        Some(msg) => IOResult::Error(msg),
+                        // A move refreshes both the local destination and the
+                        // remote source; a plain copy refreshes only the local
+                        // destination (the default `Completed`).
+                        None if delete_source_on_success => IOResult::CompletedMoved(host),
+                        None => IOResult::Completed,
+                    };
                 }
                 IOTask::CopyLocalToRemote {
                     src,
                     host,
                     remote_dir,
                     is_dir,
+                    delete_source_on_success,
                 } => {
                     let mut err_msg: Option<String> = None;
                     if let Some(session) = lock_or_recover(&sftp_sessions).get(&host).cloned() {
@@ -431,16 +458,38 @@ pub fn start_io_worker(
                                 Some(&transfer_progress),
                             )
                         };
-                        if let Err(e) = result
-                            && e != "Cancelled"
-                        {
-                            let label = src
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| src.display().to_string());
-                            let msg = format!("Copy {label}: {e}");
-                            eprintln!("{msg}");
-                            err_msg = Some(msg);
+                        match result {
+                            // Only a fully successful upload may delete the local
+                            // source (the move half). A cancel returns Err and
+                            // therefore leaves the source untouched.
+                            Ok(()) => {
+                                if delete_source_on_success {
+                                    let del = match std::fs::symlink_metadata(&src) {
+                                        Ok(ref m) if m.is_dir() && !m.file_type().is_symlink() => {
+                                            std::fs::remove_dir_all(&src)
+                                        }
+                                        _ => std::fs::remove_file(&src),
+                                    };
+                                    if let Err(e) = del {
+                                        let msg = format!(
+                                            "Move: uploaded but failed to remove source {}: {e}",
+                                            src.display()
+                                        );
+                                        eprintln!("{msg}");
+                                        err_msg = Some(msg);
+                                    }
+                                }
+                            }
+                            Err(ref e) if e == "Cancelled" => {}
+                            Err(e) => {
+                                let label = src
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| src.display().to_string());
+                                let msg = format!("Copy {label}: {e}");
+                                eprintln!("{msg}");
+                                err_msg = Some(msg);
+                            }
                         }
                     } else {
                         let msg = format!("No SFTP session for host: {host}");
@@ -449,6 +498,10 @@ pub fn start_io_worker(
                     }
                     io_result = match err_msg {
                         Some(msg) => IOResult::ErrorRemote(host, msg),
+                        // A move refreshes both the remote destination and the
+                        // local source; a plain copy refreshes only the remote
+                        // destination.
+                        None if delete_source_on_success => IOResult::CompletedMoved(host),
                         None => IOResult::CompletedRemote(host),
                     };
                 }
