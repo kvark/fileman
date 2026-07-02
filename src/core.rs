@@ -400,6 +400,10 @@ pub struct EditLoadResult {
     pub text: String,
     /// Whether the original file used CRLF line endings.
     pub crlf: bool,
+    /// True when the load failed or the file was refused (binary, unreadable,
+    /// no session). The buffer holds an explanatory message rather than file
+    /// contents, so saving must be blocked to avoid overwriting the file.
+    pub failed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

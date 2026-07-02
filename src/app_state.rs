@@ -356,6 +356,9 @@ pub struct EditState {
     pub text: String,
     pub ext: Option<String>,
     pub loading: bool,
+    /// The load failed or the file was refused (binary/unreadable); the buffer
+    /// holds an error message, so saving is blocked to avoid clobbering it.
+    pub load_failed: bool,
     pub dirty: bool,
     pub confirm_discard: bool,
     pub return_focus: ActivePanel,
@@ -1153,6 +1156,7 @@ impl AppState {
                 text: String::new(),
                 ext,
                 loading: true,
+                load_failed: false,
                 dirty: false,
                 confirm_discard: false,
                 return_focus,
@@ -1183,6 +1187,7 @@ impl AppState {
                 && let Some(edit) = self.edit_panel_mut()
             {
                 edit.loading = false;
+                edit.load_failed = true;
                 edit.text = "Failed to load file.".to_string();
             }
         } else if let Some(edit) = self.edit_panel_mut() {
