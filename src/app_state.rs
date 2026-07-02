@@ -477,6 +477,11 @@ pub struct AppState {
     pub search_results: Vec<SearchResult>,
     pub search_selected: usize,
     pub search_request_id: u64,
+    /// The (panel, tab) that started the current search. Search events are
+    /// routed here rather than to whatever panel/tab happens to be active when
+    /// they arrive, so switching panels or tabs mid-search doesn't inject
+    /// results into an unrelated directory listing.
+    pub search_target: Option<(ActivePanel, usize)>,
     pub search_status: SearchStatus,
     pub search_ui: SearchUiState,
     pub search_tx: mpsc::Sender<crate::core::SearchRequest>,
@@ -653,6 +658,15 @@ impl AppState {
 
     pub fn get_active_panel_mut(&mut self) -> &mut PanelState {
         self.panel_mut(self.active_panel)
+    }
+
+    /// The browser tab that owns the currently-running search, if it still
+    /// exists. Search events must be applied here rather than to whatever panel
+    /// is active when the event arrives. Returns None if no search is running
+    /// or the originating tab has since been closed.
+    pub fn search_target_browser_mut(&mut self) -> Option<&mut BrowserState> {
+        let (which, tab) = self.search_target?;
+        self.panel_mut(which).tabs.get_mut(tab)
     }
 
     pub fn preview_panel_side(&self) -> Option<ActivePanel> {
