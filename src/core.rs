@@ -439,10 +439,43 @@ pub enum SearchEvent {
     Error { id: u64, message: String },
 }
 
+/// Whether two paths refer to the same filesystem location. Uses canonical
+/// paths when both exist; if the destination does not exist yet (the common
+/// case for a copy target), it compares the canonical source against the
+/// canonical destination directory joined with the final component, and falls
+/// back to a lexical comparison when canonicalization is unavailable.
+fn is_same_path(src: &Path, dest: &Path) -> bool {
+    if let (Ok(a), Ok(b)) = (src.canonicalize(), dest.canonicalize()) {
+        return a == b;
+    }
+    if let (Ok(canon_src), Some(dest_parent), Some(dest_name)) =
+        (src.canonicalize(), dest.parent(), dest.file_name())
+    {
+        if let Ok(canon_dest_parent) = dest_parent.canonicalize() {
+            return canon_dest_parent.join(dest_name) == canon_src;
+        }
+    }
+    src == dest
+}
+
 pub fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {
     let src_name = src
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?;
+
+    let dest = dst_dir.join(src_name);
+
+    // Prevent copying a file or directory onto itself. When both panels show
+    // the same directory, `dest` resolves to `src`; without this guard
+    // `fs::copy` would open `src` and then truncate the very same inode to
+    // zero bytes before copying, irreversibly destroying the file (and, for a
+    // directory, every file in the tree via the recursion below).
+    if is_same_path(src, &dest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source and destination are the same file",
+        ));
+    }
 
     // Prevent copying a directory into itself (infinite recursion / disk fill).
     if src.is_dir() {
@@ -462,24 +495,20 @@ pub fn copy_recursively(src: &Path, dst_dir: &Path) -> io::Result<()> {
         #[cfg(unix)]
         {
             let target = fs::read_link(src)?;
-            let dest = dst_dir.join(src_name);
             std::os::unix::fs::symlink(&target, &dest)?;
         }
         #[cfg(not(unix))]
         {
             // On Windows, copy the target rather than recreating the link.
-            let dest = dst_dir.join(src_name);
             fs::copy(src, &dest)?;
         }
     } else if meta.is_dir() {
-        let dest = dst_dir.join(src_name);
         fs::create_dir_all(&dest)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
             copy_recursively(&entry.path(), &dest)?;
         }
     } else {
-        let dest = dst_dir.join(src_name);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -801,4 +830,72 @@ pub fn is_probably_text(bytes: &[u8]) -> bool {
     }
     let ratio = printable as f32 / bytes.len().max(1) as f32;
     ratio > 0.85
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A self-cleaning unique temp directory built with std only (no dev-deps).
+    struct TmpDir(path::PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut p = std::env::temp_dir();
+            p.push(format!("fileman-test-{tag}-{}-{n}", std::process::id()));
+            fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn copy_into_same_directory_is_rejected_and_preserves_file() {
+        let dir = TmpDir::new("same-dir-copy");
+        let file = dir.path().join("notes.txt");
+        fs::write(&file, b"important contents").unwrap();
+
+        // Copying a file into the directory it already lives in must be
+        // rejected rather than truncating the source to zero bytes.
+        let err = copy_recursively(&file, dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let after = fs::read(&file).unwrap();
+        assert_eq!(after, b"important contents", "source file must be intact");
+    }
+
+    #[test]
+    fn copy_into_same_directory_is_rejected_for_directory() {
+        let dir = TmpDir::new("same-dir-copy-dir");
+        let sub = dir.path().join("data");
+        fs::create_dir_all(&sub).unwrap();
+        let inner = sub.join("file.bin");
+        fs::write(&inner, b"payload").unwrap();
+
+        let err = copy_recursively(&sub, dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&inner).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn copy_into_different_directory_succeeds() {
+        let src_dir = TmpDir::new("copy-src");
+        let dst_dir = TmpDir::new("copy-dst");
+        let file = src_dir.path().join("doc.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        copy_recursively(&file, dst_dir.path()).unwrap();
+        assert_eq!(fs::read(dst_dir.path().join("doc.txt")).unwrap(), b"hello");
+        // Original must remain.
+        assert_eq!(fs::read(&file).unwrap(), b"hello");
+    }
 }
