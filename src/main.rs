@@ -4059,6 +4059,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     match result {
                         core::IOResult::Completed => local_refresh = true,
                         core::IOResult::CompletedRemote(host) => remote_hosts.push(host),
+                        core::IOResult::CompletedMoved(host) => {
+                            local_refresh = true;
+                            remote_hosts.push(host);
+                        }
                         core::IOResult::CompletedSilent => {}
                         core::IOResult::Error(msg) => {
                             local_refresh = true;

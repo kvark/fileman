@@ -252,12 +252,18 @@ pub enum IOTask {
         dst_dir: path::PathBuf,
         name: String,
         is_dir: bool,
+        /// When true (a cross-location Move), delete the remote source after the
+        /// copy has verifiably succeeded. The delete never runs on copy failure.
+        delete_source_on_success: bool,
     },
     CopyLocalToRemote {
         src: path::PathBuf,
         host: String,
         remote_dir: String,
         is_dir: bool,
+        /// When true (a cross-location Move), delete the local source after the
+        /// copy has verifiably succeeded. The delete never runs on copy failure.
+        delete_source_on_success: bool,
     },
     DeleteRemote {
         host: String,
@@ -361,6 +367,9 @@ pub enum IOResult {
     Completed,
     /// Refresh only remote panels browsing this host.
     CompletedRemote(String),
+    /// A cross-location move completed — refresh both local panels and the
+    /// remote host, since one side is the source and the other the destination.
+    CompletedMoved(String),
     /// No panel refresh needed (open-only / read-only ops).
     CompletedSilent,
     /// Operation failed — display the error to the user and still refresh.
