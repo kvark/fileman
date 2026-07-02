@@ -919,6 +919,11 @@ impl<'a> BitReader<'a> {
     }
 
     fn peek(&mut self, n: u8) -> u32 {
+        // A malformed stream can request more bits than fit in u32; guard the
+        // shift so `1u32 << n` can't overflow and panic.
+        if n == 0 || n >= 32 {
+            return 0;
+        }
         if self.nbits < n {
             self.fill();
         }
@@ -998,7 +1003,9 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                     return None;
                 }
                 let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-                if pos + seg_len > len {
+                // seg_len includes its own 2 length bytes; a value < 2 would make
+                // the slice below have start > end and panic.
+                if seg_len < 2 || pos + seg_len > len {
                     return None;
                 }
                 // Try to extract orientation from EXIF
@@ -1114,7 +1121,10 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                     return None;
                 }
                 let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-                if pos + seg_len > len {
+                let seg_end = pos + seg_len;
+                // Need 2 (len) + 1 (precision) + 2 (height) + 2 (width) +
+                // 1 (component count) before the per-component entries.
+                if seg_len < 8 || seg_end > len {
                     return None;
                 }
                 let p = pos + 2;
@@ -1122,7 +1132,12 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                 height = u16::from_be_bytes([bytes[p + 1], bytes[p + 2]]);
                 width = u16::from_be_bytes([bytes[p + 3], bytes[p + 4]]);
                 num_components = bytes[p + 5];
-                if num_components == 0 || num_components > 4 {
+                // This fast path only assembles grayscale (1) and YCbCr (3);
+                // reject others so the later component indexing stays in bounds.
+                if num_components != 1 && num_components != 3 {
+                    return None;
+                }
+                if p + 6 + num_components as usize * 3 > seg_end {
                     return None;
                 }
                 components.clear();
@@ -1131,15 +1146,22 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                     let _id = bytes[off];
                     let sampling = bytes[off + 1];
                     let qt = bytes[off + 2] as usize;
+                    let h_samp = (sampling >> 4) as usize;
+                    let v_samp = (sampling & 0x0F) as usize;
+                    // Valid sampling factors are 1..=4; a 0 would make h_max/v_max
+                    // 0 and divide-by-zero in the MCU math below.
+                    if h_samp == 0 || h_samp > 4 || v_samp == 0 || v_samp > 4 {
+                        return None;
+                    }
                     components.push(JpegComponent {
-                        h_samp: (sampling >> 4) as usize,
-                        v_samp: (sampling & 0x0F) as usize,
+                        h_samp,
+                        v_samp,
                         qt_id: qt,
                         dc_table: 0,
                         ac_table: 0,
                     });
                 }
-                pos += seg_len;
+                pos = seg_end;
             }
             0xC2 => {
                 // SOF2 — progressive, bail out
@@ -1159,7 +1181,8 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                     return None;
                 }
                 let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-                if pos + seg_len > len {
+                let seg_end = pos + seg_len;
+                if seg_len < 3 || seg_end > len {
                     return None;
                 }
                 let p = pos + 2;
@@ -1167,14 +1190,23 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                 if ns != num_components as usize {
                     return None; // only handle interleaved scans
                 }
+                if p + 1 + ns * 2 > seg_end {
+                    return None;
+                }
                 for (i, comp) in components.iter_mut().enumerate().take(ns) {
                     let off = p + 1 + i * 2;
                     let _cs = bytes[off];
                     let td_ta = bytes[off + 1];
-                    comp.dc_table = (td_ta >> 4) as usize;
-                    comp.ac_table = (td_ta & 0x0F) as usize;
+                    let dc_table = (td_ta >> 4) as usize;
+                    let ac_table = (td_ta & 0x0F) as usize;
+                    // Selectors index dc_huff/ac_huff, which are [_; 4].
+                    if dc_table >= 4 || ac_table >= 4 {
+                        return None;
+                    }
+                    comp.dc_table = dc_table;
+                    comp.ac_table = ac_table;
                 }
-                pos += seg_len;
+                pos = seg_end;
                 // Now decode entropy data
                 break;
             }
@@ -1193,11 +1225,21 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
     if width == 0 || height == 0 || components.is_empty() {
         return None;
     }
+    // A crafted header can claim up to 65535×65535, whose DC planes would be
+    // gigabytes. Cap the pixel count for this preview path and fall back.
+    if width as u64 * height as u64 > 100_000_000 {
+        return None;
+    }
 
     let w = width as usize;
     let h = height as usize;
     let h_max = components.iter().map(|c| c.h_samp).max().unwrap_or(1);
     let v_max = components.iter().map(|c| c.v_samp).max().unwrap_or(1);
+    // Sampling factors were validated to be >= 1 at parse time, so h_max/v_max
+    // are non-zero; guard anyway so the division can never trap.
+    if h_max == 0 || v_max == 0 {
+        return None;
+    }
     let mcu_w = w.div_ceil(h_max * 8);
     let mcu_h = h.div_ceil(v_max * 8);
     // Allocate DC coefficient planes for each component
@@ -1230,6 +1272,11 @@ fn decode_jpeg_dc_only(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Ima
                     for hx in 0..comp.h_samp {
                         // Decode DC coefficient
                         let cat = reader.decode_huff(dc_lut)?;
+                        // A valid DC magnitude category is at most 15; anything
+                        // larger would overflow the `1 << cat` shifts below.
+                        if cat > 15 {
+                            return None;
+                        }
                         let dc_diff = if cat == 0 {
                             0
                         } else {
@@ -1588,4 +1635,46 @@ fn downscale_rgba(
         }
     }
     (out_w, out_h, out)
+}
+
+#[cfg(test)]
+mod jpeg_fuzz_tests {
+    use super::decode_jpeg_dc_preview;
+
+    // Crafted JPEG headers that previously panicked the DC-preview decoder
+    // (out-of-bounds slices, shift overflow, divide-by-zero). All must return
+    // None (fall back) rather than panic.
+    #[test]
+    fn malformed_jpeg_headers_do_not_panic() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![0xFF, 0xD8],                               // SOI only
+            vec![0xFF, 0xD8, 0xFF, 0xC0],                   // truncated SOF0 marker
+            vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x02],       // SOF0 seg_len too small
+            // SOF0 with a zero sampling factor (would divide by zero)
+            vec![
+                0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x00, 0x00,
+                0x00,
+            ],
+            vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x00],       // APP1 seg_len 0 (slice start > end)
+            vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x01],       // APP1 seg_len 1
+            vec![0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02],       // SOS seg_len too small
+            // SOF0 claiming a huge canvas (allocation cap)
+            vec![
+                0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x03, 0x01, 0x11,
+                0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+            ],
+        ];
+        for c in &cases {
+            let _ = decode_jpeg_dc_preview(c, 256);
+        }
+
+        // A deterministic sweep of byte patterns behind a valid SOI marker.
+        for seed in 0u8..=255 {
+            let mut v = vec![0xFF, 0xD8];
+            for i in 0..96u8 {
+                v.push(seed.wrapping_mul(i).wrapping_add(i ^ seed));
+            }
+            let _ = decode_jpeg_dc_preview(&v, 256);
+        }
+    }
 }
