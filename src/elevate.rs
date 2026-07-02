@@ -226,6 +226,7 @@ pub fn execute_elevated(task: &IOTask) -> Result<(), String> {
         IOTask::WriteFile {
             ref path,
             ref contents,
+            ..
         } => elevated_write_file(path, contents),
         #[cfg(unix)]
         IOTask::SetProps {

@@ -225,6 +225,10 @@ pub enum IOTask {
     WriteFile {
         path: path::PathBuf,
         contents: Vec<u8>,
+        /// When true (creating a new file), fail if the path already exists
+        /// instead of truncating it. When false (editor save), overwrite the
+        /// existing file atomically.
+        exclusive: bool,
     },
     Mkdir {
         path: path::PathBuf,
