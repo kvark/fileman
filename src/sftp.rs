@@ -173,7 +173,17 @@ fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<(), Strin
         .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
 
     if kh_path.exists() {
-        let _ = known_hosts.read_file(&kh_path, KnownHostFileKind::OpenSSH);
+        // If the file exists but can't be read, the in-memory set stays empty,
+        // which would (a) downgrade every host to blind TOFU and (b) let the
+        // NotFound branch below overwrite the on-disk file with only the new
+        // entry, destroying existing pins. Fail closed instead.
+        if let Err(e) = known_hosts.read_file(&kh_path, KnownHostFileKind::OpenSSH) {
+            return Err(format!(
+                "Could not read {}: {e}. Refusing to connect rather than skip \
+                 host-key verification.",
+                kh_path.display()
+            ));
+        }
     }
 
     let check = if port == 22 {
@@ -202,8 +212,15 @@ fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<(), Strin
             Ok(())
         }
         CheckResult::Failure => {
-            eprintln!("Known-hosts check failed for {host}; proceeding.");
-            Ok(())
+            // The check itself could not be performed (e.g. unsupported key
+            // type, malformed entry). Failing open here would let a MITM who
+            // can steer the check into this branch bypass verification, so
+            // refuse the connection.
+            eprintln!("Known-hosts check could not be performed for {host}; refusing.");
+            Err(format!(
+                "Host-key verification could not be performed for {host}. \
+                 Refusing to connect."
+            ))
         }
     }
 }
