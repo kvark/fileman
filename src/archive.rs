@@ -1201,6 +1201,15 @@ pub fn create_archive(
     archive_path: &Path,
     kind: ContainerKind,
 ) -> io::Result<()> {
+    // Refuse to overwrite an existing file: packing uses File::create, which
+    // would silently truncate whatever is already at archive_path (e.g. an
+    // unrelated file the user named by mistake, or a previous archive).
+    if archive_path.symlink_metadata().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", archive_path.display()),
+        ));
+    }
     match kind {
         ContainerKind::Zip => create_zip_archive(sources, archive_path),
         ContainerKind::Tar => create_tar_archive(sources, archive_path),
