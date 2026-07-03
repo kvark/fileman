@@ -1329,8 +1329,11 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         if let Some(edit) = app.edit_panel_mut()
             && result.id == edit.request_id
         {
-            edit.loading = false;
-            edit.load_failed = result.failed;
+            edit.load = if result.failed {
+                app_state::EditLoad::Failed
+            } else {
+                app_state::EditLoad::Loaded
+            };
             edit.text = result.text;
             edit.crlf = result.crlf;
             edit.highlight_hash = hash_text(&edit.text);

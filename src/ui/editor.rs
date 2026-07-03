@@ -62,7 +62,7 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
                         });
                     });
                 ui.add_space(2.0);
-                if edit.loading {
+                if edit.load == app_state::EditLoad::Loading {
                     let t = ui.ctx().input(|i| i.time);
                     let dots = ".".repeat(((t * 2.0) as usize % 4) + 1);
                     ui.colored_label(color32(colors.row_fg_inactive), format!("Loading{dots}"));
