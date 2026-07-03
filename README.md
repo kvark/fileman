@@ -21,7 +21,7 @@ FileMan is a fast, responsive two-panel file manager built with Rust, egui, and 
 |-----|--------|
 | Enter | Open |
 | Shift+Enter | Open with system default app |
-| Tab / Ctrl+I | Switch panels |
+| Tab | Switch panels |
 | Ctrl+U | Swap panels |
 | Ctrl+T | New tab |
 | Ctrl+W | Close tab |
@@ -46,7 +46,7 @@ FileMan is a fast, responsive two-panel file manager built with Rust, egui, and 
 | F8 | Delete |
 | F9 | Toggle theme |
 | F10 | Theme picker |
-| Insert | Mark / unmark |
+| Insert / Ctrl+I | Mark / unmark |
 | Space | Compute folder size |
 | Alt+Enter | Properties |
 | Ctrl+G | Quick jump |
