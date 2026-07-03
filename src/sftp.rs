@@ -227,7 +227,7 @@ fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<(), Strin
 
 #[cfg(unix)]
 fn set_tcp_keepalive(tcp: &TcpStream) {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsRawFd as _;
     let fd = tcp.as_raw_fd();
     unsafe {
         let enable: libc::c_int = 1;

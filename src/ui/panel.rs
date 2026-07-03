@@ -133,7 +133,7 @@ fn worker_dot(ui: &mut egui::Ui, active: bool, colors: &theme::ThemeColors) {
 
 #[cfg(unix)]
 fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStrExt as _;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
@@ -149,7 +149,7 @@ fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
 #[cfg(windows)]
 fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
     use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStrExt as _;
 
     unsafe extern "system" {
         fn GetDiskFreeSpaceExW(

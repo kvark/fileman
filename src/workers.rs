@@ -1,7 +1,7 @@
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::PermissionsExt as _;
 use std::{
     fs::File,
     io::Read,
@@ -264,7 +264,7 @@ pub fn start_io_worker(
                     exclusive,
                 } => {
                     let write_result = (|| -> std::io::Result<()> {
-                        use std::io::Write;
+                        use std::io::Write as _;
                         if exclusive {
                             // New file: create_new fails if the path exists,
                             // rather than truncating an existing file.
