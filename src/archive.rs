@@ -1335,3 +1335,39 @@ impl ContainerPlugin for TarBz2Plugin {
         })?)
     }
 }
+
+#[cfg(test)]
+mod traversal_tests {
+    use super::{normalize_archive_path, safe_rel_path};
+    use std::path::Path;
+
+    #[test]
+    fn safe_rel_path_rejects_traversal_and_absolute() {
+        // Parent-dir, absolute, and root-escaping paths must be refused so an
+        // archive entry can never write outside the destination directory.
+        assert!(safe_rel_path("../etc/passwd").is_none());
+        assert!(safe_rel_path("a/../../b").is_none());
+        assert!(safe_rel_path("/etc/passwd").is_none());
+        assert!(safe_rel_path("..").is_none());
+        assert!(safe_rel_path("").is_none());
+    }
+
+    #[test]
+    fn safe_rel_path_accepts_normal_relative() {
+        assert_eq!(
+            safe_rel_path("a/b/c.txt"),
+            Some(Path::new("a/b/c.txt").to_path_buf())
+        );
+        assert_eq!(safe_rel_path("file.txt"), Some(Path::new("file.txt").to_path_buf()));
+    }
+
+    #[test]
+    fn normalize_archive_path_cannot_escape() {
+        // Leading slashes are stripped and .. can never pop above the root.
+        assert_eq!(normalize_archive_path(Path::new("/etc/passwd")), "etc/passwd");
+        assert_eq!(normalize_archive_path(Path::new("a/../../b")), "b");
+        assert_eq!(normalize_archive_path(Path::new("../../x")), "x");
+        assert_eq!(normalize_archive_path(Path::new("a/./b")), "a/b");
+        assert_eq!(normalize_archive_path(Path::new("dir/sub/f")), "dir/sub/f");
+    }
+}
