@@ -21,9 +21,10 @@ pub fn draw_quick_jump(
     ctx: &egui::Context,
     app: &mut app_state::AppState,
 ) -> Option<QuickJumpResult> {
-    let qj = app.quick_jump.as_mut()?;
-
+    // Read theme colors before taking the mutable quick-jump borrow of `app`.
     let colors = app.theme.colors();
+    let qj = app.quick_jump_mut()?;
+
     let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "quick_jump_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(

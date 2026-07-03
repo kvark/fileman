@@ -104,7 +104,7 @@ fn apply_replay_key(
     let key_name = key.key.as_str();
     if key_name.eq_ignore_ascii_case("enter")
         && matches!(
-            app.pending_op,
+            app.pending_op(),
             Some(
                 fileman::app_state::PendingOp::Delete { .. }
                     | fileman::app_state::PendingOp::Copy { .. }
@@ -460,11 +460,9 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         container_last_selected_name: Default::default(),
         container_dir_cache: Default::default(),
         archive_index: Default::default(),
-        props_dialog: None,
+        modal: None,
         theme: theme::Theme::dark(),
-        theme_picker_open: false,
         theme_picker_selected: None,
-        pending_op: None,
         pending_collisions: Vec::new(),
         rename_input: None,
         rename_focus: false,
@@ -488,15 +486,10 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         update_status: app_state::UpdateStatus::Disabled,
         update_rx: None,
         gpu_info: String::from("Test"),
-        quick_jump: None,
-        error_message: None,
         error_log: Vec::new(),
         settings: fileman::settings::Settings::default(),
-        settings_draft: None,
-        elevation_prompt: None,
         sftp_sessions: std::collections::HashMap::new(),
         sftp_sessions_shared: sftp_sessions_shared.clone(),
-        sftp_connecting: None,
         sftp_connect_rx: None,
         sftp_pending_nav: None,
         sftp_nav_queue: std::collections::VecDeque::new(),

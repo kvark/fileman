@@ -302,7 +302,7 @@ pub(crate) fn handle_keyboard(
     // shortcut is consumed so egui's widgets receive typing, Tab (field
     // navigation), and Enter, and no panel action fires on the panel beneath
     // it. Escape (close) is handled by the settings view itself.
-    if app.settings_draft.is_some() {
+    if app.settings_open() {
         return;
     }
     // The search bar is a focused egui TextEdit; its select-all/copy/cut keys
@@ -362,50 +362,50 @@ pub(crate) fn handle_keyboard(
         }
         return;
     }
-    if app.elevation_prompt.is_some() {
+    if matches!(app.modal, Some(app_state::Modal::Elevation { .. })) {
         if input.key_pressed(egui::Key::Enter) {
-            if let Some((_, task)) = app.elevation_prompt.take() {
+            if let Some((_, task)) = app.take_elevation() {
                 app.enqueue_io(crate::core::IOTask::Elevated(Box::new(task)));
             }
             ctx.request_repaint();
         } else if input.key_pressed(egui::Key::Escape) {
-            app.elevation_prompt = None;
+            app.close_modal();
             ctx.request_repaint();
         }
         return;
     }
-    if app.error_message.is_some() {
+    if app.error_message().is_some() {
         if input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::Enter) {
-            app.error_message = None;
+            app.close_modal();
             ctx.request_repaint();
         }
         return;
     }
-    if app.props_dialog.is_some() {
+    if app.props_dialog().is_some() {
         if input.key_pressed(egui::Key::Escape) {
-            app.props_dialog = None;
+            app.close_modal();
             ctx.request_repaint();
         }
         return;
     }
-    if app.quick_jump.is_some() {
+    if app.quick_jump().is_some() {
         if input.key_pressed(egui::Key::Escape) {
             app.close_quick_jump();
             ctx.request_repaint();
         } else if input.key_pressed(egui::Key::ArrowDown) {
-            if let Some(ref mut qj) = app.quick_jump
+            if let Some(qj) = app.quick_jump_mut()
                 && qj.selected + 1 < qj.filtered.len()
             {
                 qj.selected += 1;
             }
             ctx.request_repaint();
         } else if input.key_pressed(egui::Key::ArrowUp) {
-            if let Some(ref mut qj) = app.quick_jump {
+            if let Some(qj) = app.quick_jump_mut() {
                 qj.selected = qj.selected.saturating_sub(1);
             }
             ctx.request_repaint();
         } else if input.key_pressed(egui::Key::Enter) {
-            let result = app.quick_jump.as_ref().and_then(|qj| {
+            let result = app.quick_jump().and_then(|qj| {
                 if !qj.filtered.is_empty() {
                     let entry = &qj.entries[qj.filtered[qj.selected]];
                     Some(crate::ui::quick_jump::QuickJumpResult {
@@ -444,7 +444,7 @@ pub(crate) fn handle_keyboard(
         }
         return;
     }
-    if app.pending_op.is_some() {
+    if app.pending_op().is_some() {
         if input.key_pressed(egui::Key::Enter) {
             confirm_pending_op(app);
         }
@@ -650,7 +650,7 @@ pub(crate) fn handle_keyboard(
     let window_rows = active_window_rows(app, cache);
     let tab_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
     if tab_pressed {
-        if app.props_dialog.is_none() {
+        if app.props_dialog().is_none() {
             app.switch_panel();
         }
         ctx.request_repaint();
@@ -833,7 +833,7 @@ pub(crate) fn handle_keyboard(
                 }
             }
             app.search_ui = app_state::SearchUiState::Closed;
-        } else if app.theme_picker_open {
+        } else if app.theme_picker_open() {
             app.apply_selected_theme();
         } else {
             open_selected(app);
@@ -908,7 +908,7 @@ pub(crate) fn handle_keyboard(
     } = app.panel(app.active_panel);
     let active_is_browser = matches!(active_mode, app_state::PanelMode::Browser);
     if input.key_pressed(egui::Key::ArrowDown) && active_is_browser {
-        if app.theme_picker_open {
+        if app.theme_picker_open() {
             app.select_next_theme();
         } else {
             let browser = app.get_active_panel().browser();
@@ -918,7 +918,7 @@ pub(crate) fn handle_keyboard(
         }
     }
     if input.key_pressed(egui::Key::ArrowUp) && active_is_browser {
-        if app.theme_picker_open {
+        if app.theme_picker_open() {
             app.select_prev_theme();
         } else {
             let browser = app.get_active_panel().browser();
@@ -970,7 +970,7 @@ pub(crate) fn handle_keyboard(
         app.toggle_preview();
     }
     if input.key_pressed(egui::Key::Escape) {
-        if app.theme_picker_open {
+        if app.theme_picker_open() {
             app.close_theme_picker();
         } else {
             app.clear_preview();
