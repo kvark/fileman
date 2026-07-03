@@ -255,7 +255,10 @@ fn apply_replay_key(
 fn is_app_pending(app: &app_state::AppState) -> bool {
     let left = app.left_panel.browser();
     let right = app.right_panel.browser();
-    let edit_loading = app.edit_panel().map(|edit| edit.loading).unwrap_or(false);
+    let edit_loading = app
+        .edit_panel()
+        .map(|edit| edit.load == app_state::EditLoad::Loading)
+        .unwrap_or(false);
     let search_running = matches!(app.search_status, app_state::SearchStatus::Running(_));
     app.io_in_flight > 0
         || left.load.is_loading()

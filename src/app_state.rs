@@ -351,14 +351,25 @@ pub struct PreviewState {
     pub image_pan: [f32; 2],
 }
 
+/// State of the editor's background file load. The three cases are mutually
+/// exclusive — there is no "loading and failed" — so they live in one field
+/// rather than two booleans.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EditLoad {
+    /// The read is in flight; the buffer is empty and must not be saved.
+    Loading,
+    /// The file loaded successfully; the buffer holds its contents.
+    Loaded,
+    /// The load failed or the file was refused (binary/unreadable); the buffer
+    /// holds an error message, so saving is blocked to avoid clobbering it.
+    Failed,
+}
+
 pub struct EditState {
     pub path: Option<path::PathBuf>,
     pub text: String,
     pub ext: Option<String>,
-    pub loading: bool,
-    /// The load failed or the file was refused (binary/unreadable); the buffer
-    /// holds an error message, so saving is blocked to avoid clobbering it.
-    pub load_failed: bool,
+    pub load: EditLoad,
     pub dirty: bool,
     pub confirm_discard: bool,
     pub return_focus: ActivePanel,
@@ -1188,8 +1199,7 @@ impl AppState {
                 path: Some(path),
                 text: String::new(),
                 ext,
-                loading: true,
-                load_failed: false,
+                load: EditLoad::Loading,
                 dirty: false,
                 confirm_discard: false,
                 return_focus,
@@ -1219,12 +1229,12 @@ impl AppState {
                 .is_err()
                 && let Some(edit) = self.edit_panel_mut()
             {
-                edit.loading = false;
-                edit.load_failed = true;
+                edit.load = EditLoad::Failed;
                 edit.text = "Failed to load file.".to_string();
             }
         } else if let Some(edit) = self.edit_panel_mut() {
-            edit.loading = false;
+            // No request was sent; the empty buffer must not be savable.
+            edit.load = EditLoad::Failed;
         }
         self.active_panel = target_panel_clone;
     }
