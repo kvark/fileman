@@ -290,7 +290,6 @@ pub(crate) fn handle_keyboard(
     app: &mut app_state::AppState,
     cache: &mut UiCache,
 ) {
-    let io_tx = app.io_tx.clone();
     let in_edit = matches!(
         app.panel(app.active_panel).mode,
         app_state::PanelMode::Edit(_)
@@ -458,6 +457,11 @@ pub(crate) fn handle_keyboard(
         let mut save_payload: Option<(PathBuf, Vec<u8>)> = None;
         let mut close_editor = false;
         let mut remote_size_update: Option<(String, String, u64)> = None;
+        // Tasks are collected here and enqueued through app.enqueue_io() after
+        // the `edit` borrow of `app` ends, so io_in_flight/io_batch_total stay
+        // accurate (a raw io_tx.send would leave the counter one short and make
+        // a later batch's progress/cancel-reset fire early).
+        let mut pending_io_tasks: Vec<core::IOTask> = Vec::new();
         if edit.confirm_discard {
             if enter {
                 close_editor = true;
@@ -502,7 +506,7 @@ pub(crate) fn handle_keyboard(
                         edit.confirm_discard = false;
                         // Don't refresh the whole panel — just update file size in place
                         close_editor = true;
-                        let _ = io_tx.send(core::IOTask::WriteRemoteFile {
+                        pending_io_tasks.push(core::IOTask::WriteRemoteFile {
                             host,
                             path: remote_path,
                             contents,
@@ -518,7 +522,7 @@ pub(crate) fn handle_keyboard(
             }
             ctx.request_repaint();
             if let Some((path, contents)) = save_payload {
-                let _ = io_tx.send(core::IOTask::WriteFile {
+                pending_io_tasks.push(core::IOTask::WriteFile {
                     path,
                     contents,
                     exclusive: false,
@@ -529,6 +533,11 @@ pub(crate) fn handle_keyboard(
                 let panel = app.panel_mut(app.active_panel);
                 panel.mode = app_state::PanelMode::Browser;
                 app.active_panel = return_focus;
+            }
+            // `edit` is no longer borrowed here; enqueue through app so the
+            // in-flight counter is maintained.
+            for task in pending_io_tasks {
+                app.enqueue_io(task);
             }
             if let Some((ref host, ref rpath, size)) = remote_size_update {
                 for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
