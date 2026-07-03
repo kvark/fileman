@@ -305,14 +305,19 @@ pub(crate) fn handle_keyboard(
     if app.settings_draft.is_some() {
         return;
     }
+    // The search bar is a focused egui TextEdit; its select-all/copy/cut keys
+    // must reach it instead of triggering panel actions (Pack/Copy/Delete).
+    let search_typing = app.search_ui == app_state::SearchUiState::Open;
     // In edit mode, don't consume Ctrl+letter shortcuts that egui's TextEdit
     // needs (copy, paste, cut, select-all, undo, redo, etc.).
     let ctrl_h = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::H));
     let ctrl_p = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P));
     let ctrl_e = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E));
     let ctrl_n = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N));
-    let ctrl_c = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C));
-    let ctrl_a = if in_preview || in_edit {
+    let ctrl_c = !in_edit
+        && !search_typing
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+    let ctrl_a = if in_preview || in_edit || search_typing {
         // Don't consume: egui's widgets handle Ctrl+A (select-all) natively.
         false
     } else {
@@ -321,7 +326,9 @@ pub(crate) fn handle_keyboard(
     let ctrl_m = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
     let ctrl_d = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::D));
     let ctrl_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G));
-    let ctrl_x = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::X));
+    let ctrl_x = !in_edit
+        && !search_typing
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::X));
     let ctrl_i = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::I));
     let ctrl_shift_m = !in_edit
         && ctx.input_mut(|i| {
@@ -752,7 +759,16 @@ pub(crate) fn handle_keyboard(
     if alt_f7 {
         open_search(app, core::SearchMode::Name);
     }
-    if input.key_pressed(egui::Key::Enter) {
+    // Only plain Enter navigates here. `input` is a frozen snapshot and
+    // key_pressed ignores modifiers, so without these guards this block also
+    // fired for Ctrl+Enter (start search — already handled above, would run
+    // twice), Shift+Enter (open-external), and Enter in preview mode (find-next
+    // below) — each a double action off one keypress.
+    let plain_enter = input.key_pressed(egui::Key::Enter)
+        && !input.modifiers.ctrl
+        && !input.modifiers.alt
+        && !input.modifiers.shift;
+    if !in_preview && plain_enter {
         if app.search_ui == app_state::SearchUiState::Open {
             if matches!(
                 app.get_active_panel().browser().browser_mode,
@@ -924,12 +940,15 @@ pub(crate) fn handle_keyboard(
             }
         }
     }
-    if input.key_pressed(egui::Key::PageUp) && active_is_browser {
+    // Plain PageUp/PageDown page the row cursor. Exclude Ctrl, which is the
+    // parent-folder / open-selected binding consumed above — key_pressed
+    // ignores modifiers, so without this the cursor also jumped on Ctrl+PgUp/Dn.
+    if input.key_pressed(egui::Key::PageUp) && !input.modifiers.ctrl && active_is_browser {
         let browser = app.get_active_panel().browser();
         let new_index = browser.selected_index.saturating_sub(window_rows);
         app.select_entry(new_index, window_rows);
     }
-    if input.key_pressed(egui::Key::PageDown) && active_is_browser {
+    if input.key_pressed(egui::Key::PageDown) && !input.modifiers.ctrl && active_is_browser {
         let browser = app.get_active_panel().browser();
         let len = browser.entries.len();
         let mut new_index = browser.selected_index.saturating_add(window_rows);
