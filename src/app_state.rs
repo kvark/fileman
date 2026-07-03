@@ -664,6 +664,21 @@ impl AppState {
         self.panel_mut(self.active_panel)
     }
 
+    /// Whether an overlay modal is currently displayed. The browser panels
+    /// behind it must not respond to mouse input while one is up, otherwise
+    /// clicking "through" a dialog changes selection or the active panel.
+    pub fn any_modal_open(&self) -> bool {
+        self.pending_op.is_some()
+            || self.props_dialog.is_some()
+            || self.settings_draft.is_some()
+            || self.quick_jump.is_some()
+            || self.elevation_prompt.is_some()
+            || self.error_message.is_some()
+            || self.sftp_connecting.is_some()
+            || self.theme_picker_open
+            || self.io_in_flight > 0
+    }
+
     /// The browser tab that owns the currently-running search, if it still
     /// exists. Search events must be applied here rather than to whatever panel
     /// is active when the event arrives. Returns None if no search is running

@@ -313,6 +313,12 @@ pub fn draw_panel(
 ) -> usize {
     let available = ui.available_size();
     ui.set_min_size(available);
+    // While an overlay modal is up, the panel must not react to clicks (which
+    // would change selection or switch panels "behind" the dialog). Disabling
+    // the Ui makes every widget below non-interactive.
+    if app.any_modal_open() {
+        ui.disable();
+    }
     let panel_height = available.y.max(0.0).max(min_height);
     let colors = app.theme.colors();
     let is_active = app.active_panel == panel_side;
