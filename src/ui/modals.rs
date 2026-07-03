@@ -5,7 +5,7 @@ use fileman::app_state;
 use crate::{color32, input};
 
 pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
-    let op = match app.pending_op.clone() {
+    let op = match app.pending_op().cloned() {
         Some(op) => op,
         None => return,
     };

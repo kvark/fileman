@@ -437,6 +437,36 @@ fn history_key(snapshot: &PanelSnapshot) -> String {
     }
 }
 
+/// The single overlay dialog that can be showing at any moment. Holding the
+/// modal state in one field (rather than a scatter of `Option`/`bool` fields)
+/// makes it impossible by construction to have two dialogs open at once, and
+/// gives one place to check with `any_modal_open`.
+///
+/// The busy/progress overlay is intentionally *not* here — it is driven by the
+/// `io_in_flight` counter (it needs the count for "file X of N"), and the
+/// editor's discard prompt lives in `EditState` since it is scoped to a panel.
+pub enum Modal {
+    /// Copy/Move/Delete/Rename/Pack confirmation.
+    Confirm(PendingOp),
+    /// File properties dialog.
+    Props(PropsDialog),
+    /// Settings editor (working copy applied on save, dropped on cancel).
+    Settings(crate::settings::Settings),
+    /// Quick-jump path/bookmark picker.
+    QuickJump(QuickJumpState),
+    /// Permission error offering an elevated retry of the failed task.
+    Elevation {
+        message: String,
+        task: crate::core::IOTask,
+    },
+    /// A fatal/operation error message.
+    Error(String),
+    /// Shown while an SFTP connection is being established (holds the host).
+    Connecting(String),
+    /// External-theme picker.
+    ThemePicker,
+}
+
 pub struct AppState {
     pub left_panel: PanelState,
     pub right_panel: PanelState,
@@ -471,11 +501,10 @@ pub struct AppState {
     pub container_last_selected_name: HashMap<(path::PathBuf, String, ContainerKind), String>,
     pub container_dir_cache: HashMap<(path::PathBuf, String, ContainerKind), ContainerDirCache>,
     pub archive_index: HashMap<path::PathBuf, Arc<Mutex<ArchiveFullIndex>>>,
-    pub props_dialog: Option<PropsDialog>,
+    /// The single overlay dialog currently displayed, if any. See `Modal`.
+    pub modal: Option<Modal>,
     pub theme: Theme,
-    pub theme_picker_open: bool,
     pub theme_picker_selected: Option<usize>,
-    pub pending_op: Option<PendingOp>,
     /// Destination names that a pending Copy/Move would overwrite, computed once
     /// when the op is prepared and shown in the confirmation dialog so the user
     /// consents to clobbering existing files.
@@ -507,25 +536,15 @@ pub struct AppState {
     pub update_status: UpdateStatus,
     pub update_rx: Option<mpsc::Receiver<UpdateStatus>>,
     pub gpu_info: String,
-    pub quick_jump: Option<QuickJumpState>,
-    pub error_message: Option<String>,
     /// Persistent error log surfaced in the Help screen. New entries are
     /// pushed via `record_error`; capped at `ERROR_LOG_CAP` entries.
     pub error_log: Vec<ErrorLogEntry>,
     /// User-editable settings persisted to RON at config_dir().
     pub settings: crate::settings::Settings,
-    /// Settings modal open state (toggled by Ctrl+,). When Some, holds a
-    /// working copy edited by the UI; applied + persisted on save, dropped
-    /// on cancel.
-    pub settings_draft: Option<crate::settings::Settings>,
-    /// Permission error with retryable task — shown as elevation prompt.
-    pub elevation_prompt: Option<(String, crate::core::IOTask)>,
     /// Active SFTP sessions keyed by hostname — local reference for quick lookups.
     pub sftp_sessions: HashMap<String, Arc<Mutex<crate::sftp::SftpSession>>>,
     /// Shared SFTP sessions for worker threads (IO, preview).
     pub sftp_sessions_shared: Arc<Mutex<HashMap<String, Arc<Mutex<crate::sftp::SftpSession>>>>>,
-    /// Hostname currently being connected via SFTP.
-    pub sftp_connecting: Option<String>,
     /// Receives the result of an async SFTP connection.
     pub sftp_connect_rx: Option<mpsc::Receiver<Result<crate::sftp::SftpSession, String>>>,
     /// Pending navigation after SFTP connect completes.
@@ -621,7 +640,7 @@ impl AppState {
     pub fn record_error(&mut self, source: impl Into<String>, message: impl Into<String>) {
         let source = source.into();
         let message = message.into();
-        self.error_message = Some(message.clone());
+        self.modal = Some(Modal::Error(message.clone()));
         self.error_log.push(ErrorLogEntry {
             when: Instant::now(),
             source,
@@ -677,17 +696,120 @@ impl AppState {
 
     /// Whether an overlay modal is currently displayed. The browser panels
     /// behind it must not respond to mouse input while one is up, otherwise
-    /// clicking "through" a dialog changes selection or the active panel.
+    /// clicking "through" a dialog changes selection or the active panel. The
+    /// busy overlay (io_in_flight) counts too, though it isn't a `Modal`.
     pub fn any_modal_open(&self) -> bool {
-        self.pending_op.is_some()
-            || self.props_dialog.is_some()
-            || self.settings_draft.is_some()
-            || self.quick_jump.is_some()
-            || self.elevation_prompt.is_some()
-            || self.error_message.is_some()
-            || self.sftp_connecting.is_some()
-            || self.theme_picker_open
-            || self.io_in_flight > 0
+        self.modal.is_some() || self.io_in_flight > 0
+    }
+
+    // --- Modal accessors -----------------------------------------------------
+    // Typed views over the single `modal` field, so callers read the specific
+    // dialog they care about without matching the enum everywhere.
+
+    pub fn pending_op(&self) -> Option<&PendingOp> {
+        match self.modal {
+            Some(Modal::Confirm(ref op)) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn props_dialog(&self) -> Option<&PropsDialog> {
+        match self.modal {
+            Some(Modal::Props(ref d)) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn props_dialog_mut(&mut self) -> Option<&mut PropsDialog> {
+        match self.modal {
+            Some(Modal::Props(ref mut d)) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn settings_draft_mut(&mut self) -> Option<&mut crate::settings::Settings> {
+        match self.modal {
+            Some(Modal::Settings(ref mut s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn settings_open(&self) -> bool {
+        matches!(self.modal, Some(Modal::Settings(_)))
+    }
+
+    pub fn quick_jump(&self) -> Option<&QuickJumpState> {
+        match self.modal {
+            Some(Modal::QuickJump(ref q)) => Some(q),
+            _ => None,
+        }
+    }
+
+    pub fn quick_jump_mut(&mut self) -> Option<&mut QuickJumpState> {
+        match self.modal {
+            Some(Modal::QuickJump(ref mut q)) => Some(q),
+            _ => None,
+        }
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        match self.modal {
+            Some(Modal::Error(ref m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn sftp_connecting(&self) -> Option<&str> {
+        match self.modal {
+            Some(Modal::Connecting(ref h)) => Some(h),
+            _ => None,
+        }
+    }
+
+    pub fn elevation_message(&self) -> Option<&str> {
+        match self.modal {
+            Some(Modal::Elevation { ref message, .. }) => Some(message),
+            _ => None,
+        }
+    }
+
+    pub fn theme_picker_open(&self) -> bool {
+        matches!(self.modal, Some(Modal::ThemePicker))
+    }
+
+    /// Open a modal, replacing any that is currently showing. Single-modal by
+    /// construction: there is nowhere to put a second one.
+    pub fn open_modal(&mut self, modal: Modal) {
+        self.modal = Some(modal);
+    }
+
+    /// Close whatever modal is open (if any).
+    pub fn close_modal(&mut self) {
+        self.modal = None;
+    }
+
+    /// Take the pending elevation prompt, if that is the open modal.
+    pub fn take_elevation(&mut self) -> Option<(String, crate::core::IOTask)> {
+        if matches!(self.modal, Some(Modal::Elevation { .. })) {
+            match self.modal.take() {
+                Some(Modal::Elevation { message, task }) => Some((message, task)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Take the "connecting…" host and close that modal, if it is the open one.
+    pub fn take_connecting(&mut self) -> Option<String> {
+        if matches!(self.modal, Some(Modal::Connecting(_))) {
+            match self.modal.take() {
+                Some(Modal::Connecting(host)) => Some(host),
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 
     /// The browser tab that owns the currently-running search, if it still
@@ -1018,7 +1140,7 @@ impl AppState {
                 focus: true,
             });
             self.rename_input = None;
-            self.pending_op = None;
+            self.modal = None;
             self.rename_focus = false;
         }
     }
@@ -1437,22 +1559,22 @@ impl AppState {
     }
 
     pub fn prepare_copy_selected(&mut self) {
-        if self.pending_op.is_some() {
+        if self.modal.is_some() {
             return;
         }
         if let Some(op) = self.build_copy_op() {
             self.pending_collisions = Self::op_collisions(&op);
-            self.pending_op = Some(op);
+            self.modal = Some(Modal::Confirm(op));
         }
     }
 
     pub fn prepare_move_selected(&mut self) {
-        if self.pending_op.is_some() {
+        if self.modal.is_some() {
             return;
         }
         if let Some(op) = self.build_move_op() {
             self.pending_collisions = Self::op_collisions(&op);
-            self.pending_op = Some(op);
+            self.modal = Some(Modal::Confirm(op));
         }
     }
 
@@ -1488,23 +1610,23 @@ impl AppState {
     }
 
     pub fn prepare_delete_selected(&mut self) {
-        if self.pending_op.is_some() {
+        if self.modal.is_some() {
             return;
         }
         if let Some(op) = self.build_delete_op() {
-            self.pending_op = Some(op);
+            self.modal = Some(Modal::Confirm(op));
         }
     }
 
     pub fn prepare_pack_selected(&mut self) {
-        if self.pending_op.is_some() {
+        if self.modal.is_some() {
             return;
         }
         if let Some(op) = self.build_pack_op() {
-            self.pending_op = Some(op);
-            // Pre-fill archive name based on first source
-            let name = match self.pending_op {
-                Some(PendingOp::Pack { ref sources, .. }) => sources
+            // Pre-fill the archive name from the first source, before `op` moves
+            // into the modal.
+            let name = match op {
+                PendingOp::Pack { ref sources, .. } => sources
                     .first()
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
@@ -1512,6 +1634,7 @@ impl AppState {
                     .unwrap_or_else(|| "archive.zip".to_string()),
                 _ => "archive.zip".to_string(),
             };
+            self.modal = Some(Modal::Confirm(op));
             self.rename_input = Some(name);
             self.rename_focus = true;
         }
@@ -1519,11 +1642,17 @@ impl AppState {
 
     pub fn take_pending_op(&mut self) -> Option<PendingOp> {
         self.pending_collisions.clear();
-        self.pending_op.take()
+        match self.modal {
+            Some(Modal::Confirm(_)) => match self.modal.take() {
+                Some(Modal::Confirm(op)) => Some(op),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub fn clear_pending_op(&mut self) {
-        self.pending_op = None;
+        self.modal = None;
         self.pending_collisions.clear();
         self.rename_input = None;
         self.rename_focus = false;
@@ -1665,17 +1794,19 @@ impl AppState {
         }
 
         let filtered: Vec<usize> = (0..entries.len()).collect();
-        self.quick_jump = Some(QuickJumpState {
+        self.modal = Some(Modal::QuickJump(QuickJumpState {
             input: String::new(),
             entries,
             filtered,
             selected: 0,
             focus_input: true,
-        });
+        }));
     }
 
     pub fn close_quick_jump(&mut self) {
-        self.quick_jump = None;
+        if matches!(self.modal, Some(Modal::QuickJump(_))) {
+            self.modal = None;
+        }
     }
 
     pub fn enqueue_io(&mut self, task: IOTask) {
@@ -2076,7 +2207,7 @@ impl AppState {
     }
 
     pub fn switch_theme(&mut self) {
-        if self.theme.selected_external.is_some() && self.theme_picker_open {
+        if self.theme.selected_external.is_some() && self.theme_picker_open() {
             self.apply_selected_theme();
         } else {
             self.theme.toggle();
@@ -2084,12 +2215,14 @@ impl AppState {
     }
 
     pub fn open_theme_picker(&mut self) {
-        self.theme_picker_open = true;
+        self.modal = Some(Modal::ThemePicker);
         self.theme_picker_selected = self.theme.selected_external.or(Some(0));
     }
 
     pub fn close_theme_picker(&mut self) {
-        self.theme_picker_open = false;
+        if self.theme_picker_open() {
+            self.modal = None;
+        }
     }
 
     pub fn select_next_theme(&mut self) {
@@ -2116,7 +2249,9 @@ impl AppState {
         {
             self.theme.selected_external = Some(i);
         }
-        self.theme_picker_open = false;
+        if self.theme_picker_open() {
+            self.modal = None;
+        }
     }
 
     pub fn theme_names(&self) -> Vec<String> {

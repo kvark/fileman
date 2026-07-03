@@ -9,10 +9,11 @@ use crate::refresh_active_panel;
 use fileman::core;
 
 pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
-    let Some(dialog) = app.props_dialog.as_mut() else {
+    // Read theme colors before taking the mutable dialog borrow of `app`.
+    let colors = app.theme.colors();
+    let Some(dialog) = app.props_dialog_mut() else {
         return;
     };
-    let colors = app.theme.colors();
     let screen = ctx.content_rect();
     let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "props_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
@@ -25,7 +26,7 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
 
     let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
     if escape {
-        app.props_dialog = None;
+        app.close_modal();
         return;
     }
 
@@ -198,7 +199,7 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
         apply_props_dialog(app, recursive);
     }
     if let Some(("cancel", _)) = action {
-        app.props_dialog = None;
+        app.close_modal();
     }
 }
 
@@ -307,44 +308,51 @@ fn perms_row(
 
 #[cfg(unix)]
 fn apply_props_dialog(app: &mut app_state::AppState, recursive: bool) {
-    let Some(dialog) = app.props_dialog.as_mut() else {
-        return;
-    };
-    dialog.error = None;
-    let uid = match parse_user_value(&dialog.current.user) {
-        Ok(uid) => uid,
-        Err(err) => {
-            dialog.error = Some(err);
+    // Compute the update while the dialog is borrowed, then release the borrow
+    // before touching other AppState fields (io_tx, counters, panels).
+    let (target, new_mode, uid, gid, changed) = {
+        let Some(dialog) = app.props_dialog_mut() else {
             return;
-        }
+        };
+        dialog.error = None;
+        let uid = match parse_user_value(&dialog.current.user) {
+            Ok(uid) => uid,
+            Err(err) => {
+                dialog.error = Some(err);
+                return;
+            }
+        };
+        let gid = match parse_group_value(&dialog.current.group) {
+            Ok(gid) => gid,
+            Err(err) => {
+                dialog.error = Some(err);
+                return;
+            }
+        };
+        let new_mode = (dialog.original.mode & !0o777) | (dialog.current.mode & 0o777);
+        let changed = new_mode != dialog.original.mode
+            || uid != dialog.original.uid
+            || gid != dialog.original.gid;
+        (dialog.target.clone(), new_mode, uid, gid, changed)
     };
-    let gid = match parse_group_value(&dialog.current.group) {
-        Ok(gid) => gid,
-        Err(err) => {
-            dialog.error = Some(err);
-            return;
-        }
-    };
-    let new_mode = (dialog.original.mode & !0o777) | (dialog.current.mode & 0o777);
-    let changed = new_mode != dialog.original.mode
-        || uid != dialog.original.uid
-        || gid != dialog.original.gid;
     if !changed {
-        app.props_dialog = None;
+        app.close_modal();
         return;
     }
     if let Err(e) = app.io_tx.send(core::IOTask::SetProps {
-        path: dialog.target.clone(),
+        path: target,
         mode: new_mode,
         uid,
         gid,
         recursive,
     }) {
-        dialog.error = Some(format!("Failed to queue update: {e}"));
+        if let Some(dialog) = app.props_dialog_mut() {
+            dialog.error = Some(format!("Failed to queue update: {e}"));
+        }
         return;
     }
     app.io_in_flight = app.io_in_flight.saturating_add(1);
-    app.props_dialog = None;
+    app.close_modal();
     app.store_selection_memory_for(app.active_panel);
     refresh_active_panel(app);
 }

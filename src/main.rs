@@ -1285,7 +1285,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
     if let Some(ref rx) = app.sftp_connect_rx
         && let Ok(result) = rx.try_recv()
     {
-        let _host = app.sftp_connecting.take().unwrap_or_default();
+        let _host = app.take_connecting().unwrap_or_default();
         app.sftp_connect_rx = None;
         match result {
             Ok(session) => {
@@ -1622,7 +1622,7 @@ fn navigate_sftp(
         return;
     }
     // If another connection is already in progress, queue this one
-    if app.sftp_connecting.is_some() {
+    if app.sftp_connecting().is_some() {
         app.sftp_nav_queue
             .push_back((host.to_string(), remote_path.to_string(), target_panel));
         return;
@@ -1639,7 +1639,7 @@ fn navigate_sftp(
             wake();
         }
     });
-    app.sftp_connecting = Some(host.to_string());
+    app.open_modal(app_state::Modal::Connecting(host.to_string()));
     app.sftp_connect_rx = Some(rx);
     app.sftp_pending_nav = Some((host.to_string(), remote_path.to_string(), target_panel));
 }
@@ -3206,7 +3206,7 @@ fn open_props_dialog(app: &mut app_state::AppState) {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
 
-    app.props_dialog = Some(app_state::PropsDialog {
+    app.open_modal(app_state::Modal::Props(app_state::PropsDialog {
         target: path.clone(),
         original: app_state::FileProps {
             mode,
@@ -3225,7 +3225,7 @@ fn open_props_dialog(app: &mut app_state::AppState) {
             group: group_label,
         },
         error: None,
-    });
+    }));
 }
 
 fn file_type_label(meta: &std::fs::Metadata) -> String {
@@ -3288,7 +3288,7 @@ fn open_props_dialog(app: &mut app_state::AppState) {
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
-    app.props_dialog = Some(app_state::PropsDialog {
+    app.open_modal(app_state::Modal::Props(app_state::PropsDialog {
         target: path.clone(),
         original: app_state::FileProps {
             mode: 0,
@@ -3307,7 +3307,7 @@ fn open_props_dialog(app: &mut app_state::AppState) {
             group: String::new(),
         },
         error: None,
-    });
+    }));
 }
 
 struct Runtime {
@@ -3918,11 +3918,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             container_last_selected_name: Default::default(),
             container_dir_cache: Default::default(),
             archive_index: Default::default(),
-            props_dialog: None,
+            modal: None,
             theme: theme::Theme::dark(),
-            theme_picker_open: false,
             theme_picker_selected: None,
-            pending_op: None,
             pending_collisions: Vec::new(),
             rename_input: None,
             rename_focus: false,
@@ -3956,15 +3954,10 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let dev = context.device_information();
                 format!("{} ({})", dev.device_name, backend)
             },
-            quick_jump: None,
-            error_message: None,
             error_log: Vec::new(),
             settings: loaded_settings,
-            settings_draft: None,
-            elevation_prompt: None,
             sftp_sessions: HashMap::new(),
             sftp_sessions_shared: sftp_sessions_shared.clone(),
-            sftp_connecting: None,
             sftp_connect_rx: None,
             sftp_pending_nav: None,
             sftp_nav_queue: std::collections::VecDeque::new(),
@@ -4096,7 +4089,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         core::IOResult::PermissionError { message, task } => {
                             local_refresh = true;
                             if fileman::elevate::elevation_available() {
-                                runtime.app.elevation_prompt = Some((message, task));
+                                runtime
+                                    .app
+                                    .open_modal(app_state::Modal::Elevation { message, task });
                             } else {
                                 io_errors.push(message);
                             }
@@ -4458,14 +4453,14 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         }
                     });
 
-                    if runtime.app.theme_picker_open {
+                    if runtime.app.theme_picker_open() {
                         ui::theme_picker::draw_theme_picker(&ctx, &mut runtime.app);
                     }
-                    if runtime.app.settings_draft.is_some() {
+                    if runtime.app.settings_open() {
                         let outcome = {
                             let externals = runtime.app.theme.external.clone();
                             let theme_clone = runtime.app.theme.clone();
-                            let draft = runtime.app.settings_draft.as_mut().unwrap();
+                            let draft = runtime.app.settings_draft_mut().unwrap();
                             ui::settings::draw_settings(&ctx, &theme_clone, &externals, draft)
                         };
                         match outcome {
@@ -4478,7 +4473,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                             ui::settings::SettingsOutcome::Stay => {}
                         }
                     }
-                    if runtime.app.pending_op.is_some() {
+                    if runtime.app.pending_op().is_some() {
                         ui::modals::draw_confirmation(&ctx, &mut runtime.app);
                     }
                     if let Some(edit) = runtime.app.edit_panel_mut()
@@ -4486,13 +4481,13 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     {
                         ui::modals::draw_discard_modal(&ctx, &mut runtime.app);
                     }
-                    if runtime.app.props_dialog.is_some() {
+                    if runtime.app.props_dialog().is_some() {
                         ui::props_dialog::draw_props_modal(&ctx, &mut runtime.app);
                     }
                     if runtime.app.io_in_flight > 0 {
                         ui::modals::draw_progress_modal(&ctx, &runtime.app);
                     }
-                    if runtime.app.quick_jump.is_some()
+                    if runtime.app.quick_jump().is_some()
                         && let Some(result) =
                             ui::quick_jump::draw_quick_jump(&ctx, &mut runtime.app)
                     {
@@ -4500,27 +4495,27 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         runtime.app.close_quick_jump();
                         navigate_quick_jump(&mut runtime.app, result, active);
                     }
-                    if let Some(ref host) = runtime.app.sftp_connecting.clone() {
-                        draw_connecting_modal(&ctx, host);
+                    if let Some(host) = runtime.app.sftp_connecting().map(|s| s.to_string()) {
+                        draw_connecting_modal(&ctx, &host);
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     }
-                    if let Some((ref msg, _)) = runtime.app.elevation_prompt.clone() {
-                        match draw_elevation_modal(&ctx, msg) {
+                    if let Some(msg) = runtime.app.elevation_message().map(|s| s.to_string()) {
+                        match draw_elevation_modal(&ctx, &msg) {
                             Some(true) => {
-                                if let Some((_, task)) = runtime.app.elevation_prompt.take() {
+                                if let Some((_, task)) = runtime.app.take_elevation() {
                                     runtime
                                         .app
                                         .enqueue_io(core::IOTask::Elevated(Box::new(task)));
                                 }
                             }
                             Some(false) => {
-                                runtime.app.elevation_prompt = None;
+                                runtime.app.close_modal();
                             }
                             None => {}
                         }
                     }
-                    if let Some(ref msg) = runtime.app.error_message.clone() {
-                        draw_error_modal(&ctx, msg);
+                    if let Some(msg) = runtime.app.error_message().map(|s| s.to_string()) {
+                        draw_error_modal(&ctx, &msg);
                     }
                     draw_async_indicator(&ctx, &runtime.app);
                 });
@@ -5005,11 +5000,11 @@ fn draw_root_ui(render: UiRender<'_>) {
             );
         }
     });
-    if app.settings_draft.is_some() {
+    if app.settings_open() {
         let outcome = {
             let externals = app.theme.external.clone();
             let theme_clone = app.theme.clone();
-            let draft = app.settings_draft.as_mut().unwrap();
+            let draft = app.settings_draft_mut().unwrap();
             ui::settings::draw_settings(&ctx, &theme_clone, &externals, draft)
         };
         match outcome {
@@ -5018,7 +5013,7 @@ fn draw_root_ui(render: UiRender<'_>) {
             ui::settings::SettingsOutcome::Stay => {}
         }
     }
-    if app.pending_op.is_some() {
+    if app.pending_op().is_some() {
         ui::modals::draw_confirmation(&ctx, app);
     }
     if let Some(edit) = app.edit_panel_mut()
@@ -5026,13 +5021,13 @@ fn draw_root_ui(render: UiRender<'_>) {
     {
         ui::modals::draw_discard_modal(&ctx, app);
     }
-    if app.props_dialog.is_some() {
+    if app.props_dialog().is_some() {
         ui::props_dialog::draw_props_modal(&ctx, app);
     }
     if app.io_in_flight > 0 {
         ui::modals::draw_progress_modal(&ctx, app);
     }
-    if app.quick_jump.is_some()
+    if app.quick_jump().is_some()
         && let Some(result) = ui::quick_jump::draw_quick_jump(&ctx, app)
     {
         let active = app.active_panel;

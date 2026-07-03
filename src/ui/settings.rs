@@ -172,18 +172,20 @@ fn bookmark_editor(
 
 /// Open the settings modal: populate the draft from current settings.
 pub fn open(app: &mut app_state::AppState) {
-    app.settings_draft = Some(app.settings.clone());
+    let draft = app.settings.clone();
+    app.open_modal(app_state::Modal::Settings(draft));
 }
 
 /// Close without saving: drop the draft.
 pub fn cancel(app: &mut app_state::AppState) {
-    app.settings_draft = None;
+    app.close_modal();
 }
 
 /// Apply the draft as the new settings, persist to disk, and close. The
 /// theme preference is also applied to the live theme.
 pub fn save(app: &mut app_state::AppState) {
-    if let Some(draft) = app.settings_draft.take() {
+    if let Some(draft) = app.settings_draft_mut().map(|d| d.clone()) {
+        app.close_modal();
         app.settings = draft;
         crate::apply_theme_preference(&mut app.theme, &app.settings.theme);
         if let Err(e) = fileman::settings::save(&app.settings) {
