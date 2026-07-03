@@ -72,7 +72,7 @@ fn shell_escape(s: &str) -> String {
 #[cfg(target_os = "windows")]
 fn run_elevated_platform(program: &str, args: &[&str]) -> Result<(), String> {
     use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStrExt as _;
     use std::ptr;
 
     #[repr(C)]
@@ -326,7 +326,7 @@ fn elevated_write_file(path: &Path, contents: &[u8]) -> Result<(), String> {
     // Write with restrictive permissions on Unix.
     #[cfg(unix)]
     {
-        use std::io::Write;
+        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)

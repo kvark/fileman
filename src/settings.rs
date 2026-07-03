@@ -148,7 +148,7 @@ pub fn load() -> Settings {
 /// write is atomic (temp file + fsync + rename) so a crash mid-write can't
 /// truncate the settings file, which `load` would then treat as corrupt.
 pub fn save(settings: &Settings) -> anyhow::Result<()> {
-    use std::io::Write;
+    use std::io::Write as _;
     let dir = config_dir().ok_or_else(|| anyhow::anyhow!("no config dir available"))?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("settings.ron");

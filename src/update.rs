@@ -132,7 +132,7 @@ fn extract_and_replace(
 }
 
 fn extract_from_tar_gz(data: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read;
+    use std::io::Read as _;
     let gz = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(gz);
     for entry in archive.entries()? {
@@ -148,7 +148,7 @@ fn extract_from_tar_gz(data: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn extract_from_zip(data: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
-    use std::io::{Cursor, Read};
+    use std::io::{Cursor, Read as _};
     let cursor = Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)?;
     for i in 0..archive.len() {
@@ -164,7 +164,7 @@ fn extract_from_zip(data: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn atomic_replace(target: &std::path::Path, new_binary: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
+    use std::io::Write as _;
 
     let dir = target
         .parent()
@@ -181,7 +181,7 @@ fn atomic_replace(target: &std::path::Path, new_binary: &[u8]) -> anyhow::Result
     // Set executable permission on Unix
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
