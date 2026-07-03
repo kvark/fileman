@@ -462,6 +462,7 @@ fn init_headless_app(root: Option<PathBuf>) -> anyhow::Result<app_state::AppStat
         theme_picker_open: false,
         theme_picker_selected: None,
         pending_op: None,
+        pending_collisions: Vec::new(),
         rename_input: None,
         rename_focus: false,
         edit_request_id: 0,
