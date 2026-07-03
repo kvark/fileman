@@ -26,6 +26,8 @@ pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
         op,
         app_state::PendingOp::Rename { .. } | app_state::PendingOp::Pack { .. }
     );
+    let collisions = &app.pending_collisions;
+    let overwrite = !collisions.is_empty();
 
     egui::Window::new(title)
         .collapsible(false)
@@ -34,6 +36,25 @@ pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
         .show(ctx, |ui| {
             ui.add_space(4.0);
             ui.colored_label(color32(colors.row_fg_active), body);
+            if overwrite {
+                ui.add_space(8.0);
+                let warn = egui::Color32::from_rgb(230, 170, 70);
+                let header = if collisions.len() == 1 {
+                    "1 item already exists and will be overwritten:".to_string()
+                } else {
+                    format!(
+                        "{} items already exist and will be overwritten:",
+                        collisions.len()
+                    )
+                };
+                ui.colored_label(warn, header);
+                for name in collisions.iter().take(6) {
+                    ui.colored_label(warn, format!("  • {name}"));
+                }
+                if collisions.len() > 6 {
+                    ui.colored_label(warn, format!("  … and {} more", collisions.len() - 6));
+                }
+            }
             if is_rename {
                 ui.add_space(8.0);
                 let mut name = app.rename_input.clone().unwrap_or_default();
@@ -65,7 +86,9 @@ pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
             } else {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    let yes = ui.add(egui::Button::new("Yes").min_size(egui::vec2(80.0, 0.0)));
+                    let yes_label = if overwrite { "Overwrite" } else { "Yes" };
+                    let yes =
+                        ui.add(egui::Button::new(yes_label).min_size(egui::vec2(80.0, 0.0)));
                     let no = ui.add(egui::Button::new("No").min_size(egui::vec2(80.0, 0.0)));
                     if yes.clicked() {
                         confirmed = true;

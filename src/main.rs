@@ -3920,6 +3920,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             theme_picker_open: false,
             theme_picker_selected: None,
             pending_op: None,
+            pending_collisions: Vec::new(),
             rename_input: None,
             rename_focus: false,
             edit_request_id: 0,

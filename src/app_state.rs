@@ -465,6 +465,10 @@ pub struct AppState {
     pub theme_picker_open: bool,
     pub theme_picker_selected: Option<usize>,
     pub pending_op: Option<PendingOp>,
+    /// Destination names that a pending Copy/Move would overwrite, computed once
+    /// when the op is prepared and shown in the confirmation dialog so the user
+    /// consents to clobbering existing files.
+    pub pending_collisions: Vec<String>,
     pub rename_input: Option<String>,
     pub rename_focus: bool,
     pub edit_tx: mpsc::Sender<EditLoadRequest>,
@@ -1412,6 +1416,7 @@ impl AppState {
             return;
         }
         if let Some(op) = self.build_copy_op() {
+            self.pending_collisions = Self::op_collisions(&op);
             self.pending_op = Some(op);
         }
     }
@@ -1421,8 +1426,40 @@ impl AppState {
             return;
         }
         if let Some(op) = self.build_move_op() {
+            self.pending_collisions = Self::op_collisions(&op);
             self.pending_op = Some(op);
         }
+    }
+
+    /// Names of existing entries a Copy/Move would overwrite at a *local*
+    /// destination. Remote destinations are not stat-checked here (that would
+    /// require a blocking round-trip), so they return no collisions.
+    fn op_collisions(op: &PendingOp) -> Vec<String> {
+        let (items, dst) = match *op {
+            PendingOp::Copy {
+                ref items,
+                ref dst,
+            }
+            | PendingOp::Move {
+                ref items,
+                ref dst,
+            } => (items, dst),
+            _ => return Vec::new(),
+        };
+        let CopyDest::Local(ref dir) = *dst else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                let name = item.src.display_name();
+                if dir.join(&name).symlink_metadata().is_ok() {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn prepare_delete_selected(&mut self) {
@@ -1456,11 +1493,13 @@ impl AppState {
     }
 
     pub fn take_pending_op(&mut self) -> Option<PendingOp> {
+        self.pending_collisions.clear();
         self.pending_op.take()
     }
 
     pub fn clear_pending_op(&mut self) {
         self.pending_op = None;
+        self.pending_collisions.clear();
         self.rename_input = None;
         self.rename_focus = false;
     }
@@ -2079,5 +2118,69 @@ impl AppState {
         if let Some(return_focus) = self.preview_return_focus.take() {
             self.active_panel = return_focus;
         }
+    }
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TmpDir(std::path::PathBuf);
+    impl TmpDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut p = std::env::temp_dir();
+            p.push(format!("fileman-collision-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fs_item(path: &str) -> CopyItem {
+        CopyItem {
+            src: EntryLocation::Fs(path.into()),
+            kind: CopyKind::File,
+        }
+    }
+
+    #[test]
+    fn reports_only_existing_local_targets() {
+        let dst = TmpDir::new();
+        std::fs::write(dst.0.join("a.txt"), b"x").unwrap();
+        let op = PendingOp::Copy {
+            items: vec![fs_item("/src/a.txt"), fs_item("/src/b.txt")],
+            dst: CopyDest::Local(dst.0.clone()),
+        };
+        assert_eq!(AppState::op_collisions(&op), vec!["a.txt".to_string()]);
+    }
+
+    #[test]
+    fn move_targets_are_checked_too() {
+        let dst = TmpDir::new();
+        std::fs::write(dst.0.join("keep.bin"), b"x").unwrap();
+        let op = PendingOp::Move {
+            items: vec![fs_item("/src/keep.bin")],
+            dst: CopyDest::Local(dst.0.clone()),
+        };
+        assert_eq!(AppState::op_collisions(&op), vec!["keep.bin".to_string()]);
+    }
+
+    #[test]
+    fn remote_dest_reports_no_collisions() {
+        let op = PendingOp::Copy {
+            items: vec![fs_item("/src/a.txt")],
+            dst: CopyDest::Remote {
+                host: "h".into(),
+                path: "/p".into(),
+            },
+        };
+        assert!(AppState::op_collisions(&op).is_empty());
     }
 }
