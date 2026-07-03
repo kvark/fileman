@@ -298,6 +298,13 @@ pub(crate) fn handle_keyboard(
         app.panel(app.active_panel).mode,
         app_state::PanelMode::Preview(_)
     );
+    // The Settings modal owns the keyboard while open: return before any
+    // shortcut is consumed so egui's widgets receive typing, Tab (field
+    // navigation), and Enter, and no panel action fires on the panel beneath
+    // it. Escape (close) is handled by the settings view itself.
+    if app.settings_draft.is_some() {
+        return;
+    }
     // In edit mode, don't consume Ctrl+letter shortcuts that egui's TextEdit
     // needs (copy, paste, cut, select-all, undo, redo, etc.).
     let ctrl_h = !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::H));
