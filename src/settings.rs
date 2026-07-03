@@ -132,18 +132,77 @@ pub fn load() -> Settings {
         Ok(s) => s,
         Err(e) => {
             eprintln!("settings: parse error in {}: {e}", path.display());
+            // Preserve the unparseable file rather than letting the next save
+            // silently overwrite it — it may hold recoverable bookmarks.
+            let backup = path.with_extension("ron.corrupt");
+            match std::fs::rename(&path, &backup) {
+                Ok(()) => eprintln!("settings: moved corrupt file to {}", backup.display()),
+                Err(re) => eprintln!("settings: could not preserve corrupt file: {re}"),
+            }
             Settings::default()
         }
     }
 }
 
-/// Serialize settings to disk. Creates the config directory if needed.
+/// Serialize settings to disk. Creates the config directory if needed. The
+/// write is atomic (temp file + fsync + rename) so a crash mid-write can't
+/// truncate the settings file, which `load` would then treat as corrupt.
 pub fn save(settings: &Settings) -> anyhow::Result<()> {
+    use std::io::Write;
     let dir = config_dir().ok_or_else(|| anyhow::anyhow!("no config dir available"))?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("settings.ron");
     let pretty = ron::ser::PrettyConfig::default();
     let text = ron::ser::to_string_pretty(settings, pretty)?;
-    std::fs::write(&path, text)?;
+    let tmp = dir.join("settings.ron.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_preserves_fields() {
+        let s = Settings {
+            show_glyphs: false,
+            auto_refresh: false,
+            theme: ThemePref::External("solarized".into()),
+            bookmarks: vec![Bookmark {
+                label: "home".into(),
+                host: "example.com".into(),
+                path: "/srv".into(),
+            }],
+            ..Settings::default()
+        };
+        let text = ron::ser::to_string_pretty(&s, ron::ser::PrettyConfig::default()).unwrap();
+        let back: Settings = ron::from_str(&text).unwrap();
+        assert!(!back.show_glyphs);
+        assert!(!back.auto_refresh);
+        assert_eq!(back.bookmarks.len(), 1);
+        assert_eq!(back.bookmarks[0].host, "example.com");
+        assert!(matches!(back.theme, ThemePref::External(ref n) if n == "solarized"));
+    }
+
+    #[test]
+    fn garbage_does_not_parse() {
+        assert!(ron::from_str::<Settings>("this is not ron {{{").is_err());
+        assert!(ron::from_str::<Settings>("").is_err());
+    }
+
+    #[test]
+    fn missing_fields_fall_back_to_defaults() {
+        // A minimal file (as an older/newer version might write) must still load,
+        // with absent fields taking their #[serde(default)] values.
+        let s: Settings = ron::from_str("(theme: Dark)").unwrap();
+        assert!(s.show_glyphs);
+        assert!(s.row_striping);
+        assert!(s.bookmarks.is_empty());
+    }
 }
