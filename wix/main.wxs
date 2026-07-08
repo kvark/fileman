@@ -21,15 +21,30 @@
         Codepage='1252'
         Version='$(var.Version)'>
 
+        <!-- MSI 5.0 "single package authoring": the package is marked as not
+             requiring elevation (InstallScope=perUser sets the LUA summary
+             bit), and ALLUSERS=2 + MSIINSTALLPERUSER=1 make the default
+             resolution a per-user install — so no UAC prompt appears. The
+             WixUI_Advanced scope dialog can switch to a per-machine install,
+             at which point Windows Installer shows the UAC prompt. Requires
+             Windows Installer 5.0 (Windows 7+). -->
         <Package Id='*'
             Keywords='Installer'
             Description='Two-panel file manager'
             Manufacturer='Dzmitry Malyshau'
-            InstallerVersion='450'
+            InstallerVersion='500'
             Languages='1033'
             Compressed='yes'
-            InstallScope='perMachine'
+            InstallScope='perUser'
             SummaryCodepage='1252' />
+
+        <Property Id='ALLUSERS' Value='2' />
+        <Property Id='MSIINSTALLPERUSER' Value='1' />
+
+        <!-- Required by WixUI_Advanced: the leaf folder name, and the default
+             selection on the install-scope dialog (per-user). -->
+        <Property Id='ApplicationFolderName' Value='FileMan' />
+        <Property Id='WixAppFolder' Value='WixPerUserFolder' />
 
         <MajorUpgrade
             Schedule='afterInstallInitialize'
@@ -38,6 +53,9 @@
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
         <Property Id='DiskPrompt' Value='FileMan Installation'/>
 
+        <!-- Authored under Program Files (the per-machine location). For a
+             per-user install, WixUI_Advanced's custom actions redirect
+             APPLICATIONFOLDER to the per-user folder at run time. -->
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
                 <Directory Id='APPLICATIONFOLDER' Name='FileMan'>
@@ -61,11 +79,34 @@
                 </Directory>
             </Directory>
 
-            <!-- Start Menu directory structure -->
+            <!-- Start Menu directory structure (per-user or common Start Menu,
+                 depending on the chosen scope) -->
             <Directory Id="ProgramMenuFolder">
                 <Directory Id="ApplicationProgramsFolder" Name="FileMan" />
             </Directory>
         </Directory>
+
+        <!-- WixUI_Advanced's stock defaults are [ProgramFilesFolder] (32-bit,
+             wrong on x64) for per-machine and [LocalAppDataFolder]Apps\... for
+             per-user. Overwrite both right after the stock actions set them:
+             per-machine follows the build arch, per-user uses the conventional
+             %LocalAppData%\Programs location. -->
+        <CustomAction Id='OverwriteWixPerMachineFolder'
+            Property='WixPerMachineFolder'
+            Value='[$(var.PlatformProgramFilesFolder)][ApplicationFolderName]'
+            Execute='immediate' />
+        <CustomAction Id='OverwriteWixPerUserFolder'
+            Property='WixPerUserFolder'
+            Value='[LocalAppDataFolder]Programs\[ApplicationFolderName]'
+            Execute='immediate' />
+        <InstallUISequence>
+            <Custom Action='OverwriteWixPerMachineFolder' After='WixSetDefaultPerMachineFolder' />
+            <Custom Action='OverwriteWixPerUserFolder' After='WixSetDefaultPerUserFolder' />
+        </InstallUISequence>
+        <InstallExecuteSequence>
+            <Custom Action='OverwriteWixPerMachineFolder' After='WixSetDefaultPerMachineFolder' />
+            <Custom Action='OverwriteWixPerUserFolder' After='WixSetDefaultPerUserFolder' />
+        </InstallExecuteSequence>
 
         <Icon Id="FileManIcon" SourceFile="etc\windows\icon.ico" />
         <!-- Icon in Add/Remove Programs -->
@@ -115,8 +156,11 @@
 
         <Property Id='ARPHELPLINK' Value='https://github.com/kvark/fileman'/>
 
+        <!-- WixUI_Advanced: one-click "Install" (per-user, no elevation) on the
+             welcome page, plus an "Advanced" path with the per-user/per-machine
+             scope chooser and feature/directory pages. -->
         <UI>
-            <UIRef Id='WixUI_FeatureTree'/>
+            <UIRef Id='WixUI_Advanced'/>
         </UI>
 
         <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
