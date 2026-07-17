@@ -283,10 +283,8 @@ pub fn start_io_worker(
                                 .file_name()
                                 .map(|s| s.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| "file".to_string());
-                            let tmp = dir.join(format!(
-                                ".{fname}.fileman-tmp.{}",
-                                std::process::id()
-                            ));
+                            let tmp =
+                                dir.join(format!(".{fname}.fileman-tmp.{}", std::process::id()));
                             {
                                 let mut f = std::fs::File::create(&tmp)?;
                                 f.write_all(&contents)?;

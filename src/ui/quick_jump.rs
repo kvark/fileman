@@ -177,7 +177,9 @@ fn expand_tilde(input: &str) -> String {
         let home = {
             #[cfg(windows)]
             {
-                std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()
+                std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .ok()
             }
             #[cfg(not(windows))]
             {

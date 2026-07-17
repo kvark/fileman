@@ -98,8 +98,7 @@ pub fn draw_help(
                             ui.add_space(10.0);
                             ui.colored_label(
                                 color32(colors.row_fg_inactive),
-                                egui::RichText::new(relative_time(now, entry.when))
-                                    .monospace(),
+                                egui::RichText::new(relative_time(now, entry.when)).monospace(),
                             );
                             ui.colored_label(
                                 color32(colors.row_fg_selected),

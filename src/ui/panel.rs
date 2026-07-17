@@ -74,11 +74,7 @@ fn draw_status_line(
                 .sum();
             let count = browser.marked.len();
             let label = if total > 0 {
-                format!(
-                    "{} marked ({})",
-                    count,
-                    core::format_size(total)
-                )
+                format!("{} marked ({})", count, core::format_size(total))
             } else {
                 format!("{count} marked")
             };
@@ -160,9 +156,19 @@ fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
         ) -> i32;
     }
 
-    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut free_available: u64 = 0;
-    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_available, std::ptr::null_mut(), std::ptr::null_mut()) };
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
     if ok != 0 { Some(free_available) } else { None }
 }
 
@@ -492,8 +498,8 @@ pub fn draw_panel(
                                                 );
                                                 let t = ui.ctx().input(|i| i.time);
                                                 let frames = [
-                                                    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧",
-                                                    "⠇", "⠏",
+                                                    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
+                                                    "⠏",
                                                 ];
                                                 let spinner =
                                                     frames[((t * 10.0) as usize) % frames.len()];
@@ -519,10 +525,8 @@ pub fn draw_panel(
                                             // Reserve space for the active-panel dot
                                             let dot_space =
                                                 if is_active { header_font.size } else { 0.0 };
-                                            let sep_color = color32(fade_color(
-                                                colors.header_fg,
-                                                0.55,
-                                            ));
+                                            let sep_color =
+                                                color32(fade_color(colors.header_fg, 0.55));
                                             let text_fmt = |font: &egui::FontId, color| {
                                                 egui::text::TextFormat {
                                                     font_id: font.clone(),
@@ -796,10 +800,8 @@ pub fn draw_panel(
 
                                         // Gutter dot for marked entries
                                         if is_marked {
-                                            let dot_center = egui::pos2(
-                                                rect.left() + 3.5,
-                                                rect.center().y,
-                                            );
+                                            let dot_center =
+                                                egui::pos2(rect.left() + 3.5, rect.center().y);
                                             ui.painter().circle_filled(
                                                 dot_center,
                                                 2.5,
@@ -1050,7 +1052,12 @@ pub fn draw_panel(
                                         let search_open = is_active
                                             && app.search_ui == app_state::SearchUiState::Open;
                                         if !search_open {
-                                            draw_status_line(ui, app, panel_side_for_closure, &colors);
+                                            draw_status_line(
+                                                ui,
+                                                app,
+                                                panel_side_for_closure,
+                                                &colors,
+                                            );
                                         }
                                         if search_open {
                                             ui.horizontal(|ui| {
@@ -1096,12 +1103,12 @@ pub fn draw_panel(
         // 2px colored stripe down the left edge — reads as the active panel in
         // peripheral vision faster than the surrounding border.
         let rect = panel_response.response.rect;
-        let stripe = egui::Rect::from_min_max(
-            rect.min,
-            egui::pos2(rect.min.x + 2.0, rect.max.y),
+        let stripe = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 2.0, rect.max.y));
+        ui.painter().rect_filled(
+            stripe,
+            egui::CornerRadius::ZERO,
+            color32(colors.panel_border_active),
         );
-        ui.painter()
-            .rect_filled(stripe, egui::CornerRadius::ZERO, color32(colors.panel_border_active));
     }
 
     if panel_response.response.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
