@@ -31,7 +31,7 @@ pub fn draw_editor(ui: &mut egui::Ui, ctx: EditorRender<'_>) {
     ui.push_id("editor_panel", |ui| {
         egui::Frame::NONE
             .stroke(egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 color32(if is_focused {
                     colors.panel_border_active
                 } else {

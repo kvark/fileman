@@ -53,7 +53,7 @@ pub fn draw_help(
         egui::Frame::NONE
             .fill(color32(colors.preview_bg))
             .stroke(egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 color32(if is_focused {
                     colors.panel_border_active
                 } else {

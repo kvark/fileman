@@ -122,7 +122,7 @@ fn worker_dot(ui: &mut egui::Ui, active: bool, colors: &theme::ThemeColors) {
         ui.painter().circle_stroke(
             center,
             r,
-            egui::Stroke::new(1.0, color32(fade_color(colors.footer_fg, 0.5))),
+            egui::Stroke::new(1.0_f32, color32(fade_color(colors.footer_fg, 0.5))),
         );
     }
 }
@@ -225,7 +225,7 @@ fn draw_file_icon(
         painter.rect_stroke(
             r,
             egui::CornerRadius::same(1),
-            egui::Stroke::new(1.2, color),
+            egui::Stroke::new(1.2_f32, color),
             egui::StrokeKind::Middle,
         );
         for dy in [-2.0_f32, 0.0, 2.0] {
@@ -235,7 +235,7 @@ fn draw_file_icon(
                     egui::pos2(r.left() + 1.5, y),
                     egui::pos2(r.right() - 1.5, y),
                 ],
-                egui::Stroke::new(0.8, color),
+                egui::Stroke::new(0.8_f32, color),
             );
         }
     } else if core::is_image_name(&entry.name) {
@@ -244,7 +244,7 @@ fn draw_file_icon(
         painter.rect_stroke(
             r,
             egui::CornerRadius::same(1),
-            egui::Stroke::new(1.2, color),
+            egui::Stroke::new(1.2_f32, color),
             egui::StrokeKind::Middle,
         );
         let d = s * 0.5;
@@ -281,7 +281,7 @@ fn draw_file_icon(
             let y = center.y + dy;
             painter.line_segment(
                 [egui::pos2(center.x - w, y), egui::pos2(center.x + w, y)],
-                egui::Stroke::new(1.2, color),
+                egui::Stroke::new(1.2_f32, color),
             );
         }
     } else {
@@ -290,7 +290,7 @@ fn draw_file_icon(
         painter.rect_stroke(
             r,
             egui::CornerRadius::same(1),
-            egui::Stroke::new(1.2, color),
+            egui::Stroke::new(1.2_f32, color),
             egui::StrokeKind::Middle,
         );
         // Folded corner
@@ -385,7 +385,7 @@ pub fn draw_panel(
         .push_id("browser_panel", |ui| {
             egui::Frame::NONE
                 .stroke(egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     color32(if is_active {
                         colors.panel_border_active
                     } else {
