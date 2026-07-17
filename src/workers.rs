@@ -1093,6 +1093,10 @@ fn send_streaming_preview<R: Read>(
     let mut is_text = force_text;
     let mut bom_stripped = false;
     let mut sent_any = false;
+    // Text decoder chosen after the first chunk. UTF-8 by default; if the
+    // first chunk isn't valid UTF-8, chardetng picks a legacy encoding
+    // (CP1251, CP1252, Shift_JIS, …) and encoding_rs decodes incrementally.
+    let mut decoder: Option<encoding_rs::Decoder> = None;
 
     while remaining > 0 {
         if !is_preview_current(current_id, id) {
@@ -1120,12 +1124,24 @@ fn send_streaming_preview<R: Read>(
             } else {
                 chunk
             };
-            let text = String::from_utf8_lossy(chunk).into_owned();
+            let dec = decoder.get_or_insert_with(|| {
+                let encoding = if std::str::from_utf8(chunk).is_ok() {
+                    encoding_rs::UTF_8
+                } else {
+                    let mut det = chardetng::EncodingDetector::new();
+                    det.feed(chunk, remaining == 0);
+                    det.guess(None, true)
+                };
+                encoding.new_decoder_without_bom_handling()
+            });
+            let last = remaining == 0;
+            let mut text = String::with_capacity(chunk.len() + 16);
+            let (_, _, _) = dec.decode_to_string(chunk, &mut text, last);
             let _ = tx.send((
                 id,
                 PreviewContent::TextChunk {
                     text,
-                    done: remaining == 0,
+                    done: last,
                 },
             ));
         } else {

@@ -787,7 +787,21 @@ pub fn read_text_preview(path: &Path, max_bytes: usize) -> anyhow::Result<String
     let mut file = fs::File::open(path)?;
     let mut buf = Vec::new();
     file.by_ref().take(max_bytes as u64).read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(decode_text_bytes(&buf))
+}
+
+/// Decode a byte slice as text. Prefers UTF-8; falls back to chardetng
+/// detection for legacy encodings (CP1251, CP1252, Shift_JIS, GBK, …).
+pub fn decode_text_bytes(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    let mut det = chardetng::EncodingDetector::new();
+    det.feed(bytes, true);
+    let encoding = det.guess(None, true);
+    let (decoded, _, _) = encoding.decode(bytes);
+    decoded.into_owned()
 }
 
 pub fn read_bytes_prefix(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
