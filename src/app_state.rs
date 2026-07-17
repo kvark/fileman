@@ -302,6 +302,10 @@ pub struct ArchiveFullIndex {
     pub entries: Vec<(String, bool, Option<u64>)>,
     pub root: Option<String>,
     pub complete: bool,
+    /// Set when the loader thread hit an I/O error (permission denied,
+    /// corrupt archive, …). Callers should evict the cached index and
+    /// re-attempt indexing rather than reuse the empty entries.
+    pub failed: bool,
 }
 
 pub struct ContainerDirCache {
