@@ -1088,8 +1088,20 @@ mod fuzz {
 
     fn random_key(rng: &mut Xs64) -> ReplayKey {
         const KEYS: &[&str] = &[
-            "Down", "Down", "Up", "Up", "Home", "End", "PageDown", "PageUp",
-            "Enter", "Backspace", "Tab", "F2", "F1", "Insert",
+            "Down",
+            "Down",
+            "Up",
+            "Up",
+            "Home",
+            "End",
+            "PageDown",
+            "PageUp",
+            "Enter",
+            "Backspace",
+            "Tab",
+            "F2",
+            "F1",
+            "Insert",
         ];
         let key = (*rng.pick(KEYS)).to_string();
         // Occasionally inject Ctrl+ shortcuts
@@ -1113,8 +1125,7 @@ mod fuzz {
 
         for seed in 0..30u64 {
             let mut rng = Xs64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
-            let mut app =
-                init_headless_app(Some(tmp.clone())).expect("init_headless_app");
+            let mut app = init_headless_app(Some(tmp.clone())).expect("init_headless_app");
             let mut ui_cache = UiCache {
                 left_rows: 12,
                 right_rows: 12,
@@ -1136,10 +1147,7 @@ mod fuzz {
                 let key_for_msg = key.key.clone();
                 apply_replay_key(&mut headless, &mut app, &mut ui_cache, &key);
                 drain_async(&mut app, 50);
-                check_invariants(
-                    &app,
-                    &format!("seed={seed} step={step} key={key_for_msg}"),
-                );
+                check_invariants(&app, &format!("seed={seed} step={step} key={key_for_msg}"));
             }
             // Drain anything left so the next iteration starts clean.
             wait_for_idle(&mut headless, &mut app, &mut ui_cache, 200);

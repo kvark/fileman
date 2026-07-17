@@ -770,8 +770,7 @@ pub fn copy_local_dir_to_remote_via_tar(
         Err(e) => return Err(format!("tar create: {e}")),
     }
 
-    let (exit, stderr) = finalize_writing_channel(&mut dst_ch)
-        .map_err(|e| format!("dst {e}"))?;
+    let (exit, stderr) = finalize_writing_channel(&mut dst_ch).map_err(|e| format!("dst {e}"))?;
     if exit != 0 {
         let tail = stderr.trim();
         return if tail.is_empty() {
@@ -956,8 +955,7 @@ pub fn copy_cross_host_via_tar(
     src_session.set_timeout(30_000);
     dst_session.set_timeout(30_000);
 
-    let (exit, stderr) = finalize_writing_channel(&mut dst_ch)
-        .map_err(|e| format!("dst {e}"))?;
+    let (exit, stderr) = finalize_writing_channel(&mut dst_ch).map_err(|e| format!("dst {e}"))?;
     if exit != 0 {
         let tail = stderr.trim();
         return if tail.is_empty() {

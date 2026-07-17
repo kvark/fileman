@@ -121,11 +121,7 @@ fn section_header(ui: &mut egui::Ui, colors: &theme::ThemeColors, text: &str) {
     ui.add_space(4.0);
 }
 
-fn bookmark_editor(
-    ui: &mut egui::Ui,
-    colors: &theme::ThemeColors,
-    bookmarks: &mut Vec<Bookmark>,
-) {
+fn bookmark_editor(ui: &mut egui::Ui, colors: &theme::ThemeColors, bookmarks: &mut Vec<Bookmark>) {
     let mut to_remove: Option<usize> = None;
     for (i, bm) in bookmarks.iter_mut().enumerate() {
         ui.horizontal(|ui| {

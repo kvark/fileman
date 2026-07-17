@@ -341,10 +341,18 @@ impl IOTask {
             IOTask::WriteFile { ref path, .. } => fs_name(path),
             IOTask::Mkdir { ref path } => fs_name(path),
             IOTask::SetProps { ref path, .. } => fs_name(path),
-            IOTask::CopyContainer { ref display_name, .. }
-            | IOTask::CopyContainerDir { ref display_name, .. }
-            | IOTask::CopyContainerAndOpen { ref display_name, .. } => display_name.clone(),
-            IOTask::Pack { ref archive_path, .. } => fs_name(archive_path),
+            IOTask::CopyContainer {
+                ref display_name, ..
+            }
+            | IOTask::CopyContainerDir {
+                ref display_name, ..
+            }
+            | IOTask::CopyContainerAndOpen {
+                ref display_name, ..
+            } => display_name.clone(),
+            IOTask::Pack {
+                ref archive_path, ..
+            } => fs_name(archive_path),
             IOTask::WriteRemoteFile { ref path, .. } => remote_name(path),
             IOTask::CopyRemoteToLocal { ref name, .. } => name.clone(),
             IOTask::CopyLocalToRemote { ref src, .. } => fs_name(src),
@@ -357,7 +365,9 @@ impl IOTask {
             }
             IOTask::RenameRemote { ref src, .. } => remote_name(src),
             IOTask::MkdirRemote { ref path, .. } => remote_name(path),
-            IOTask::CopyRemoteToLocalAndOpen { ref remote_path, .. } => remote_name(remote_path),
+            IOTask::CopyRemoteToLocalAndOpen {
+                ref remote_path, ..
+            } => remote_name(remote_path),
             IOTask::CopyRemoteSameHost { ref name, .. }
             | IOTask::MoveRemoteSameHost { ref name, .. } => name.clone(),
             IOTask::CopyRemoteCrossHost { ref name, .. } => name.clone(),

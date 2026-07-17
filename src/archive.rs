@@ -1367,13 +1367,19 @@ mod traversal_tests {
             safe_rel_path("a/b/c.txt"),
             Some(Path::new("a/b/c.txt").to_path_buf())
         );
-        assert_eq!(safe_rel_path("file.txt"), Some(Path::new("file.txt").to_path_buf()));
+        assert_eq!(
+            safe_rel_path("file.txt"),
+            Some(Path::new("file.txt").to_path_buf())
+        );
     }
 
     #[test]
     fn normalize_archive_path_cannot_escape() {
         // Leading slashes are stripped and .. can never pop above the root.
-        assert_eq!(normalize_archive_path(Path::new("/etc/passwd")), "etc/passwd");
+        assert_eq!(
+            normalize_archive_path(Path::new("/etc/passwd")),
+            "etc/passwd"
+        );
         assert_eq!(normalize_archive_path(Path::new("a/../../b")), "b");
         assert_eq!(normalize_archive_path(Path::new("../../x")), "x");
         assert_eq!(normalize_archive_path(Path::new("a/./b")), "a/b");

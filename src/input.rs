@@ -344,8 +344,8 @@ pub(crate) fn handle_keyboard(
                 egui::Key::C,
             )
         });
-    let ctrl_comma = !in_edit
-        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Comma));
+    let ctrl_comma =
+        !in_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Comma));
     let f2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2));
 
     let f1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1));
@@ -988,9 +988,7 @@ pub(crate) fn handle_keyboard(
         app.prepare_copy_selected();
         ctx.request_repaint();
     }
-    if ctrl_shift_c
-        && let Some(text) = build_selected_paths(app)
-    {
+    if ctrl_shift_c && let Some(text) = build_selected_paths(app) {
         ctx.copy_text(text);
         ctx.request_repaint();
     }
@@ -1345,7 +1343,11 @@ fn build_selected_paths(app: &app_state::AppState) -> Option<String> {
                 kind,
                 archive_path,
                 inner_path,
-            } => Some(core::container_display_path(*kind, archive_path, inner_path)),
+            } => Some(core::container_display_path(
+                *kind,
+                archive_path,
+                inner_path,
+            )),
         }
     };
     let paths: Vec<String> = if browser.marked.is_empty() {
@@ -1368,4 +1370,3 @@ fn build_selected_paths(app: &app_state::AppState) -> Option<String> {
     }
     Some(paths.join("\n"))
 }
-

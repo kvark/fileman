@@ -87,8 +87,7 @@ pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let yes_label = if overwrite { "Overwrite" } else { "Yes" };
-                    let yes =
-                        ui.add(egui::Button::new(yes_label).min_size(egui::vec2(80.0, 0.0)));
+                    let yes = ui.add(egui::Button::new(yes_label).min_size(egui::vec2(80.0, 0.0)));
                     let no = ui.add(egui::Button::new("No").min_size(egui::vec2(80.0, 0.0)));
                     if yes.clicked() {
                         confirmed = true;

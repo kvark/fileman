@@ -112,8 +112,7 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
                                 .desired_width(220.0)
                                 .id(egui::Id::new("props_owner_group")),
                         );
-                        if user_response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Tab))
+                        if user_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab))
                         {
                             group_response.request_focus();
                         }
@@ -174,8 +173,7 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 #[cfg(unix)]
                 {
-                    let apply =
-                        ui.add(egui::Button::new("Apply").min_size(egui::vec2(110.0, 0.0)));
+                    let apply = ui.add(egui::Button::new("Apply").min_size(egui::vec2(110.0, 0.0)));
                     if dialog.original.is_dir {
                         let recursive =
                             ui.add(egui::Button::new("Recursive").min_size(egui::vec2(130.0, 0.0)));

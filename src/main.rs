@@ -438,13 +438,10 @@ fn fatal_error_dialog(title: &str, body: &str) {
 
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            MB_ICONERROR, MB_OK, MessageBoxW,
-        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
         // Convert to UTF-16 NUL-terminated for MessageBoxW.
-        let to_wide = |s: &str| -> Vec<u16> {
-            s.encode_utf16().chain(std::iter::once(0)).collect()
-        };
+        let to_wide =
+            |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let wide_title = to_wide(title);
         let wide_body = to_wide(body);
         unsafe {
@@ -535,10 +532,7 @@ pub fn panel_path_segments(panel: &app_state::PanelState) -> PathSegments {
                 let server = parts.next().unwrap_or("");
                 format!("\\\\{server}")
             } else if path.len() >= 2 && path.as_bytes()[1] == b':' {
-                let drive = segments
-                    .first()
-                    .cloned()
-                    .unwrap_or_default();
+                let drive = segments.first().cloned().unwrap_or_default();
                 if !segments.is_empty() {
                     segments.remove(0);
                 }
@@ -907,7 +901,10 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
     match batch {
         core::DirBatch::Loading => {
             // Already Loading at this point (we drained from its rx); just clear progress.
-            if let app_state::LoadState::Loading { ref mut progress, .. } = browser.load {
+            if let app_state::LoadState::Loading {
+                ref mut progress, ..
+            } = browser.load
+            {
                 *progress = None;
             }
             return;
@@ -1083,8 +1080,9 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                         cached.entries = new;
                     }
                     core::DirBatch::Loading => {
-                        if let app_state::LoadState::Loading { ref mut progress, .. } =
-                            cached.load
+                        if let app_state::LoadState::Loading {
+                            ref mut progress, ..
+                        } = cached.load
                         {
                             *progress = None;
                         }
@@ -1111,7 +1109,10 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
     if !stale_sessions.is_empty() {
         let mut removed = Vec::new();
         {
-            let mut shared = app.sftp_sessions_shared.lock().unwrap_or_else(|p| p.into_inner());
+            let mut shared = app
+                .sftp_sessions_shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             for host in stale_sessions {
                 if let Some(s) = app.sftp_sessions.remove(&host) {
                     removed.push(s);
@@ -1805,27 +1806,22 @@ fn spawn_sftp_load_thread(
         let locked = session.lock().unwrap_or_else(|p| p.into_inner());
         let mut buffered: Vec<core::DirEntry> = Vec::new();
         let mut first = true;
-        let result = fileman::sftp::read_directory_streaming(
-            &locked.sftp,
-            &host,
-            &path,
-            |batch| {
-                if atomic {
-                    buffered.extend(batch);
-                    return;
-                }
-                let msg = if first {
-                    first = false;
-                    core::DirBatch::Replace(batch)
-                } else {
-                    core::DirBatch::Append(batch)
-                };
-                let _ = tx.send(msg);
-                if let Some(ref wake) = wake {
-                    wake();
-                }
-            },
-        );
+        let result = fileman::sftp::read_directory_streaming(&locked.sftp, &host, &path, |batch| {
+            if atomic {
+                buffered.extend(batch);
+                return;
+            }
+            let msg = if first {
+                first = false;
+                core::DirBatch::Replace(batch)
+            } else {
+                core::DirBatch::Append(batch)
+            };
+            let _ = tx.send(msg);
+            if let Some(ref wake) = wake {
+                wake();
+            }
+        });
         if let Err((msg, is_connection_error)) = result {
             let batch = if is_connection_error {
                 core::DirBatch::ConnectionError(msg)
@@ -2705,7 +2701,13 @@ fn load_container_directory_async(
     let index_entry_count = if used_index || watching {
         app.archive_index
             .get(&archive_path)
-            .map(|shared| shared.lock().unwrap_or_else(|p| p.into_inner()).entries.len())
+            .map(|shared| {
+                shared
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .entries
+                    .len()
+            })
             .unwrap_or(0)
     } else {
         0
@@ -3587,7 +3589,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 // can be sent before the full file has downloaded.
                 if let ImageSource::Remote { ref host, ref path } = req.source {
                     let key = req.key.clone();
-                    let session = image_sftp.lock().unwrap_or_else(|p| p.into_inner()).get(host).cloned();
+                    let session = image_sftp
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(host)
+                        .cloned();
                     let data = session.and_then(|s| {
                         let locked = s.lock().unwrap_or_else(|p| p.into_inner());
                         let stat = locked.sftp.stat(std::path::Path::new(path)).ok();
@@ -3794,14 +3800,20 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     // unreadable / no session) from real file contents, so the
                     // editor can refuse to save over the file.
                     let (text, failed) = if let Some((host, remote_path)) = req.remote {
-                        let session = sftp_sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&host).cloned();
+                        let session = sftp_sessions
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&host)
+                            .cloned();
                         match session {
                             Some(session) => {
                                 let locked = session.lock().unwrap_or_else(|p| p.into_inner());
                                 match fileman::sftp::read_file_full(&locked.sftp, &remote_path) {
                                     Ok(bytes) => match String::from_utf8(bytes) {
                                         Ok(text) => (text, false),
-                                        Err(_) => ("Refusing to edit binary file.".to_string(), true),
+                                        Err(_) => {
+                                            ("Refusing to edit binary file.".to_string(), true)
+                                        }
                                     },
                                     Err(e) => (format!("Failed to read remote file: {e}"), true),
                                 }
@@ -4909,7 +4921,14 @@ fn draw_root_ui(render: UiRender<'_>) {
                         let is_focused = app.active_panel == core::ActivePanel::Left;
                         let theme = app.theme.clone();
                         let async_status = app.async_status();
-                        ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status, &app.error_log);
+                        ui::help::draw_help(
+                            ui,
+                            &theme,
+                            is_focused,
+                            rect.height(),
+                            &async_status,
+                            &app.error_log,
+                        );
                         ui_cache.left_rows
                     } else {
                         ui::panel::draw_panel(
@@ -4973,7 +4992,14 @@ fn draw_root_ui(render: UiRender<'_>) {
                         let is_focused = app.active_panel == core::ActivePanel::Right;
                         let theme = app.theme.clone();
                         let async_status = app.async_status();
-                        ui::help::draw_help(ui, &theme, is_focused, rect.height(), &async_status, &app.error_log);
+                        ui::help::draw_help(
+                            ui,
+                            &theme,
+                            is_focused,
+                            rect.height(),
+                            &async_status,
+                            &app.error_log,
+                        );
                         ui_cache.right_rows
                     } else {
                         ui::panel::draw_panel(
