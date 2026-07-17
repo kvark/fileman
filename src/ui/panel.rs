@@ -923,15 +923,16 @@ pub fn draw_panel(
                                                         // before the last dot) so typing replaces
                                                         // it while keeping the extension. For
                                                         // NewFile/NewDir, select the whole thing.
+                                                        let text_len = rename.text.len();
                                                         let sel_end = match rename.kind {
                                                             app_state::InlineEditKind::Rename => {
                                                                 rename
                                                                     .text
                                                                     .rfind('.')
                                                                     .filter(|&i| i > 0)
-                                                                    .unwrap_or(rename.text.len())
+                                                                    .unwrap_or(text_len)
                                                             }
-                                                            _ => rename.text.len(),
+                                                            _ => text_len,
                                                         };
                                                         // TextEdit state doesn't exist until the
                                                         // widget has been drawn once — keep the
