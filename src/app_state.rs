@@ -208,7 +208,10 @@ impl LoadState {
     }
 
     pub fn set_progress(&mut self, loaded: usize, total: Option<usize>) {
-        if let LoadState::Loading { ref mut progress, .. } = *self {
+        if let LoadState::Loading {
+            ref mut progress, ..
+        } = *self
+        {
             *progress = Some((loaded, total));
         }
     }
@@ -393,6 +396,27 @@ pub struct PanelSnapshot {
     pub mode: BrowserMode,
     pub current_path: path::PathBuf,
     pub selected_name: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_proc_mount(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let (a, b, c) = (bytes[i + 1], bytes[i + 2], bytes[i + 3]);
+            if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() {
+                let v = (a - b'0') * 64 + (b - b'0') * 8 + (c - b'0');
+                out.push(v as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn history_key(snapshot: &PanelSnapshot) -> String {
@@ -1583,14 +1607,9 @@ impl AppState {
     /// require a blocking round-trip), so they return no collisions.
     fn op_collisions(op: &PendingOp) -> Vec<String> {
         let (items, dst) = match *op {
-            PendingOp::Copy {
-                ref items,
-                ref dst,
+            PendingOp::Copy { ref items, ref dst } | PendingOp::Move { ref items, ref dst } => {
+                (items, dst)
             }
-            | PendingOp::Move {
-                ref items,
-                ref dst,
-            } => (items, dst),
             _ => return Vec::new(),
         };
         let CopyDest::Local(ref dir) = *dst else {
@@ -1761,7 +1780,8 @@ impl AppState {
                 if fields.len() < 3 {
                     continue;
                 }
-                let mount_point = fields[1];
+                // /proc/mounts octal-escapes space/tab/newline/backslash in the mount point.
+                let mount_point = unescape_proc_mount(fields[1]);
                 let fs_type = fields[2];
                 if skip_types.contains(&fs_type) {
                     continue;
@@ -1772,12 +1792,12 @@ impl AppState {
                 if !is_removable && skip_paths.iter().any(|p| mount_point.starts_with(p)) {
                     continue;
                 }
-                let mp = path::PathBuf::from(mount_point);
+                let mp = path::PathBuf::from(&mount_point);
                 if entries.iter().any(|e| e.path == mp) {
                     continue;
                 }
                 entries.push(QuickJumpEntry {
-                    label: mount_point.to_string(),
+                    label: mount_point,
                     path: mp,
                     category: QuickJumpCategory::Mount,
                 });
