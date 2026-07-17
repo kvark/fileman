@@ -2454,19 +2454,27 @@ fn load_container_directory_async(
     let mut watching = false;
     if !skip_loading && let Some(shared) = app.archive_index.get(&archive_path).cloned() {
         let idx = shared.lock().unwrap_or_else(|p| p.into_inner());
-        let mut listing = build_listing_from_index(&idx, &archive_path, kind, &cwd);
-        let browser = app.panel(target_panel).browser();
-        sort_entries(&mut listing, browser.sort_mode, browser.sort_desc);
-        root_hint = idx.root.clone();
-        let entry_count = idx.entries.len();
-        let complete = idx.complete;
-        drop(idx);
-        initial = listing;
-        used_index = true;
-        if !complete {
-            watching = true;
+        // If the previous load failed (e.g. permission denied), drop the
+        // cached empty index so we re-attempt reading rather than serve
+        // stale nothing.
+        if idx.failed {
+            drop(idx);
+            app.archive_index.remove(&archive_path);
+        } else {
+            let mut listing = build_listing_from_index(&idx, &archive_path, kind, &cwd);
+            let browser = app.panel(target_panel).browser();
+            sort_entries(&mut listing, browser.sort_mode, browser.sort_desc);
+            root_hint = idx.root.clone();
+            let entry_count = idx.entries.len();
+            let complete = idx.complete;
+            drop(idx);
+            initial = listing;
+            used_index = true;
+            if !complete {
+                watching = true;
+            }
+            let _ = entry_count; // used below for index_last_seen
         }
-        let _ = entry_count; // used below for index_last_seen
     }
 
     // Need to spawn a new loader thread
@@ -2476,6 +2484,7 @@ fn load_container_directory_async(
             entries: Vec::new(),
             root: root_hint.clone(),
             complete: false,
+            failed: false,
         }));
         app.archive_index
             .insert(archive_path.clone(), shared.clone());
@@ -2663,6 +2672,10 @@ fn load_container_directory_async(
             if indexing_result.is_err() {
                 let mut idx = shared.lock().unwrap_or_else(|p| p.into_inner());
                 idx.complete = true;
+                // Mark failed so the next entry into this archive discards
+                // the empty cache and re-tries — e.g. after the user fixes
+                // permissions.
+                idx.failed = true;
                 if let Some(ref wake) = wake {
                     wake();
                 }
