@@ -919,11 +919,25 @@ pub fn draw_panel(
                                                     );
                                                     if rename.focus {
                                                         response.request_focus();
-                                                        if matches!(
-                                                            rename.kind,
-                                                            app_state::InlineEditKind::NewFile
-                                                                | app_state::InlineEditKind::NewDir
-                                                        ) && let Some(mut state) =
+                                                        // For Rename, pre-select the stem (name
+                                                        // before the last dot) so typing replaces
+                                                        // it while keeping the extension. For
+                                                        // NewFile/NewDir, select the whole thing.
+                                                        let sel_end = match rename.kind {
+                                                            app_state::InlineEditKind::Rename => {
+                                                                rename
+                                                                    .text
+                                                                    .rfind('.')
+                                                                    .filter(|&i| i > 0)
+                                                                    .unwrap_or(rename.text.len())
+                                                            }
+                                                            _ => rename.text.len(),
+                                                        };
+                                                        // TextEdit state doesn't exist until the
+                                                        // widget has been drawn once — keep the
+                                                        // focus flag set until we successfully
+                                                        // apply the selection.
+                                                        if let Some(mut state) =
                                                             egui::TextEdit::load_state(
                                                                 ui.ctx(),
                                                                 response.id,
@@ -933,13 +947,13 @@ pub fn draw_panel(
                                                                 egui::text::CCursorRange::two(
                                                                     egui::text::CCursor::new(0),
                                                                     egui::text::CCursor::new(
-                                                                        rename.text.len(),
+                                                                        sel_end,
                                                                     ),
                                                                 ),
                                                             ));
                                                             state.store(ui.ctx(), response.id);
+                                                            rename.focus = false;
                                                         }
-                                                        rename.focus = false;
                                                     }
                                                 },
                                             );
