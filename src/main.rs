@@ -262,7 +262,7 @@ fn apply_theme(ctx: &egui::Context, colors: &theme::ThemeColors) {
     style.visuals.code_bg_color = color32(colors.footer_bg);
     // Text selection
     style.visuals.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(40, 80, 180, 180);
-    style.visuals.selection.stroke = egui::Stroke::new(0.0, egui::Color32::WHITE);
+    style.visuals.selection.stroke = egui::Stroke::new(0.0_f32, egui::Color32::WHITE);
     style.visuals.widgets.inactive.bg_fill = color32(colors.preview_bg);
     style.visuals.widgets.inactive.fg_stroke.color = color32(colors.row_fg_inactive);
     style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
