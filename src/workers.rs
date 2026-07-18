@@ -1135,7 +1135,13 @@ fn send_streaming_preview<R: Read>(
                 encoding.new_decoder_without_bom_handling()
             });
             let last = remaining == 0;
-            let mut text = String::with_capacity(chunk.len() + 16);
+            // A single input byte can expand to up to 3 UTF-8 output bytes
+            // (Cyrillic in CP1251, CJK in various single-byte encodings, …).
+            // Reserving max_utf8_buffer_length avoids OutputFull truncation.
+            let cap = dec
+                .max_utf8_buffer_length(chunk.len())
+                .unwrap_or(chunk.len() * 3);
+            let mut text = String::with_capacity(cap);
             let _ = dec.decode_to_string(chunk, &mut text, last);
             let _ = tx.send((
                 id,
