@@ -565,7 +565,6 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                             preview.image_pan = [0.0, 0.0];
                                             ui.add(egui::Image::new(sized).fit_to_exact_size(size));
                                         }
-                                        ui.ctx().request_repaint();
                                     } else {
                                         if image_cache.pending.insert(key.clone()) {
                                             let _ = image_req_tx.send(request);
