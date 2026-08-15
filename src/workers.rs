@@ -1143,13 +1143,7 @@ fn send_streaming_preview<R: Read>(
                 .unwrap_or(chunk.len() * 3);
             let mut text = String::with_capacity(cap);
             let _ = dec.decode_to_string(chunk, &mut text, last);
-            let _ = tx.send((
-                id,
-                PreviewContent::TextChunk {
-                    text,
-                    done: last,
-                },
-            ));
+            let _ = tx.send((id, PreviewContent::TextChunk { text, done: last }));
         } else {
             let _ = tx.send((
                 id,

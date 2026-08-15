@@ -99,7 +99,10 @@ pub fn draw_quick_jump(
                                             egui::pos2(sep_rect.left() + 4.0, y),
                                             egui::pos2(sep_rect.right() - 4.0, y),
                                         ],
-                                        egui::Stroke::new(2.0_f32, color32(colors.panel_border_active)),
+                                        egui::Stroke::new(
+                                            2.0_f32,
+                                            color32(colors.panel_border_active),
+                                        ),
                                     );
                                 }
                             }
