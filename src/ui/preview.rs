@@ -327,60 +327,30 @@ pub fn draw_preview(ui: &mut egui::Ui, ctx: PreviewRender<'_>) {
                                     ui.add(egui::Label::new(job).selectable(true));
                                 }
                                 Some(core::PreviewContent::Image(path)) => {
-                                    let (key, request) = match path {
+                                    let key = crate::image_cache_key(path);
+                                    let source = match path {
                                         core::ImageLocation::Fs(path) => {
-                                            let key = path.to_string_lossy().into_owned();
-                                            (
-                                                key.clone(),
-                                                ImageRequest {
-                                                    key,
-                                                    source: ImageSource::Fs(
-                                                        path.as_ref().to_path_buf(),
-                                                    ),
-                                                },
-                                            )
+                                            ImageSource::Fs(path.as_ref().to_path_buf())
                                         }
                                         core::ImageLocation::Container {
                                             kind,
                                             archive_path,
                                             inner_path,
-                                        } => {
-                                            let key = format!(
-                                                "{}::{}:/{}",
-                                                archive_path.to_string_lossy(),
-                                                match kind {
-                                                    core::ContainerKind::Zip => "zip",
-                                                    core::ContainerKind::Tar => "tar",
-                                                    core::ContainerKind::TarGz => "tar.gz",
-                                                    core::ContainerKind::TarBz2 => "tar.bz2",
-                                                },
-                                                inner_path
-                                            );
-                                            (
-                                                key.clone(),
-                                                ImageRequest {
-                                                    key,
-                                                    source: ImageSource::Container {
-                                                        kind: *kind,
-                                                        archive_path: archive_path.clone(),
-                                                        inner_path: inner_path.clone(),
-                                                    },
-                                                },
-                                            )
-                                        }
+                                        } => ImageSource::Container {
+                                            kind: *kind,
+                                            archive_path: archive_path.clone(),
+                                            inner_path: inner_path.clone(),
+                                        },
                                         core::ImageLocation::Remote { host, path } => {
-                                            let key = format!("sftp://{host}{path}");
-                                            (
-                                                key.clone(),
-                                                ImageRequest {
-                                                    key,
-                                                    source: ImageSource::Remote {
-                                                        host: host.clone(),
-                                                        path: path.clone(),
-                                                    },
-                                                },
-                                            )
+                                            ImageSource::Remote {
+                                                host: host.clone(),
+                                                path: path.clone(),
+                                            }
                                         }
+                                    };
+                                    let request = ImageRequest {
+                                        key: key.clone(),
+                                        source,
                                     };
                                     if let Some(message) = image_cache.failures.get(&key) {
                                         ui.colored_label(

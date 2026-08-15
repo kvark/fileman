@@ -156,6 +156,49 @@ enum ImageSource {
     },
 }
 
+/// Cache key for a previewed image. The backing file's last-modified time is
+/// folded in — the image file itself for a filesystem preview, the archive
+/// file for a container preview — so editing either in place produces a fresh
+/// key and the stale decoded texture is bypassed instead of shown. Remote
+/// images key on their location only. Both the draw path (ui::preview) and the
+/// redraw-throttle check must derive the key here so they stay in lockstep.
+pub(crate) fn image_cache_key(loc: &core::ImageLocation) -> String {
+    // Append `path`'s last-modified time to `base` so a fresh edit misses the
+    // cache. Leaves `base` untouched if the mtime can't be read.
+    fn stamp(path: &std::path::Path, base: String) -> String {
+        match std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        {
+            Some(d) => format!("{base}\0{}", d.as_nanos()),
+            None => base,
+        }
+    }
+    match loc {
+        core::ImageLocation::Fs(path) => stamp(path, path.to_string_lossy().into_owned()),
+        core::ImageLocation::Container {
+            kind,
+            archive_path,
+            inner_path,
+        } => {
+            let base = format!(
+                "{}::{}:/{}",
+                archive_path.to_string_lossy(),
+                match kind {
+                    core::ContainerKind::Zip => "zip",
+                    core::ContainerKind::Tar => "tar",
+                    core::ContainerKind::TarGz => "tar.gz",
+                    core::ContainerKind::TarBz2 => "tar.bz2",
+                },
+                inner_path
+            );
+            stamp(archive_path, base)
+        }
+        core::ImageLocation::Remote { host, path } => format!("sftp://{host}{path}"),
+    }
+}
+
 struct HighlightRequest {
     key: String,
     text: String,
@@ -4682,27 +4725,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             if let Some(preview) = runtime.app.preview_panel_mut()
                 && let Some(core::PreviewContent::Image(path)) = preview.content.as_ref()
             {
-                let key = match path {
-                    core::ImageLocation::Fs(path) => path.to_string_lossy().into_owned(),
-                    core::ImageLocation::Container {
-                        kind,
-                        archive_path,
-                        inner_path,
-                    } => format!(
-                        "{}::{}:/{}",
-                        archive_path.to_string_lossy(),
-                        match kind {
-                            core::ContainerKind::Zip => "zip",
-                            core::ContainerKind::Tar => "tar",
-                            core::ContainerKind::TarGz => "tar.gz",
-                            core::ContainerKind::TarBz2 => "tar.bz2",
-                        },
-                        inner_path
-                    ),
-                    core::ImageLocation::Remote { host, path } => {
-                        format!("sftp://{host}{path}")
-                    }
-                };
+                let key = image_cache_key(path);
                 // Keep repainting only while the decode is unresolved: still in
                 // flight (animate the spinner), or not yet dispatched. Once the
                 // key resolves to a texture OR a failure, stop — otherwise a
