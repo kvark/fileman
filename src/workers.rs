@@ -1025,8 +1025,7 @@ pub fn start_preview_worker(
                             continue;
                         }
                     };
-                    let listing =
-                        format_container_listing(kind, &archive_path, &entries, max_entries);
+                    let listing = format_container_listing(&entries, max_entries);
                     let _ = result_tx.send((id, PreviewContent::Text(listing)));
                 }
             }
