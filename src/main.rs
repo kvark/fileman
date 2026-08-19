@@ -1586,8 +1586,26 @@ fn draw_elevation_modal(ctx: &egui::Context, message: &str) -> Option<bool> {
 
 fn draw_async_indicator(ctx: &egui::Context, app: &app_state::AppState) {
     let search_running = matches!(app.search_status, app_state::SearchStatus::Running(_));
+    // Largest entry count among archives still being indexed, if any. Gives the
+    // user a live "still working" signal — a big remote archive can take a
+    // while to stream in, and without this the panel would look frozen/empty.
+    let indexing_count = [core::ActivePanel::Left, core::ActivePanel::Right]
+        .into_iter()
+        .filter_map(|side| {
+            let archive = app.panel(side).browser().watching_archive.as_ref()?;
+            let shared = app.archive_index.get(archive)?;
+            Some(
+                shared
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .entries
+                    .len(),
+            )
+        })
+        .max();
     let is_busy = app.io_in_flight > 0
         || search_running
+        || indexing_count.is_some()
         || !app.dir_size_pending.is_empty()
         || !app.remote_dir_size_pending.is_empty();
     if !is_busy {
@@ -1601,6 +1619,9 @@ fn draw_async_indicator(ctx: &egui::Context, app: &app_state::AppState) {
     }
     if search_running {
         label += " scan";
+    }
+    if let Some(count) = indexing_count {
+        label += &format!(" {count} indexed");
     }
     let sz_pending = app.dir_size_pending.len() + app.remote_dir_size_pending.len();
     if sz_pending > 0 {
@@ -2607,6 +2628,15 @@ fn load_container_directory_async(
             }
 
             let indexing_result: std::io::Result<()> = if kind_clone == core::ContainerKind::Zip {
+                // A zip's central directory (parsed once by ZipArchive::new)
+                // already holds every entry's name, so listing needs no
+                // per-entry I/O. Uncompressed *size*, however, is only exposed
+                // through by_index(), which seeks to each entry's local header —
+                // one network round-trip per entry over SFTP, i.e. minutes for a
+                // large remote archive. So fetch sizes only for local files,
+                // where the seek hits the OS page cache; for remote archives we
+                // list from the central directory alone and leave size unknown.
+                let is_remote = fileman::sftp::decode_archive_path(&archive_clone).is_some();
                 fileman::archive::with_seek_reader(&archive_clone, |reader| {
                     let mut zip = zip::ZipArchive::new(reader).map_err(std::io::Error::other)?;
                     // Pre-scan all entry names to detect root (cheap — central
@@ -2632,20 +2662,23 @@ fn load_container_directory_async(
                     implicit_root = decide_root(&root_candidate, seen_root_file, seen_other_root);
 
                     for i in 0..zip.len() {
-                        let entry = match zip.by_index(i) {
-                            Ok(entry) => entry,
-                            Err(_) => continue,
+                        // name_for_index reads the in-memory central directory,
+                        // no seek. Derive everything owned from it before the
+                        // reader is borrowed again for the optional size lookup.
+                        let Some(raw_name) = zip.name_for_index(i) else {
+                            continue;
                         };
-                        let entry_is_dir = entry.is_dir();
-                        let entry_size = if entry_is_dir {
-                            None
-                        } else {
-                            Some(entry.size())
-                        };
-                        let name = core::normalize_archive_path(Path::new(entry.name()));
+                        let entry_is_dir = raw_name.ends_with('/') || raw_name.ends_with('\\');
+                        let name = core::normalize_archive_path(Path::new(raw_name));
                         if name.is_empty() {
                             continue;
                         }
+                        let entry_size = if entry_is_dir || is_remote {
+                            None
+                        } else {
+                            // Local only: seek to the local header for the size.
+                            zip.by_index(i).ok().map(|entry| entry.size())
+                        };
 
                         batch_buf.push((name, entry_is_dir, entry_size));
                         if batch_buf.len() >= BATCH {

@@ -5,7 +5,7 @@ use std::{
     path::{self, Path},
 };
 
-use crate::core::{DirEntry, EntryLocation, format_mode, format_size};
+use crate::core::{DirEntry, EntryLocation, format_size};
 
 const ARCHIVE_READ_BUFFER: usize = 1024 * 1024;
 
@@ -22,11 +22,15 @@ where
         let locked = session
             .lock()
             .map_err(|_| io::Error::other("session mutex poisoned"))?;
-        let mut file = locked
+        let file = locked
             .sftp
             .open(Path::new(&remote_path))
             .map_err(|e| io::Error::other(format!("open remote {remote_path}: {e}")))?;
-        f(&mut file)
+        // Buffer the remote handle: the zip reader parses the central directory
+        // with many tiny field-sized reads, and each unbuffered read is a
+        // separate SFTP round-trip. Buffering collapses them into 1 MB fills.
+        let mut reader = io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
+        f(&mut reader)
     } else {
         let file = fs::File::open(archive_path)?;
         let mut reader = io::BufReader::with_capacity(ARCHIVE_READ_BUFFER, file);
@@ -380,7 +384,7 @@ fn copy_tar_dir<R: Read>(reader: R, inner_path: &str, dst_root: &Path) -> io::Re
 
 fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirEntry>> {
     let (dirs, files) = with_seek_reader(archive_path, |reader| {
-        let mut zip = zip::ZipArchive::new(reader).map_err(io::Error::other)?;
+        let zip = zip::ZipArchive::new(reader).map_err(io::Error::other)?;
         let mut dirs: Vec<String> = Vec::new();
         let mut seen_dirs: HashSet<String> = HashSet::new();
         let mut files: Vec<String> = Vec::new();
@@ -392,12 +396,10 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
             format!("{}/", cwd.trim_end_matches('/'))
         };
 
-        for i in 0..zip.len() {
-            let name = zip
-                .by_index(i)
-                .map_err(io::Error::other)?
-                .name()
-                .to_string();
+        // Names come straight from the in-memory central directory. Using
+        // by_index() here would seek to each entry's local header — one SFTP
+        // round-trip per entry — which is ruinous for a large remote archive.
+        for name in zip.file_names() {
             if name.is_empty() || !name.starts_with(&prefix) {
                 continue;
             }
@@ -501,12 +503,7 @@ fn read_zip_directory(archive_path: &Path, cwd: &str) -> anyhow::Result<Vec<DirE
     Ok(entries)
 }
 
-pub fn format_container_listing(
-    kind: ContainerKind,
-    archive_path: &Path,
-    entries: &[DirEntry],
-    max_entries: usize,
-) -> String {
+pub fn format_container_listing(entries: &[DirEntry], max_entries: usize) -> String {
     let mut out = String::new();
     out.push_str("Contents:\n");
     let mut count = 0usize;
@@ -521,26 +518,18 @@ pub fn format_container_listing(
             ));
             break;
         }
-        let size = read_container_metadata(kind, archive_path, entry_name_for_metadata(entry))
-            .ok()
-            .flatten()
-            .map(|(size, mode)| (format_size(size), mode));
-        let mode_str = size.as_ref().and_then(|pair| pair.1.map(format_mode));
-        let size_str = size.as_ref().map(|pair| pair.0.as_str());
-
+        // Render straight from the already-loaded listing. Previously this
+        // re-opened the whole archive once per entry to fetch a size — for a
+        // large (especially remote) archive that meant reopening and scanning
+        // the central directory hundreds of times, holding the SFTP session
+        // lock throughout. The size shown here isn't worth that; use whatever
+        // the listing already carries.
         let mut line = String::new();
-        if let Some(mode) = mode_str {
-            line.push_str(&mode);
-            line.push(' ');
+        if let Some(size) = entry.size {
+            line.push_str(&format!("{:>8} ", format_size(size)));
         } else {
-            line.push_str("---- ");
+            line.push_str("       - ");
         }
-        if let Some(size) = size_str {
-            line.push_str(size);
-        } else {
-            line.push_str("    -");
-        }
-        line.push(' ');
         line.push_str(&entry_display_name(entry));
         line.push('\n');
         out.push_str(&line);
@@ -554,14 +543,6 @@ fn entry_display_name(entry: &DirEntry) -> String {
         format!("{}/", entry.name)
     } else {
         entry.name.clone()
-    }
-}
-
-fn entry_name_for_metadata(entry: &DirEntry) -> &str {
-    if entry.is_dir {
-        entry.name.trim_end_matches('/')
-    } else {
-        entry.name.as_str()
     }
 }
 
