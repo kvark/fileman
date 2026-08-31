@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.4 (30 Aug 2026)
+
+## Features
+- In-app settings
+- Breadcrumb path and per-panel status line
+- Removable drives in Go To
+- Stream remote media to the system player
+- SSH host-key verification
+
+### Fixes
+- GPU init on Windows
+- Remote copy, SFTP disconnects, and large zip listing
+- Image preview cache and oversized-decode OOM
+- File operations no longer clobber existing files
+
 ## v0.3.3 (26 Apr 2026)
 
 ## Features

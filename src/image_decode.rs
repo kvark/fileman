@@ -260,7 +260,7 @@ fn decode_webp_bytes(bytes: &[u8], max_side: u32) -> Option<(DecodedImage, Image
         data
     } else {
         let mut out = Vec::with_capacity(width * height * 4);
-        for rgb in data.chunks_exact(3) {
+        for rgb in data.as_chunks::<3>().0 {
             out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
         out
@@ -1565,7 +1565,7 @@ fn convert_to_rgba(
                 return None;
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(3) {
+            for chunk in data.as_chunks::<3>().0 {
                 out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
             Some(out)
@@ -1575,7 +1575,7 @@ fn convert_to_rgba(
                 return None;
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(3) {
+            for chunk in data.as_chunks::<3>().0 {
                 out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], 255]);
             }
             Some(out)
@@ -1585,7 +1585,7 @@ fn convert_to_rgba(
                 return None;
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(4) {
+            for chunk in data.as_chunks::<4>().0 {
                 out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
             }
             Some(out)
@@ -1595,7 +1595,7 @@ fn convert_to_rgba(
                 return None;
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(4) {
+            for chunk in data.as_chunks::<4>().0 {
                 out.extend_from_slice(&[chunk[1], chunk[2], chunk[3], chunk[0]]);
             }
             Some(out)
@@ -1615,7 +1615,7 @@ fn convert_to_rgba(
                 return None;
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(2) {
+            for chunk in data.as_chunks::<2>().0 {
                 out.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
             }
             Some(out)
