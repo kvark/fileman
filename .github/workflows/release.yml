@@ -116,7 +116,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          cargo install cargo-wix --version 0.3 --locked
+          cargo install cargo-wix --version '^0.3' --locked
           # Build the MSI from the committed wix/main.wxs. Do NOT run
           # `cargo wix init --force`, which regenerates main.wxs from the stock
           # template and discards the checked-in Start-Menu shortcut, ARP icon,
