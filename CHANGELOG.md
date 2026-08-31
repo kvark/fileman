@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- macOS releases are signed with Developer ID and notarized, so the app opens
+  without a Gatekeeper warning
+
 ## v0.3.4 (30 Aug 2026)
 
 ## Features

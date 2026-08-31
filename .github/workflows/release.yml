@@ -80,19 +80,19 @@ jobs:
           rustup target add aarch64-apple-darwin
           cargo bundle --release --target aarch64-apple-darwin --features self-update,vendored-openssl
 
+      # Signs with Developer ID, notarizes, and staples when the secrets below
+      # are configured; falls back to an ad-hoc signature otherwise so the job
+      # still produces artifacts on forks. See CONTRIBUTING.md for the setup.
       - name: Package (macOS)
         if: matrix.os == 'macos-latest'
-        run: |
-          mkdir -p dist
-          APP=target/aarch64-apple-darwin/release/bundle/osx/FileMan.app
-          codesign --sign - --deep --force "$APP"
-          # ZIP for self-update compatibility
-          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/fileman-macos-aarch64.zip
-          # DMG for drag-to-install
-          mkdir -p dmg_staging
-          cp -R "$APP" dmg_staging/
-          ln -s /Applications dmg_staging/Applications
-          hdiutil create -volname FileMan -srcfolder dmg_staging -ov -format UDZO dist/fileman-macos-aarch64.dmg
+        run: scripts/macos_package.sh
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
 
       # --- Windows ---
       - name: Build (Windows)
