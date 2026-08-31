@@ -107,10 +107,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path target/release/fileman.exe -DestinationPath dist/fileman-windows-x86_64.zip
 
-      - name: Install WiX Toolset (Windows)
+      - name: Add WiX to PATH (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
-        run: choco install wixtoolset --version 3.11.2 -y --no-progress
+        run: Add-Content $env:GITHUB_PATH (Join-Path $env:WIX 'bin')
 
       - name: Package MSI (Windows)
         if: matrix.os == 'windows-latest'
