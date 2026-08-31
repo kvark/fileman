@@ -29,7 +29,12 @@ pub fn compare_snapshots(
 
     let mut mismatched = 0u64;
     let mut max_seen_diff: u8 = 0;
-    for (a, e) in actual.chunks_exact(4).zip(expected.chunks_exact(4)) {
+    for (a, e) in actual
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0)
+    {
         let mut pixel_diff = 0u8;
         for channel in 0..4 {
             let diff = a[channel].abs_diff(e[channel]);
@@ -79,7 +84,7 @@ pub fn save_snapshot_png(
     }
 
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for chunk in data.chunks_exact(4) {
+    for chunk in data.as_chunks::<4>().0 {
         rgb.push(chunk[0]);
         rgb.push(chunk[1]);
         rgb.push(chunk[2]);
@@ -132,7 +137,7 @@ fn convert_to_rgba(
                 return Err("Unexpected RGB buffer length".to_string());
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(3) {
+            for chunk in data.as_chunks::<3>().0 {
                 out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
             Ok(out)
@@ -142,7 +147,7 @@ fn convert_to_rgba(
                 return Err("Unexpected BGR buffer length".to_string());
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(3) {
+            for chunk in data.as_chunks::<3>().0 {
                 out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], 255]);
             }
             Ok(out)
@@ -152,7 +157,7 @@ fn convert_to_rgba(
                 return Err("Unexpected BGRA buffer length".to_string());
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(4) {
+            for chunk in data.as_chunks::<4>().0 {
                 out.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
             }
             Ok(out)
@@ -162,7 +167,7 @@ fn convert_to_rgba(
                 return Err("Unexpected ARGB buffer length".to_string());
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(4) {
+            for chunk in data.as_chunks::<4>().0 {
                 out.extend_from_slice(&[chunk[1], chunk[2], chunk[3], chunk[0]]);
             }
             Ok(out)
@@ -182,7 +187,7 @@ fn convert_to_rgba(
                 return Err("Unexpected LumaA buffer length".to_string());
             }
             let mut out = Vec::with_capacity(pixels * 4);
-            for chunk in data.chunks_exact(2) {
+            for chunk in data.as_chunks::<2>().0 {
                 out.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
             }
             Ok(out)
