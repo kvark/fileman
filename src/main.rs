@@ -3509,7 +3509,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 timing: false,
                 capture: false,
                 overlay: false,
-                device_id: Some(0),
+                // Vulkan PCI ID, not an adapter index. None = first supported GPU.
+                device_id: None,
             }) {
                 Ok(context) => context,
                 Err(err) => {
