@@ -29,6 +29,7 @@ Ensure `cargo fmt` is ran and `cargo clippy` is clean.
 - `tests/cases/` — replay test cases (RON format)
 - `tests/data/` — test fixture data
 - `scripts/replay_runner.sh` — runs all replay cases with per-test cleanup
+- `scripts/macos_package.sh` — signs, notarizes, and packages the macOS release
 
 ## Testing
 
@@ -164,3 +165,79 @@ For debugging or developing new tests, request a full state dump:
 
 This writes a RON file with both panels' entries, cursor positions, modes, and
 sort settings. Inspect it to determine the right assertion values for a new test.
+
+## Releasing
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds every
+platform and uploads the artifacts to the GitHub release.
+
+### macOS code signing and notarization
+
+macOS refuses to open a downloaded app unless it is signed with a Developer ID
+certificate *and* notarized by Apple. Without that, users get "FileMan is
+damaged and can't be opened" or "Apple could not verify FileMan" and have to
+dig through System Settings to launch it. Notarizing removes that step
+entirely: the app opens on first double-click.
+
+`scripts/macos_package.sh` performs the whole flow — sign, submit to the notary
+service, staple the ticket into both the `.app` and the `.dmg`. It is driven by
+repository secrets, and falls back to an ad-hoc signature (producing usable but
+Gatekeeper-blocked artifacts) when they are absent, so forks still build.
+
+Setting this up is a one-time job and needs a paid Apple Developer Program
+membership (99 USD/year); an individual account is enough.
+
+**1. Create a Developer ID Application certificate.** In Xcode: Settings →
+Accounts → Manage Certificates → + → Developer ID Application. Then export it
+from Keychain Access (My Certificates → right-click → Export) as a `.p12` with
+a password. Note that this is *not* the "Apple Development" certificate — only
+Developer ID certificates can sign software distributed outside the App Store.
+
+**2. Create an App Store Connect API key.** App Store Connect → Users and
+Access → Integrations → App Store Connect API → Team Keys → Generate API Key.
+The "Developer" role is sufficient for notarization. Download the
+`AuthKey_XXXXXXXX.p8` — Apple only offers the download once — and note the Key
+ID and the Issuer ID shown on the same page.
+
+**3. Add the repository secrets** under Settings → Secrets and variables →
+Actions:
+
+| Secret | Value |
+|--------|-------|
+| `MACOS_CERTIFICATE` | `base64 -i certificate.p12 \| pbcopy` |
+| `MACOS_CERTIFICATE_PWD` | the password used when exporting the `.p12` |
+| `APPLE_API_KEY` | `base64 -i AuthKey_XXXXXXXX.p8 \| pbcopy` |
+| `APPLE_API_KEY_ID` | the Key ID, e.g. `XXXXXXXXXX` |
+| `APPLE_API_ISSUER_ID` | the Issuer UUID |
+
+`MACOS_SIGN_IDENTITY` is optional: the script picks the Developer ID identity
+out of the imported certificate on its own, and only needs an explicit value if
+the certificate happens to carry more than one.
+
+An Apple ID works instead of an API key — set `APPLE_ID`, `APPLE_APP_PASSWORD`
+(an [app-specific password](https://support.apple.com/en-us/102654), not the
+account password), and `APPLE_TEAM_ID`. API keys are preferred: they are
+scoped, revocable, and unaffected by the account's 2FA.
+
+### Testing the packaging locally
+
+On a Mac with the certificate in the login keychain, build the bundle and run
+the script with the notary credentials in the environment:
+
+```bash
+cargo bundle --release --target aarch64-apple-darwin --features self-update,vendored-openssl
+MACOS_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+  APPLE_API_KEY_ID=... APPLE_API_ISSUER_ID=... APPLE_API_KEY="$(base64 -i AuthKey.p8)" \
+  scripts/macos_package.sh
+```
+
+Leaving all of them unset exercises the ad-hoc path, which is enough to check
+that the artifacts are laid out correctly. Notarization typically takes a few
+minutes per submission; the script submits twice, once for the zip and once for
+the dmg.
+
+Note that the in-app self-update replaces the executable inside an installed
+`FileMan.app` and re-signs it ad-hoc, which drops the Developer ID signature and
+invalidates the stapled ticket. That is fine in practice — the installed app is
+no longer quarantined, so Gatekeeper does not re-check it — but a user who wants
+a fully notarized copy should reinstall from the dmg.

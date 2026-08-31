@@ -16,6 +16,31 @@ FileMan is a fast, responsive two-panel file manager built with Rust, egui, and 
 - **Search** (Alt+F7) by name or content, with wildcard and case-insensitive options; results displayed as a virtual folder you can navigate and operate on.
 - **Theming**: external theme files in `themes/` (JSON, YAML, or TOML), toggle with F9, pick with F10.
 
+## Install
+
+Grab a build for your platform from the [latest release](https://github.com/kvark/fileman/releases/latest):
+
+| Platform | Download | Notes |
+|----------|----------|-------|
+| macOS (Apple Silicon) | `fileman-macos-aarch64.dmg` | Open it and drag FileMan to Applications |
+| Windows | `fileman-*-x86_64.msi` | Installer with a Start Menu entry |
+| Debian/Ubuntu | `fileman_*_amd64.deb` | `sudo dpkg -i fileman_*_amd64.deb` |
+| Fedora/RHEL | `fileman-*.x86_64.rpm` | `sudo rpm -i fileman-*.x86_64.rpm` |
+| Linux (portable) | `fileman-linux-x86_64.AppImage` | `chmod +x` and run |
+
+The `-gles` Linux builds use the OpenGL ES backend — use them if the default
+Vulkan build reports `NoSupportedDeviceFound`.
+
+Released builds check for a newer version on startup and offer to install it
+from the help screen (F1). The command line works too: `fileman --update`.
+
+If macOS reports that the app is damaged or that Apple cannot check it for
+malicious software, that release was built without notarization credentials.
+Clear the download quarantine to run it anyway:
+```bash
+xattr -dr com.apple.quarantine /Applications/FileMan.app
+```
+
 ## Keyboard Shortcuts
 | Key | Action |
 |-----|--------|
