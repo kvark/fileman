@@ -22,6 +22,9 @@ Ensure `cargo fmt` is ran and `cargo clippy` is clean.
 - `src/input.rs` — keyboard handling
 - `src/ui/` — UI components (panel, preview, help)
 - `src/image_decode.rs` — image decoding (including animated GIF)
+- `src/ssh.rs` — SSH transport: connection thread, auth, blocking bridge over sunset
+- `src/ssh/knownhosts.rs` — `known_hosts` parsing and host-key policy
+- `src/sftp.rs` — remote file operations built on `src/ssh.rs`
 - `src/replay.rs` — replay case data structures and assertion types
 - `src/replay_runner.rs` — headless replay executor and assertion logic
 - `themes/` — external theme files
@@ -166,6 +169,38 @@ For debugging or developing new tests, request a full state dump:
 This writes a RON file with both panels' entries, cursor positions, modes, and
 sort settings. Inspect it to determine the right assertion values for a new test.
 
+## SSH
+
+Remote browsing runs on [sunset](https://github.com/navigato-rs/sunset), a
+pure-Rust SSH implementation. It is async and wants one task driving each
+connection, while the rest of FileMan is blocking and thread-per-operation, so
+`src/ssh.rs` owns that boundary: each host gets a thread running a
+current-thread tokio runtime, and `ssh::Conn` is a blocking handle that sends
+jobs to it. Nothing above `src/ssh.rs` sees a future.
+
+Two properties of sunset shape the code, and both cause hangs rather than
+errors when ignored:
+
+- A channel is only usable once its `SessionOpened` event has been answered
+  with the subsystem or command it should run.
+- Every channel half, stderr included, has to be read. An abandoned half stalls
+  the whole session once the peer fills it, not just that stream.
+
+sunset also has no way to send a channel EOF — it only sends one in reply to
+the peer's — so a remote command cannot be told that its stdin has ended.
+Anything shaped like `tar xf -` would wait forever. Directory uploads
+therefore stage the archive into a temp file next to the destination over SFTP
+and then extract it, rather than piping it in. If sunset gains a client-side
+EOF, `ssh::Conn::exec_stream` can grow a stdin half again and those paths can
+go back to streaming.
+
+Exit statuses are reported by sunset as a session-wide event that cannot be
+tied back to a particular channel, so commands run through `exec_checked` are
+judged by what they wrote to stderr instead.
+
+Integration tests run against a real sshd on localhost; see Testing above and
+the `sftp` job in CI.
+
 ## Releasing
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds every
@@ -225,7 +260,7 @@ On a Mac with the certificate in the login keychain, build the bundle and run
 the script with the notary credentials in the environment:
 
 ```bash
-cargo bundle --release --target aarch64-apple-darwin --features self-update,vendored-openssl
+cargo bundle --release --target aarch64-apple-darwin --features self-update
 MACOS_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
   APPLE_API_KEY_ID=... APPLE_API_ISSUER_ID=... APPLE_API_KEY="$(base64 -i AuthKey.p8)" \
   scripts/macos_package.sh

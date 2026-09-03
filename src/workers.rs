@@ -38,7 +38,7 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn with_sftp<F, R>(sessions: &SftpSessions, host: &str, f: F) -> Result<R, String>
 where
-    F: FnOnce(&ssh2::Sftp) -> Result<R, String>,
+    F: FnOnce(&crate::ssh::Conn) -> Result<R, String>,
 {
     with_sftp_session(sessions, host, |s| f(&s.sftp))
 }
@@ -409,10 +409,10 @@ pub fn start_io_worker(
                         let locked = lock_or_recover(&session);
                         let result = if is_dir {
                             let total =
-                                crate::sftp::count_bytes_via_exec(&locked.session, &remote_path);
+                                crate::sftp::count_bytes_via_exec(&locked.sftp, &remote_path);
                             transfer_progress.reset(total);
                             crate::sftp::copy_remote_dir_to_local_via_tar(
-                                &locked.session,
+                                &locked.sftp,
                                 &remote_path,
                                 &dst_dir,
                                 &name,
@@ -485,7 +485,7 @@ pub fn start_io_worker(
                             transfer_progress.reset(total);
                             crate::sftp::copy_local_dir_to_remote_via_tar(
                                 &src,
-                                &locked.session,
+                                &locked.sftp,
                                 &remote_dir,
                                 &cancel_flag,
                                 Some(&transfer_progress),
@@ -759,9 +759,9 @@ pub fn start_io_worker(
                             let dst_locked = lock_or_recover(&dst_arc);
                             transfer_progress.reset(0);
                             if let Err(e) = crate::sftp::copy_cross_host_via_tar(
-                                &src_locked.session,
+                                &src_locked.sftp,
                                 &src_path,
-                                &dst_locked.session,
+                                &dst_locked.sftp,
                                 &dst_dir,
                                 &name,
                                 &cancel_flag,
@@ -1608,7 +1608,9 @@ fn run_remote_search(
     let cmd = build_remote_search_cmd(remote_root, &request.needle, request.case, request.mode);
     let locked = lock_or_recover(&session_arc);
 
-    let mut channel = match locked.session.channel_session() {
+    // Streamed rather than captured: a search over a big tree can print for a
+    // long time, and results should appear as they arrive.
+    let mut channel = match locked.sftp.exec_stream(&cmd) {
         Ok(ch) => ch,
         Err(e) => {
             let _ = result_tx.send(SearchEvent::Error {
@@ -1622,17 +1624,6 @@ fn run_remote_search(
             return None;
         }
     };
-    if let Err(e) = channel.exec(&cmd) {
-        let _ = result_tx.send(SearchEvent::Error {
-            id: request.id,
-            message: format!("exec: {e}"),
-        });
-        emit_done(SearchProgress {
-            scanned: 0,
-            matched: 0,
-        });
-        return None;
-    }
 
     let mut progress = SearchProgress {
         scanned: 0,
@@ -1713,7 +1704,7 @@ pub fn start_remote_dir_size_worker(
                     let session_arc = lock_or_recover(&sessions).get(&host).cloned();
                     if let Some(arc) = session_arc {
                         let locked = lock_or_recover(&arc);
-                        crate::sftp::count_bytes_via_exec(&locked.session, &path)
+                        crate::sftp::count_bytes_via_exec(&locked.sftp, &path)
                     } else {
                         0
                     }

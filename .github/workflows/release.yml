@@ -78,7 +78,7 @@ jobs:
         run: |
           cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle --rev 17cc8eb --locked
           rustup target add aarch64-apple-darwin
-          cargo bundle --release --target aarch64-apple-darwin --features self-update,vendored-openssl
+          cargo bundle --release --target aarch64-apple-darwin --features self-update
 
       # Signs with Developer ID, notarizes, and staples when the secrets below
       # are configured; falls back to an ad-hoc signature otherwise so the job

@@ -1147,8 +1147,9 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
 
     // Evict stale SFTP sessions that failed during directory listing.
     // The next navigation will trigger a fresh reconnect.
-    // Drop removed sessions on a background thread because libssh2_session_free
-    // can block in poll() for an extended time, which would hang the UI.
+    // Drop removed sessions on a background thread: dropping a session tells
+    // its connection thread to stop, and doing that off the UI thread keeps
+    // teardown off the frame path.
     if !stale_sessions.is_empty() {
         let mut removed = Vec::new();
         {
@@ -1342,8 +1343,7 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                     .lock()
                     .unwrap()
                     .insert(host_key.clone(), arc_session);
-                // Drop old session on a background thread to avoid blocking
-                // the UI in libssh2_session_free.
+                // Drop the old session off the UI thread, as above.
                 if let Some(old) = old {
                     std::thread::spawn(move || drop(old));
                 }
@@ -3686,7 +3686,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         .cloned();
                     let data = session.and_then(|s| {
                         let locked = s.lock().unwrap_or_else(|p| p.into_inner());
-                        let stat = locked.sftp.stat(std::path::Path::new(path)).ok();
+                        let stat = locked.sftp.stat(path).ok();
                         image_progress.reset(stat.and_then(|s| s.size).unwrap_or(0));
                         let mut file =
                             fileman::sftp::open_remote_reader(&locked.sftp, path).ok()?;

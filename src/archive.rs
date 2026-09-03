@@ -11,7 +11,7 @@ const ARCHIVE_READ_BUFFER: usize = 1024 * 1024;
 
 /// Run `f` with a `Read + Seek` handle to the archive. For local paths this
 /// opens a buffered file; for synthetic SFTP archive paths it locks the SFTP
-/// session for the host and streams via `ssh2::File`.
+/// session for the host and streams over SFTP.
 pub fn with_seek_reader<R, F>(archive_path: &Path, f: F) -> io::Result<R>
 where
     F: FnOnce(&mut (dyn ReadSeek + '_)) -> io::Result<R>,
@@ -22,10 +22,8 @@ where
         let locked = session
             .lock()
             .map_err(|_| io::Error::other("session mutex poisoned"))?;
-        let file = locked
-            .sftp
-            .open(Path::new(&remote_path))
-            .map_err(|e| io::Error::other(format!("open remote {remote_path}: {e}")))?;
+        let file = crate::sftp::open_remote_reader(&locked.sftp, &remote_path)
+            .map_err(io::Error::other)?;
         // Buffer the remote handle: the zip reader parses the central directory
         // with many tiny field-sized reads, and each unbuffered read is a
         // separate SFTP round-trip. Buffering collapses them into 1 MB fills.
@@ -50,10 +48,8 @@ where
         let locked = session
             .lock()
             .map_err(|_| io::Error::other("session mutex poisoned"))?;
-        let file = locked
-            .sftp
-            .open(Path::new(&remote_path))
-            .map_err(|e| io::Error::other(format!("open remote {remote_path}: {e}")))?;
+        let file = crate::sftp::open_remote_reader(&locked.sftp, &remote_path)
+            .map_err(io::Error::other)?;
         f(Box::new(file))
     } else {
         let file = fs::File::open(archive_path)?;
