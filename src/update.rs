@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-const GITHUB_REPO: &str = "kvark/fileman";
+const GITHUB_REPO: &str = "navigato-rs/fileman";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug)]

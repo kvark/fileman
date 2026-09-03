@@ -154,7 +154,7 @@
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/kvark/fileman'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/navigato-rs/fileman'/>
 
         <!-- WixUI_Advanced: one-click "Install" (per-user, no elevation) on the
              welcome page, plus an "Advanced" path with the per-user/per-machine
