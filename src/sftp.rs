@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
-    net::TcpStream,
     path::Path,
     sync::{
         Arc, Mutex, OnceLock,
@@ -9,16 +8,23 @@ use std::{
     },
 };
 
-use ssh2::{self, CheckResult, KnownHostFileKind, KnownHostKeyFormat, Session, Sftp};
-
 use crate::core::{DirEntry, EntryLocation};
+use crate::ssh::{self, Conn, FileAttrs, OpenMode, RemoteFile};
 
 pub struct SftpSession {
-    pub session: Session,
-    pub sftp: Sftp,
+    /// The connection. Named `sftp` because that is what the app does with it;
+    /// exec-based operations share the same connection.
+    pub sftp: Arc<Conn>,
     pub host: String,
     /// Remote user's home directory (from `realpath(".")`), if resolved.
     pub home_dir: Option<String>,
+}
+
+impl SftpSession {
+    /// False once the connection has failed, so the app can drop the session.
+    pub fn is_alive(&self) -> bool {
+        self.sftp.is_alive()
+    }
 }
 
 type SessionMap = HashMap<String, Arc<Mutex<SftpSession>>>;
@@ -145,7 +151,7 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-fn home_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
         std::env::var("USERPROFILE")
@@ -159,126 +165,17 @@ fn home_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<(), String> {
-    let (key, key_type) = session
-        .host_key()
-        .ok_or_else(|| "Server did not provide a host key".to_string())?;
-
-    let mut known_hosts = session
-        .known_hosts()
-        .map_err(|e| format!("Known-hosts init: {e}"))?;
-
-    let kh_path = home_dir()
-        .map(|h| h.join(".ssh").join("known_hosts"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
-
-    if kh_path.exists() {
-        // If the file exists but can't be read, the in-memory set stays empty,
-        // which would (a) downgrade every host to blind TOFU and (b) let the
-        // NotFound branch below overwrite the on-disk file with only the new
-        // entry, destroying existing pins. Fail closed instead.
-        if let Err(e) = known_hosts.read_file(&kh_path, KnownHostFileKind::OpenSSH) {
-            return Err(format!(
-                "Could not read {}: {e}. Refusing to connect rather than skip \
-                 host-key verification.",
-                kh_path.display()
-            ));
-        }
-    }
-
-    let check = if port == 22 {
-        known_hosts.check(host, key)
-    } else {
-        known_hosts.check_port(host, port, key)
-    };
-
-    match check {
-        CheckResult::Match => Ok(()),
-        CheckResult::Mismatch => Err(format!(
-            "HOST KEY MISMATCH for {host}! The server's key has changed. \
-             This could indicate a man-in-the-middle attack. \
-             If the key change is expected, remove the old entry from {}.",
-            kh_path.display()
-        )),
-        CheckResult::NotFound => {
-            eprintln!("Host key for {host} not found in known_hosts; accepting (TOFU).");
-            let fmt: KnownHostKeyFormat = key_type.into();
-            if known_hosts.add(host, key, host, fmt).is_ok() {
-                if let Some(parent) = kh_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = known_hosts.write_file(&kh_path, KnownHostFileKind::OpenSSH);
-            }
-            Ok(())
-        }
-        CheckResult::Failure => {
-            // The check itself could not be performed (e.g. unsupported key
-            // type, malformed entry). Failing open here would let a MITM who
-            // can steer the check into this branch bypass verification, so
-            // refuse the connection.
-            eprintln!("Known-hosts check could not be performed for {host}; refusing.");
-            Err(format!(
-                "Host-key verification could not be performed for {host}. \
-                 Refusing to connect."
-            ))
-        }
-    }
-}
-
-#[cfg(unix)]
-fn set_tcp_keepalive(tcp: &TcpStream) {
-    use std::os::fd::AsRawFd as _;
-    let fd = tcp.as_raw_fd();
-    unsafe {
-        let enable: libc::c_int = 1;
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_KEEPALIVE,
-            &enable as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        // Start probing after 15 seconds of idle
-        let idle: libc::c_int = 15;
-        #[cfg(target_os = "macos")]
-        const KEEPIDLE: libc::c_int = libc::TCP_KEEPALIVE;
-        #[cfg(not(target_os = "macos"))]
-        const KEEPIDLE: libc::c_int = libc::TCP_KEEPIDLE;
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            KEEPIDLE,
-            &idle as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        // Send a probe every 5 seconds
-        let interval: libc::c_int = 5;
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPINTVL,
-            &interval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        // Give up after 3 failed probes (~15s after idle detection)
-        let count: libc::c_int = 3;
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPCNT,
-            &count as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-}
-
-/// Connect to an SSH host using config resolution. Tries ssh-agent, then key files.
+/// Connect to an SSH host using config resolution. Offers ssh-agent keys first,
+/// then key files from the config and the default locations.
 pub fn connect(
     host: &str,
     ssh_config: &HashMap<String, SshHostConfig>,
 ) -> Result<SftpSession, String> {
     let config = ssh_config.get(host);
-    let actual_host = config.and_then(|c| c.hostname.as_deref()).unwrap_or(host);
+    let hostname = config
+        .and_then(|c| c.hostname.as_deref())
+        .unwrap_or(host)
+        .to_string();
     let user = config
         .and_then(|c| c.user.as_deref())
         .map(|s| s.to_string())
@@ -286,82 +183,42 @@ pub fn connect(
         .unwrap_or_else(|| "root".to_string());
     let port = config.and_then(|c| c.port).unwrap_or(22);
 
-    let addr = format!("{actual_host}:{port}");
-    let tcp = TcpStream::connect(&addr).map_err(|e| format!("TCP connect to {addr}: {e}"))?;
-    tcp.set_nodelay(true).ok();
-    // Enable TCP keepalive so the OS detects dead connections after sleep/network changes.
-    // Probe starts after 15s idle, then every 5s, giving up after ~30s total.
-    #[cfg(unix)]
-    set_tcp_keepalive(&tcp);
-
-    let mut session = Session::new().map_err(|e| format!("SSH session init: {e}"))?;
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|e| format!("SSH handshake with {actual_host}: {e}"))?;
-    session.set_timeout(30_000);
-    // SSH-level keepalive: send a probe every 15 seconds, expect a reply.
-    session.set_keepalive(true, 15);
-
-    verify_host_key(&session, actual_host, port)?;
-
-    // Try ssh-agent first
-    if session.userauth_agent(&user).is_ok() && session.authenticated() {
-        let sftp = session.sftp().map_err(|e| format!("SFTP subsystem: {e}"))?;
-        let home_dir = sftp
-            .realpath(Path::new("."))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
-        return Ok(SftpSession {
-            session,
-            sftp,
-            host: host.to_string(),
-            home_dir,
-        });
-    }
-
-    // Try key files from config, then default paths
-    let mut key_paths: Vec<String> = config.map(|c| c.identity_files.clone()).unwrap_or_default();
-    if let Ok(home) = std::env::var("HOME") {
+    let mut identity_files: Vec<String> =
+        config.map(|c| c.identity_files.clone()).unwrap_or_default();
+    if let Some(home) = home_dir() {
         for default in &["id_ed25519", "id_rsa", "id_ecdsa"] {
-            let path = format!("{home}/.ssh/{default}");
-            if !key_paths.contains(&path) {
-                key_paths.push(path);
+            let path = home.join(".ssh").join(default);
+            let path = path.to_string_lossy().into_owned();
+            if !identity_files.contains(&path) {
+                identity_files.push(path);
             }
         }
     }
+    identity_files.retain(|p| Path::new(p).exists());
 
-    for key_path in &key_paths {
-        let key = Path::new(key_path);
-        if !key.exists() {
-            continue;
-        }
-        if session.userauth_pubkey_file(&user, None, key, None).is_ok() && session.authenticated() {
-            let sftp = session.sftp().map_err(|e| format!("SFTP subsystem: {e}"))?;
-            let home_dir = sftp
-                .realpath(Path::new("."))
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned());
-            return Ok(SftpSession {
-                session,
-                sftp,
-                host: host.to_string(),
-                home_dir,
-            });
-        }
-    }
+    let conn = ssh::connect(ssh::ConnectParams {
+        host: host.to_string(),
+        hostname,
+        port,
+        user,
+        identity_files,
+        use_agent: true,
+    })
+    .map_err(|e| e.message)?;
 
-    Err(format!(
-        "Authentication failed for {user}@{actual_host}:{port}. \
-         Ensure ssh-agent is running or key files are available."
-    ))
+    let home_dir = conn.home_dir.clone();
+    Ok(SftpSession {
+        sftp: Arc::new(conn),
+        host: host.to_string(),
+        home_dir,
+    })
 }
 
 /// List a remote directory, producing DirEntry items with EntryLocation::Remote.
 /// Does not include ".." when path is "/".
-pub fn read_directory(sftp: &Sftp, host: &str, path: &str) -> Result<Vec<DirEntry>, String> {
+pub fn read_directory(conn: &Conn, host: &str, path: &str) -> Result<Vec<DirEntry>, String> {
     let mut all = Vec::new();
-    read_directory_streaming(sftp, host, path, |entries| {
+    read_directory_streaming(conn, host, path, |entries| {
         all.extend(entries);
     })
     .map_err(|(msg, _)| msg)?;
@@ -375,16 +232,15 @@ pub fn read_directory(sftp: &Sftp, host: &str, path: &str) -> Result<Vec<DirEntr
 /// `is_connection_error = true` means the SSH session is likely dead (timeout, disconnect).
 /// `is_connection_error = false` means an SFTP-level error (permission denied, etc.)
 pub fn read_directory_streaming(
-    sftp: &Sftp,
+    conn: &Conn,
     host: &str,
     path: &str,
     mut on_batch: impl FnMut(Vec<DirEntry>),
 ) -> Result<(), (String, bool)> {
     let remote_path = if path.is_empty() { "/" } else { path };
-    let mut handle = sftp.opendir(Path::new(remote_path)).map_err(|e| {
-        let is_connection_error = !matches!(e.code(), ssh2::ErrorCode::SFTP(_));
-        (format!("opendir {remote_path}: {e}"), is_connection_error)
-    })?;
+    let handle = conn
+        .open_dir(remote_path)
+        .map_err(|e| (format!("opendir {remote_path}: {e}"), e.fatal))?;
 
     // First batch: ".." entry if not at root
     if remote_path != "/" {
@@ -403,149 +259,172 @@ pub fn read_directory_streaming(
         }]);
     }
 
-    const BATCH_SIZE: usize = 64;
-    let mut batch = Vec::with_capacity(BATCH_SIZE);
-
-    while let Ok((pathbuf, stat)) = handle.readdir() {
-        let name = pathbuf
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        if name.is_empty() || name == "." || name == ".." {
-            continue;
+    let result = (|| -> Result<(), (String, bool)> {
+        // The server chooses the batch size; each round trip yields one batch.
+        while let Some(items) = conn
+            .read_dir(handle)
+            .map_err(|e| (format!("readdir {remote_path}: {e}"), e.fatal))?
+        {
+            let mut batch = Vec::with_capacity(items.len());
+            for item in items {
+                if item.name.is_empty() || item.name == "." || item.name == ".." {
+                    continue;
+                }
+                let inner_path = join_remote(remote_path, &item.name);
+                let is_symlink = item.attrs.is_symlink();
+                // A symlink's own attributes describe the link, so resolve the
+                // target to decide whether it behaves as a directory.
+                let (is_dir, size) = if is_symlink {
+                    match conn.stat(&inner_path) {
+                        Ok(t) => (t.is_dir(), if t.is_dir() { None } else { t.size }),
+                        Err(_) => (false, item.attrs.size),
+                    }
+                } else {
+                    let d = item.attrs.is_dir();
+                    (d, if d { None } else { item.attrs.size })
+                };
+                let link_target = if is_symlink {
+                    conn.readlink(&inner_path).ok()
+                } else {
+                    None
+                };
+                batch.push(DirEntry {
+                    name: item.name,
+                    is_dir,
+                    is_symlink,
+                    link_target,
+                    location: EntryLocation::Remote {
+                        host: host.to_string(),
+                        path: inner_path,
+                    },
+                    size,
+                    modified: item.attrs.mtime.map(u64::from),
+                });
+            }
+            if !batch.is_empty() {
+                on_batch(batch);
+            }
         }
-        let is_dir = stat.is_dir();
-        let is_symlink = stat.file_type() == ssh2::FileType::Symlink;
-        let size = if is_dir { None } else { stat.size };
-        let modified = stat.mtime;
-        let inner_path = if remote_path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{remote_path}/{name}")
-        };
-        let link_target = if is_symlink {
-            sftp.readlink(Path::new(&inner_path))
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        } else {
-            None
-        };
-        batch.push(DirEntry {
-            name,
-            is_dir,
-            is_symlink,
-            link_target,
-            location: EntryLocation::Remote {
-                host: host.to_string(),
-                path: inner_path,
-            },
-            size,
-            modified,
-        });
-        if batch.len() >= BATCH_SIZE {
-            on_batch(std::mem::replace(
-                &mut batch,
-                Vec::with_capacity(BATCH_SIZE),
-            ));
-        }
-    }
+        Ok(())
+    })();
 
-    if !batch.is_empty() {
-        on_batch(batch);
-    }
-
-    Ok(())
+    // Close even after a failure: the listing may just be partial.
+    let _ = conn.close(handle);
+    result
 }
 
-/// Read an entire remote file into memory, optionally reporting progress.
-pub fn read_file_full(sftp: &Sftp, path: &str) -> Result<Vec<u8>, String> {
-    read_file_full_progress(sftp, path, None)
+/// Joins a remote directory and an entry name, without doubling the separator.
+fn join_remote(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", dir.trim_end_matches('/'))
+    }
+}
+
+/// Lists a directory's raw entries, skipping "." and "..".
+fn list_dir(conn: &Conn, path: &str) -> Result<Vec<ssh::DirItem>, String> {
+    let handle = conn
+        .open_dir(path)
+        .map_err(|e| format!("opendir {path}: {e}"))?;
+    let mut all = Vec::new();
+    let result = (|| -> Result<(), String> {
+        while let Some(items) = conn
+            .read_dir(handle)
+            .map_err(|e| format!("readdir {path}: {e}"))?
+        {
+            all.extend(
+                items
+                    .into_iter()
+                    .filter(|i| i.name != "." && i.name != ".." && !i.name.is_empty()),
+            );
+        }
+        Ok(())
+    })();
+    let _ = conn.close(handle);
+    result.map(|()| all)
+}
+
+/// Read an entire remote file into memory.
+pub fn read_file_full(conn: &Conn, path: &str) -> Result<Vec<u8>, String> {
+    read_file_full_progress(conn, path, None)
 }
 
 /// Read an entire remote file into memory with progress reporting.
 pub fn read_file_full_progress(
-    sftp: &Sftp,
+    conn: &Conn,
     path: &str,
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<Vec<u8>, String> {
-    let stat = sftp.stat(Path::new(path)).ok();
+    let size = conn.stat(path).ok().and_then(|s| s.size);
     if let Some(p) = progress {
-        p.reset(stat.and_then(|s| s.size).unwrap_or(0));
+        p.reset(size.unwrap_or(0));
     }
-    let mut file = sftp
-        .open(Path::new(path))
-        .map_err(|e| format!("open {path}: {e}"))?;
+    let handle = conn.open(path, OpenMode::Read).map_err(|e| e.message)?;
     let mut buf = Vec::new();
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        match file.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(p) = progress {
-                    p.add(n as u64);
-                }
+    let mut offset = 0u64;
+    let result = (|| -> Result<(), String> {
+        loop {
+            let chunk = conn
+                .read_at(handle, offset, ssh::CHUNK)
+                .map_err(|e| format!("read {path}: {e}"))?;
+            if chunk.is_empty() {
+                return Ok(());
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("read {path}: {e}")),
+            offset += chunk.len() as u64;
+            if let Some(p) = progress {
+                p.add(chunk.len() as u64);
+            }
+            buf.extend_from_slice(&chunk);
         }
-    }
-    Ok(buf)
+    })();
+    let _ = conn.close(handle);
+    result.map(|()| buf)
 }
 
 /// Read a prefix of a remote file for preview purposes.
-pub fn read_bytes_prefix(sftp: &Sftp, path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
-    let mut file = sftp
-        .open(Path::new(path))
-        .map_err(|e| format!("open {path}: {e}"))?;
-    let mut buf = vec![0u8; max_bytes];
-    let mut total = 0;
-    while total < max_bytes {
-        match file.read(&mut buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("read {path}: {e}")),
+pub fn read_bytes_prefix(conn: &Conn, path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let handle = conn.open(path, OpenMode::Read).map_err(|e| e.message)?;
+    let mut buf = Vec::new();
+    let result = (|| -> Result<(), String> {
+        while buf.len() < max_bytes {
+            let want = (max_bytes - buf.len()).min(ssh::CHUNK);
+            let chunk = conn
+                .read_at(handle, buf.len() as u64, want)
+                .map_err(|e| format!("read {path}: {e}"))?;
+            if chunk.is_empty() {
+                break;
+            }
+            buf.extend_from_slice(&chunk);
         }
-    }
-    buf.truncate(total);
-    Ok(buf)
+        Ok(())
+    })();
+    let _ = conn.close(handle);
+    buf.truncate(max_bytes);
+    result.map(|()| buf)
 }
 
-/// Open a remote file as a reader (for streaming preview).
-pub fn open_remote_reader(sftp: &Sftp, path: &str) -> Result<ssh2::File, String> {
-    sftp.open(Path::new(path))
-        .map_err(|e| format!("open {path}: {e}"))
+/// Open a remote file as a seekable reader (for streaming preview and archives).
+pub fn open_remote_reader(conn: &Arc<Conn>, path: &str) -> Result<RemoteFile, String> {
+    RemoteFile::open(conn.clone(), path).map_err(|e| format!("open {path}: {e}"))
 }
 
 /// Recursively delete a remote path (file or directory).
 /// Reports each deleted item via `progress.add_item()` when provided.
 pub fn recursive_delete(
-    sftp: &Sftp,
+    conn: &Conn,
     path: &str,
     is_dir: bool,
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
     if is_dir {
-        let children = sftp
-            .readdir(Path::new(path))
-            .map_err(|e| format!("readdir {path}: {e}"))?;
-        for (child_path, stat) in children {
-            let name = child_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            if name == "." || name == ".." {
-                continue;
-            }
-            let child_str = child_path.to_string_lossy().to_string();
-            recursive_delete(sftp, &child_str, stat.is_dir(), progress)?;
+        for child in list_dir(conn, path)? {
+            let child_path = join_remote(path, &child.name);
+            recursive_delete(conn, &child_path, child.attrs.is_dir(), progress)?;
         }
-        sftp.rmdir(Path::new(path))
-            .map_err(|e| format!("rmdir {path}: {e}"))?;
+        conn.rmdir(path).map_err(|e| format!("rmdir {path}: {e}"))?;
     } else {
-        sftp.unlink(Path::new(path))
+        conn.remove(path)
             .map_err(|e| format!("unlink {path}: {e}"))?;
     }
     if let Some(p) = progress {
@@ -555,57 +434,53 @@ pub fn recursive_delete(
 }
 
 /// Write bytes to a remote file (create or overwrite).
-pub fn write_file(sftp: &Sftp, path: &str, contents: &[u8]) -> Result<(), String> {
-    let mut file = sftp
-        .create(Path::new(path))
+pub fn write_file(conn: &Conn, path: &str, contents: &[u8]) -> Result<(), String> {
+    let handle = conn
+        .open(path, OpenMode::Write)
         .map_err(|e| format!("create {path}: {e}"))?;
-    file.write_all(contents)
-        .map_err(|e| format!("write {path}: {e}"))?;
-    Ok(())
+    let result = (|| -> Result<(), String> {
+        let mut offset = 0u64;
+        for chunk in contents.chunks(ssh::CHUNK) {
+            conn.write_at(handle, offset, chunk.to_vec())
+                .map_err(|e| format!("write {path}: {e}"))?;
+            offset += chunk.len() as u64;
+        }
+        Ok(())
+    })();
+    let closed = conn.close(handle).map_err(|e| format!("close {path}: {e}"));
+    result.and(closed)
 }
 
 /// Create a remote directory.
-pub fn mkdir(sftp: &Sftp, path: &str) -> Result<(), String> {
-    sftp.mkdir(Path::new(path), 0o755)
-        .map_err(|e| format!("mkdir {path}: {e}"))
+pub fn mkdir(conn: &Conn, path: &str) -> Result<(), String> {
+    conn.mkdir(path).map_err(|e| format!("mkdir {path}: {e}"))
 }
 
 /// Copy a file within the same remote host (read then write).
-pub fn copy_remote_remote(sftp: &Sftp, src_path: &str, dst_path: &str) -> Result<(), String> {
-    let data = read_file_full(sftp, src_path)?;
-    write_file(sftp, dst_path, &data)
+pub fn copy_remote_remote(conn: &Conn, src_path: &str, dst_path: &str) -> Result<(), String> {
+    copy_remote(conn, src_path, dst_path)
 }
 
 /// Recursively copy a file or directory within the same remote host.
 pub fn recursive_copy_remote(
-    sftp: &Sftp,
+    conn: &Conn,
     src_path: &str,
     dst_dir: &str,
     name: &str,
 ) -> Result<(), String> {
-    let dst_path = format!("{}/{}", dst_dir.trim_end_matches('/'), name);
-    let stat = sftp
-        .stat(Path::new(src_path))
+    let dst_path = join_remote(dst_dir, name);
+    let stat = conn
+        .stat(src_path)
         .map_err(|e| format!("stat {src_path}: {e}"))?;
     if stat.is_dir() {
-        sftp.mkdir(Path::new(&dst_path), 0o755)
+        conn.mkdir(&dst_path)
             .map_err(|e| format!("mkdir {dst_path}: {e}"))?;
-        let children = sftp
-            .readdir(Path::new(src_path))
-            .map_err(|e| format!("readdir {src_path}: {e}"))?;
-        for (child_path, _) in children {
-            let child_name = child_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            if child_name == "." || child_name == ".." {
-                continue;
-            }
-            let child_src = format!("{}/{}", src_path.trim_end_matches('/'), child_name);
-            recursive_copy_remote(sftp, &child_src, &dst_path, child_name)?;
+        for child in list_dir(conn, src_path)? {
+            let child_src = join_remote(src_path, &child.name);
+            recursive_copy_remote(conn, &child_src, &dst_path, &child.name)?;
         }
     } else {
-        copy_remote_remote(sftp, src_path, &dst_path)?;
+        copy_remote(conn, src_path, &dst_path)?;
     }
     Ok(())
 }
@@ -655,50 +530,41 @@ fn is_cancel_err(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::Other && e.to_string() == "Cancelled"
 }
 
+/// Splits a remote path into its parent directory and final component.
+fn split_remote(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        None => (".", path),
+    }
+}
+
 /// Copy a remote directory tree to a local path.
 /// Runs `tar cf -` on the remote via SSH exec, extracts locally with the Rust `tar` crate.
 pub fn copy_remote_dir_to_local_via_tar(
-    src_session: &Session,
+    conn: &Conn,
     src_path: &str,
     dst_dir: &std::path::Path,
     name: &str,
     cancel: &AtomicBool,
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
-    let (src_parent, src_name) = match src_path.rfind('/') {
-        Some(pos) => (&src_path[..pos], &src_path[pos + 1..]),
-        None => (".", src_path),
-    };
-    let src_parent = if src_parent.is_empty() {
-        "/"
-    } else {
-        src_parent
-    };
+    let (src_parent, src_name) = split_remote(src_path);
 
     let src_cmd = format!(
         "tar cf - -C {} {}",
         sh_quote(src_parent),
         sh_quote(src_name)
     );
-    let mut src_ch = src_session
-        .channel_session()
-        .map_err(|e| format!("src channel_session: {e}"))?;
-    src_ch
-        .exec(&src_cmd)
-        .map_err(|e| format!("src exec: {e}"))?;
+    let stream = conn.exec_stream(&src_cmd).map_err(|e| e.message)?;
 
-    // Disable session timeout during tar streaming — tar may pause while
-    // reading directory contents, exceeding the normal 30s timeout.
-    src_session.set_timeout(0);
-
-    let buf = io::BufReader::with_capacity(1 << 20, &mut src_ch);
     let reader = TrackedReader {
-        inner: buf,
+        inner: io::BufReader::with_capacity(1 << 20, stream),
         cancel,
         progress,
     };
     let mut archive = tar::Archive::new(reader);
-    let unpack_result = archive.unpack(dst_dir).map_err(|e| {
+    archive.unpack(dst_dir).map_err(|e| {
         if e.get_ref().is_some_and(|s| {
             is_cancel_err(
                 s.downcast_ref::<io::Error>()
@@ -709,10 +575,7 @@ pub fn copy_remote_dir_to_local_via_tar(
         } else {
             format!("tar extract: {e}")
         }
-    });
-
-    src_session.set_timeout(30_000);
-    unpack_result?;
+    })?;
 
     if name != src_name {
         std::fs::rename(dst_dir.join(src_name), dst_dir.join(name))
@@ -721,11 +584,105 @@ pub fn copy_remote_dir_to_local_via_tar(
     Ok(())
 }
 
+/// An `io::Write` that appends to a remote file over SFTP.
+struct RemoteWriter<'a> {
+    conn: &'a Conn,
+    handle: ssh::HandleId,
+    offset: u64,
+}
+
+impl io::Write for RemoteWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.conn
+            .write_at(self.handle, self.offset, buf.to_vec())
+            .map_err(io::Error::other)?;
+        self.offset += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Picks a temp path next to the destination, on the same filesystem so the
+/// extract does not cross devices.
+fn temp_archive_path(dst_dir: &str) -> String {
+    // Unique enough for concurrent transfers from one process.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    format!("{}/.fileman-{pid}-{n}.tar", dst_dir.trim_end_matches('/'))
+}
+
+/// Runs a command that should print nothing, treating any stderr as failure.
+///
+/// sunset surfaces a channel's exit status as a session-wide event that cannot
+/// be tied back to one channel, so unlike the libssh2 version this reads the
+/// command's stderr rather than its exit code.
+fn exec_checked(conn: &Conn, cmd: &str, what: &str) -> Result<(), String> {
+    let out = conn.exec(cmd).map_err(|e| format!("{what}: {e}"))?;
+    let tail = String::from_utf8_lossy(&out.stderr);
+    let tail = tail.trim();
+    if tail.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{what}: {tail}"))
+    }
+}
+
+/// Streams a tar archive into a temp file on the remote, then extracts it.
+///
+/// The archive is staged rather than piped into `tar xf -` because sunset
+/// cannot signal end-of-input on a channel, so a remote command that reads
+/// its stdin to EOF would never return. The temp file lives beside the
+/// destination and is removed whether or not the extract succeeds.
+fn extract_staged_archive(
+    conn: &Conn,
+    dst_dir: &str,
+    tar_flag: &str,
+    write_archive: impl FnOnce(&mut RemoteWriter<'_>) -> io::Result<()>,
+) -> Result<(), String> {
+    let tmp = temp_archive_path(dst_dir);
+    let handle = conn
+        .open(&tmp, OpenMode::Write)
+        .map_err(|e| format!("create {tmp}: {e}"))?;
+
+    let staged = {
+        let mut w = RemoteWriter {
+            conn,
+            handle,
+            offset: 0,
+        };
+        write_archive(&mut w)
+    };
+    let closed = conn.close(handle).map_err(|e| format!("close {tmp}: {e}"));
+
+    let cleanup = |e: String| -> String {
+        let _ = conn.remove(&tmp);
+        e
+    };
+
+    match staged {
+        Ok(()) => {}
+        Err(e) if is_cancel_err(&e) => return Err(cleanup("Cancelled".to_string())),
+        Err(e) => return Err(cleanup(format!("staging archive: {e}"))),
+    }
+    if let Err(e) = closed {
+        return Err(cleanup(e));
+    }
+
+    let cmd = format!("tar {tar_flag} {} -C {}", sh_quote(&tmp), sh_quote(dst_dir));
+    let result = exec_checked(conn, &cmd, "remote tar");
+    let _ = conn.remove(&tmp);
+    result
+}
+
 /// Copy a local directory tree to a remote path.
-/// Creates the tar archive with the Rust `tar` crate, extracts remotely via SSH exec `tar xf -`.
+/// Creates the tar archive with the Rust `tar` crate and extracts it remotely.
 pub fn copy_local_dir_to_remote_via_tar(
     src_path: &std::path::Path,
-    dst_session: &Session,
+    conn: &Conn,
     dst_dir: &str,
     cancel: &AtomicBool,
     progress: Option<&crate::core::TransferProgress>,
@@ -735,91 +692,23 @@ pub fn copy_local_dir_to_remote_via_tar(
         .and_then(|s| s.to_str())
         .unwrap_or("dir");
 
-    let dst_cmd = format!("tar xf - -C {}", sh_quote(dst_dir));
-    let mut dst_ch = dst_session
-        .channel_session()
-        .map_err(|e| format!("dst channel_session: {e}"))?;
-    dst_ch
-        .exec(&dst_cmd)
-        .map_err(|e| format!("dst exec: {e}"))?;
-
-    // Disable session timeout during tar streaming — large trees may cause
-    // pauses exceeding the normal 30s timeout.
-    dst_session.set_timeout(0);
-
-    let buf = io::BufWriter::with_capacity(1 << 20, &mut dst_ch);
-    let mut writer = TrackedWriter {
-        inner: buf,
-        cancel,
-        progress,
-    };
-    let result = (|| -> io::Result<()> {
+    extract_staged_archive(conn, dst_dir, "xf", |remote| {
+        let mut writer = TrackedWriter {
+            inner: io::BufWriter::with_capacity(1 << 20, remote),
+            cancel,
+            progress,
+        };
         let mut ar = tar::Builder::new(&mut writer);
         ar.append_dir_all(src_name, src_path)?;
-        ar.finish()
-    })();
-
-    // Drop writer (and its BufWriter) to flush remaining data and release the &mut dst_ch borrow.
-    drop(writer);
-
-    dst_session.set_timeout(30_000);
-
-    match result {
-        Ok(()) => {}
-        Err(e) if is_cancel_err(&e) => return Err("Cancelled".to_string()),
-        Err(e) => return Err(format!("tar create: {e}")),
-    }
-
-    let (exit, stderr) = finalize_writing_channel(&mut dst_ch).map_err(|e| format!("dst {e}"))?;
-    if exit != 0 {
-        let tail = stderr.trim();
-        return if tail.is_empty() {
-            Err(format!("remote tar xf exited with status {exit}"))
-        } else {
-            Err(format!("remote tar xf exited with status {exit}: {tail}"))
-        };
-    }
-    Ok(())
+        ar.finish()?;
+        drop(ar);
+        writer.flush()
+    })
 }
 
 /// Shell-quote a string with single quotes, escaping any internal single quotes.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// Properly tear down a libssh2 exec channel after the local end is done
-/// writing. libssh2's `wait_close()` precondition is `channel->remote.eof`
-/// — it returns LIBSSH2_ERROR_INVAL (-34) with the message
-/// "libssh2_channel_wait_closed() invoked when channel is not in EOF state"
-/// when the remote hasn't sent its EOF yet.
-///
-/// To force that EOF: send our own EOF, then drain stdout (and stderr) until
-/// the remote naturally closes its end. read_to_end returning Ok(0) is the
-/// signal that the remote side has sent SSH_MSG_CHANNEL_EOF, which sets
-/// `remote.eof` and unblocks wait_close. Only then do we wait_close and
-/// pull exit_status.
-///
-/// Captures whatever the command printed to stderr so the caller can fold
-/// it into an error message — tar emits useful diagnostics there.
-fn finalize_writing_channel(ch: &mut ssh2::Channel) -> Result<(i32, String), String> {
-    ch.send_eof().map_err(|e| format!("send_eof: {e}"))?;
-    let mut stdout = Vec::new();
-    let _ = ch.read_to_end(&mut stdout);
-    let mut stderr = String::new();
-    let _ = ch.stderr().read_to_string(&mut stderr);
-    ch.wait_close().map_err(|e| format!("wait_close: {e}"))?;
-    Ok((ch.exit_status().unwrap_or(-1), stderr))
-}
-
-/// Same as `finalize_writing_channel` but for read-only / no-stdin commands
-/// like `mv`. Skips the `send_eof` step (we never wrote anything to drain).
-fn finalize_readonly_channel(ch: &mut ssh2::Channel) -> Result<(i32, String), String> {
-    let mut stdout = Vec::new();
-    let _ = ch.read_to_end(&mut stdout);
-    let mut stderr = String::new();
-    let _ = ch.stderr().read_to_string(&mut stderr);
-    ch.wait_close().map_err(|e| format!("wait_close: {e}"))?;
-    Ok((ch.exit_status().unwrap_or(-1), stderr))
 }
 
 /// Return the total byte size of a remote path via SSH exec.
@@ -829,33 +718,22 @@ fn finalize_readonly_channel(ch: &mut ssh2::Channel) -> Result<(i32, String), St
 ///   1. `du -sb`  — Linux/GNU coreutils: exact bytes.
 ///   2. `du -sk`  — macOS/BSD POSIX du: 1 KiB blocks → multiply by 1024.
 ///   3. Return 0  — Windows SSH or other exotic remote; progress bar shows animated form.
-pub fn count_bytes_via_exec(session: &Session, path: &str) -> u64 {
+pub fn count_bytes_via_exec(conn: &Conn, path: &str) -> u64 {
     let quoted = sh_quote(path);
     for (cmd, scale) in [
         (format!("du -sb {quoted} 2>/dev/null"), 1u64),
         (format!("du -sk {quoted} 2>/dev/null"), 1024u64),
     ] {
-        let mut ch = match session.channel_session() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        if ch.exec(&cmd).is_err() {
-            let _ = ch.wait_close();
-            continue;
-        }
-        let mut out = String::new();
-        let _ = ch.read_to_string(&mut out);
-        let _ = ch.wait_close();
-        let ok = ch.exit_status().unwrap_or(1) == 0;
-        if ok {
-            // du output: "12345\t/path/name\n" — first token is the numeric value
-            if let Some(n) = out
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                return n * scale;
-            }
+        let Ok(out) = conn.exec(&cmd) else { continue };
+        // du output: "12345\t/path/name\n" — first token is the numeric value.
+        // A failed du prints nothing (stderr is redirected away), so a parse
+        // failure is what selects the next form.
+        if let Some(n) = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            return n * scale;
         }
     }
     0
@@ -880,23 +758,15 @@ pub fn count_bytes_local(path: &std::path::Path) -> u64 {
 /// Copy a file or directory tree between two different remote hosts using a single
 /// `tar cf -` → relay → `tar xf -` stream.  This avoids per-file SFTP round-trips.
 pub fn copy_cross_host_via_tar(
-    src_session: &Session,
+    src_conn: &Conn,
     src_path: &str,
-    dst_session: &Session,
+    dst_conn: &Conn,
     dst_dir: &str,
     name: &str,
     cancel: &AtomicBool,
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
-    let (src_parent, src_name) = match src_path.rfind('/') {
-        Some(pos) => (&src_path[..pos], &src_path[pos + 1..]),
-        None => (".", src_path),
-    };
-    let src_parent = if src_parent.is_empty() {
-        "/"
-    } else {
-        src_parent
-    };
+    let (src_parent, src_name) = split_remote(src_path);
 
     // Use gzip compression to reduce bandwidth — data transits two SSH
     // connections (source → local → destination).
@@ -905,137 +775,81 @@ pub fn copy_cross_host_via_tar(
         sh_quote(src_parent),
         sh_quote(src_name)
     );
-    let dst_cmd = format!("tar xzf - -C {}", sh_quote(dst_dir));
+    let mut src = src_conn.exec_stream(&src_cmd).map_err(|e| e.message)?;
 
-    let mut src_ch = src_session
-        .channel_session()
-        .map_err(|e| format!("src channel_session: {e}"))?;
-    src_ch
-        .exec(&src_cmd)
-        .map_err(|e| format!("src exec '{src_cmd}': {e}"))?;
-
-    let mut dst_ch = dst_session
-        .channel_session()
-        .map_err(|e| format!("dst channel_session: {e}"))?;
-    dst_ch
-        .exec(&dst_cmd)
-        .map_err(|e| format!("dst exec '{dst_cmd}': {e}"))?;
-
-    // Disable session timeouts during the relay — tar on the source may pause
-    // for longer than the normal 30s timeout while reading directory contents.
-    src_session.set_timeout(0);
-    dst_session.set_timeout(0);
-
-    // Relay compressed tar stream from source to destination.
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("Cancelled".to_string());
-        }
-        match src_ch.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                dst_ch
-                    .write_all(&buf[..n])
-                    .map_err(|e| format!("relay write: {e}"))?;
-                if let Some(p) = progress {
-                    p.add(n as u64);
+    // Relay the compressed stream into a staging file on the destination,
+    // then extract it there.
+    extract_staged_archive(dst_conn, dst_dir, "xzf", |remote| {
+        let mut out = io::BufWriter::with_capacity(1 << 20, remote);
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(io::Error::other("Cancelled"));
+            }
+            match src.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.write_all(&buf[..n])?;
+                    if let Some(p) = progress {
+                        p.add(n as u64);
+                    }
                 }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                src_session.set_timeout(30_000);
-                dst_session.set_timeout(30_000);
-                return Err(format!("relay read: {e}"));
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             }
         }
-    }
-
-    // Restore session timeouts.
-    src_session.set_timeout(30_000);
-    dst_session.set_timeout(30_000);
-
-    let (exit, stderr) = finalize_writing_channel(&mut dst_ch).map_err(|e| format!("dst {e}"))?;
-    if exit != 0 {
-        let tail = stderr.trim();
-        return if tail.is_empty() {
-            Err(format!("tar xzf exited with status {exit}"))
-        } else {
-            Err(format!("tar xzf exited with status {exit}: {tail}"))
-        };
-    }
+        out.flush()
+    })?;
 
     // Rename on destination if the target name differs from the source name.
     if name != src_name {
         let mv_cmd = format!(
             "mv {} {}",
-            sh_quote(&format!("{}/{}", dst_dir.trim_end_matches('/'), src_name)),
-            sh_quote(&format!("{}/{}", dst_dir.trim_end_matches('/'), name)),
+            sh_quote(&join_remote(dst_dir, src_name)),
+            sh_quote(&join_remote(dst_dir, name)),
         );
-        let mut mv_ch = dst_session
-            .channel_session()
-            .map_err(|e| format!("mv channel: {e}"))?;
-        mv_ch.exec(&mv_cmd).map_err(|e| format!("mv exec: {e}"))?;
-        let (mv_exit, mv_stderr) =
-            finalize_readonly_channel(&mut mv_ch).map_err(|e| format!("mv {e}"))?;
-        if mv_exit != 0 {
-            let tail = mv_stderr.trim();
-            return if tail.is_empty() {
-                Err(format!("mv exited with status {mv_exit}"))
-            } else {
-                Err(format!("mv exited with status {mv_exit}: {tail}"))
-            };
-        }
+        exec_checked(dst_conn, &mv_cmd, "mv")?;
     }
 
     Ok(())
 }
 
 /// Count the total byte size of a remote path (file or directory tree).
-pub fn count_bytes_remote(sftp: &Sftp, path: &str) -> u64 {
-    match sftp.stat(Path::new(path)) {
-        Ok(stat) if stat.is_dir() => {
-            let children = sftp.readdir(Path::new(path)).unwrap_or_default();
-            children
-                .into_iter()
-                .filter_map(|(child_path, _)| {
-                    let name = child_path.file_name().and_then(|s| s.to_str())?;
-                    if name == "." || name == ".." {
-                        return None;
-                    }
-                    Some(count_bytes_remote(sftp, &child_path.to_string_lossy()))
-                })
-                .sum()
-        }
+pub fn count_bytes_remote(conn: &Conn, path: &str) -> u64 {
+    match conn.stat(path) {
+        Ok(stat) if stat.is_dir() => list_dir(conn, path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|child| count_bytes_remote(conn, &join_remote(path, &child.name)))
+            .sum(),
         Ok(stat) => stat.size.unwrap_or(0),
         Err(_) => 0,
     }
 }
 
 /// Rename a remote file or directory.
-pub fn rename(sftp: &Sftp, src: &str, dst: &str) -> Result<(), String> {
-    sftp.rename(Path::new(src), Path::new(dst), None)
+pub fn rename(conn: &Conn, src: &str, dst: &str) -> Result<(), String> {
+    conn.rename(src, dst)
         .map_err(|e| format!("rename {src} -> {dst}: {e}"))
 }
 
 /// Copy a remote file to a local path.
 pub fn copy_remote_to_local(
-    sftp: &Sftp,
+    conn: &Conn,
     remote_path: &str,
     local_dst: &Path,
 ) -> Result<(), String> {
-    copy_remote_to_local_progress(sftp, remote_path, local_dst, None, None)
+    copy_remote_to_local_progress(conn, remote_path, local_dst, None, None)
 }
 
 pub fn copy_remote_to_local_progress(
-    sftp: &Sftp,
+    conn: &Conn,
     remote_path: &str,
     local_dst: &Path,
     cancel: Option<&AtomicBool>,
     progress: Option<&crate::core::TransferProgress>,
 ) -> Result<(), String> {
-    let stat = sftp.stat(Path::new(remote_path)).ok();
-    let expected_size = stat.as_ref().and_then(|s| s.size);
+    let expected_size = conn.stat(remote_path).ok().and_then(|s| s.size);
     if let Some(p) = progress {
         p.reset(expected_size.unwrap_or(0));
     }
@@ -1043,36 +857,39 @@ pub fn copy_remote_to_local_progress(
     // be removed before the error propagates. Keeps partial / zero-size
     // artifacts from accumulating when a transfer fails or is cancelled.
     let inner = || -> Result<(), String> {
-        let mut remote_file = sftp
-            .open(Path::new(remote_path))
+        let handle = conn
+            .open(remote_path, OpenMode::Read)
             .map_err(|e| format!("open remote {remote_path}: {e}"))?;
-        let mut local_file = std::fs::File::create(local_dst)
-            .map_err(|e| format!("create local {}: {e}", local_dst.display()))?;
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut written: u64 = 0;
-        loop {
-            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                return Err("Cancelled".to_string());
-            }
-            match remote_file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    local_file
-                        .write_all(&buf[..n])
-                        .map_err(|e| format!("write local: {e}"))?;
-                    written += n as u64;
-                    if let Some(p) = progress {
-                        p.add(n as u64);
-                    }
+        let copied = (|| -> Result<u64, String> {
+            let mut local_file = std::fs::File::create(local_dst)
+                .map_err(|e| format!("create local {}: {e}", local_dst.display()))?;
+            let mut written: u64 = 0;
+            loop {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Err("Cancelled".to_string());
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("read remote: {e}")),
+                let chunk = conn
+                    .read_at(handle, written, ssh::CHUNK)
+                    .map_err(|e| format!("read remote: {e}"))?;
+                if chunk.is_empty() {
+                    break;
+                }
+                local_file
+                    .write_all(&chunk)
+                    .map_err(|e| format!("write local: {e}"))?;
+                written += chunk.len() as u64;
+                if let Some(p) = progress {
+                    p.add(chunk.len() as u64);
+                }
             }
-        }
-        // Flush and verify final size against the source.
-        local_file
-            .sync_all()
-            .map_err(|e| format!("sync local: {e}"))?;
+            // Flush before the size check below.
+            local_file
+                .sync_all()
+                .map_err(|e| format!("sync local: {e}"))?;
+            Ok(written)
+        })();
+        let _ = conn.close(handle);
+        let written = copied?;
         if let Some(expected) = expected_size
             && written != expected
         {
@@ -1093,15 +910,15 @@ pub fn copy_remote_to_local_progress(
 
 /// Copy a local file to a remote path.
 pub fn copy_local_to_remote(
-    sftp: &Sftp,
+    conn: &Conn,
     local_src: &Path,
     remote_path: &str,
 ) -> Result<(), String> {
-    copy_local_to_remote_progress(sftp, local_src, remote_path, None, None)
+    copy_local_to_remote_progress(conn, local_src, remote_path, None, None)
 }
 
 pub fn copy_local_to_remote_progress(
-    sftp: &Sftp,
+    conn: &Conn,
     local_src: &Path,
     remote_path: &str,
     cancel: Option<&AtomicBool>,
@@ -1117,33 +934,36 @@ pub fn copy_local_to_remote_progress(
     let inner = || -> Result<(), String> {
         let mut local_file = std::fs::File::open(local_src)
             .map_err(|e| format!("open local {}: {e}", local_src.display()))?;
-        let mut remote_file = sftp
-            .create(Path::new(remote_path))
+        let handle = conn
+            .open(remote_path, OpenMode::Write)
             .map_err(|e| format!("create remote {remote_path}: {e}"))?;
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut written: u64 = 0;
-        loop {
-            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                return Err("Cancelled".to_string());
-            }
-            match local_file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    remote_file
-                        .write_all(&buf[..n])
-                        .map_err(|e| format!("write remote: {e}"))?;
-                    written += n as u64;
-                    if let Some(p) = progress {
-                        p.add(n as u64);
-                    }
+        let sent = (|| -> Result<u64, String> {
+            let mut buf = vec![0u8; ssh::CHUNK];
+            let mut written: u64 = 0;
+            loop {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Err("Cancelled".to_string());
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("read local: {e}")),
+                match local_file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        conn.write_at(handle, written, buf[..n].to_vec())
+                            .map_err(|e| format!("write remote: {e}"))?;
+                        written += n as u64;
+                        if let Some(p) = progress {
+                            p.add(n as u64);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(format!("read local: {e}")),
+                }
             }
-        }
-        // Close the remote handle by dropping so the server flushes, then
-        // stat to verify the on-disk size matches what we sent.
-        drop(remote_file);
+            Ok(written)
+        })();
+        // Close so the server flushes before the size is checked.
+        conn.close(handle)
+            .map_err(|e| format!("close remote {remote_path}: {e}"))?;
+        let written = sent?;
         if let Some(expected) = expected_size {
             if written != expected {
                 return Err(format!(
@@ -1153,8 +973,8 @@ pub fn copy_local_to_remote_progress(
             // Cross-check the destination — guards against a server-side
             // short-write that the SFTP layer didn't already surface as
             // a write error.
-            let actual = sftp
-                .stat(Path::new(remote_path))
+            let actual = conn
+                .stat(remote_path)
                 .map_err(|e| format!("stat remote after copy: {e}"))?
                 .size
                 .unwrap_or(0);
@@ -1169,34 +989,58 @@ pub fn copy_local_to_remote_progress(
     match inner() {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = sftp.unlink(Path::new(remote_path));
+            let _ = conn.remove(remote_path);
             Err(e)
         }
     }
 }
 
 /// Copy a remote file to another path on the same host.
-pub fn copy_remote(sftp: &Sftp, src: &str, dst: &str) -> Result<(), String> {
-    let mut src_file = sftp
-        .open(Path::new(src))
+pub fn copy_remote(conn: &Conn, src: &str, dst: &str) -> Result<(), String> {
+    let src_h = conn
+        .open(src, OpenMode::Read)
         .map_err(|e| format!("open {src}: {e}"))?;
-    let mut dst_file = sftp
-        .create(Path::new(dst))
-        .map_err(|e| format!("create {dst}: {e}"))?;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        match src_file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                dst_file
-                    .write_all(&buf[..n])
-                    .map_err(|e| format!("write {dst}: {e}"))?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("read {src}: {e}")),
+    let dst_h = match conn.open(dst, OpenMode::Write) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = conn.close(src_h);
+            return Err(format!("create {dst}: {e}"));
         }
+    };
+    let result = (|| -> Result<(), String> {
+        let mut offset = 0u64;
+        loop {
+            let chunk = conn
+                .read_at(src_h, offset, ssh::CHUNK)
+                .map_err(|e| format!("read {src}: {e}"))?;
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            let n = chunk.len() as u64;
+            conn.write_at(dst_h, offset, chunk)
+                .map_err(|e| format!("write {dst}: {e}"))?;
+            offset += n;
+        }
+    })();
+    let _ = conn.close(src_h);
+    let closed = conn.close(dst_h).map_err(|e| format!("close {dst}: {e}"));
+    result.and(closed)
+}
+
+/// Copies a file's permission bits, so an executable stays executable.
+pub fn copy_permissions(conn: &Conn, attrs: FileAttrs, dst: &str) -> Result<(), String> {
+    match attrs.permissions {
+        Some(mode) => conn
+            .set_stat(
+                dst,
+                FileAttrs {
+                    permissions: Some(mode & 0o7777),
+                    ..FileAttrs::default()
+                },
+            )
+            .map_err(|e| format!("chmod {dst}: {e}")),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn parent_remote_path(path: &str) -> String {

@@ -28,6 +28,7 @@ pub mod elevate;
 pub mod settings;
 pub mod sftp;
 pub mod snapshot;
+pub mod ssh;
 pub mod syntax;
 pub mod theme;
 pub mod workers;

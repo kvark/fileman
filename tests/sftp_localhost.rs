@@ -20,7 +20,7 @@ fn connect_localhost() -> sftp::SftpSession {
 fn sftp_connect() {
     let session = connect_localhost();
     assert_eq!(session.host, "localhost");
-    assert!(session.session.authenticated());
+    assert!(session.is_alive());
 }
 
 #[test]
@@ -253,4 +253,174 @@ Host jump
     let jump = parsed.get("jump").expect("jump");
     assert_eq!(jump.hostname.as_deref(), Some("jump.internal"));
     assert_eq!(jump.identity_files.len(), 2);
+}
+
+// --- exec-backed operations ---
+//
+// These cover the paths that run a command on the remote rather than talking
+// SFTP: directory copies stream a tar through an exec channel, and the size
+// probe shells out to `du`.
+
+#[test]
+#[ignore]
+fn sftp_count_bytes_via_exec() {
+    let session = connect_localhost();
+    let dir = "/tmp/fileman_sftp_test_count";
+    let _ = sftp::recursive_delete(&session.sftp, dir, true, None);
+    sftp::mkdir(&session.sftp, dir).expect("mkdir");
+    let payload = vec![b'x'; 5000];
+    sftp::write_file(&session.sftp, &format!("{dir}/a.bin"), &payload).expect("write a");
+    sftp::write_file(&session.sftp, &format!("{dir}/b.bin"), &payload).expect("write b");
+
+    let n = sftp::count_bytes_via_exec(&session.sftp, dir);
+    assert!(n >= 10_000, "du should report at least both files, got {n}");
+
+    // The SFTP walk is exact, so it should agree on the file bytes.
+    let walked = sftp::count_bytes_remote(&session.sftp, dir);
+    assert_eq!(walked, 10_000, "recursive walk should sum both files");
+
+    sftp::recursive_delete(&session.sftp, dir, true, None).expect("cleanup");
+}
+
+#[test]
+#[ignore]
+fn sftp_copy_remote_dir_to_local_via_tar() {
+    use std::sync::atomic::AtomicBool;
+
+    let session = connect_localhost();
+    let remote_dir = "/tmp/fileman_sftp_test_tar_src";
+    let _ = sftp::recursive_delete(&session.sftp, remote_dir, true, None);
+    sftp::mkdir(&session.sftp, remote_dir).expect("mkdir");
+    sftp::write_file(&session.sftp, &format!("{remote_dir}/one.txt"), b"first").expect("write");
+    sftp::mkdir(&session.sftp, &format!("{remote_dir}/sub")).expect("mkdir sub");
+    sftp::write_file(
+        &session.sftp,
+        &format!("{remote_dir}/sub/two.txt"),
+        b"second",
+    )
+    .expect("write nested");
+
+    let local = std::env::temp_dir().join("fileman_tar_dst");
+    let _ = std::fs::remove_dir_all(&local);
+    std::fs::create_dir_all(&local).expect("create local dir");
+
+    let cancel = AtomicBool::new(false);
+    sftp::copy_remote_dir_to_local_via_tar(
+        &session.sftp,
+        remote_dir,
+        &local,
+        "renamed",
+        &cancel,
+        None,
+    )
+    .expect("tar copy down");
+
+    // The tree arrives under the requested name, contents intact.
+    assert_eq!(
+        std::fs::read_to_string(local.join("renamed/one.txt")).expect("one.txt"),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(local.join("renamed/sub/two.txt")).expect("two.txt"),
+        "second"
+    );
+
+    let _ = std::fs::remove_dir_all(&local);
+    sftp::recursive_delete(&session.sftp, remote_dir, true, None).expect("cleanup");
+}
+
+#[test]
+#[ignore]
+fn sftp_copy_local_dir_to_remote_via_tar() {
+    use std::sync::atomic::AtomicBool;
+
+    let session = connect_localhost();
+    let local = std::env::temp_dir().join("fileman_tar_up");
+    let _ = std::fs::remove_dir_all(&local);
+    std::fs::create_dir_all(local.join("inner")).expect("create local tree");
+    std::fs::write(local.join("top.txt"), b"top").expect("write top");
+    std::fs::write(local.join("inner/deep.txt"), b"deep").expect("write deep");
+
+    let remote_parent = "/tmp/fileman_sftp_test_tar_up";
+    let _ = sftp::recursive_delete(&session.sftp, remote_parent, true, None);
+    sftp::mkdir(&session.sftp, remote_parent).expect("mkdir");
+
+    let cancel = AtomicBool::new(false);
+    sftp::copy_local_dir_to_remote_via_tar(&local, &session.sftp, remote_parent, &cancel, None)
+        .expect("tar copy up");
+
+    let uploaded = format!("{remote_parent}/fileman_tar_up");
+    assert_eq!(
+        sftp::read_bytes_prefix(&session.sftp, &format!("{uploaded}/top.txt"), 64)
+            .expect("read top"),
+        b"top"
+    );
+    assert_eq!(
+        sftp::read_bytes_prefix(&session.sftp, &format!("{uploaded}/inner/deep.txt"), 64)
+            .expect("read deep"),
+        b"deep"
+    );
+
+    let _ = std::fs::remove_dir_all(&local);
+    sftp::recursive_delete(&session.sftp, remote_parent, true, None).expect("cleanup");
+}
+
+#[test]
+#[ignore]
+fn sftp_recursive_copy_remote() {
+    let session = connect_localhost();
+    let src = "/tmp/fileman_sftp_test_rcopy_src";
+    let dst_parent = "/tmp/fileman_sftp_test_rcopy_dst";
+    let _ = sftp::recursive_delete(&session.sftp, src, true, None);
+    let _ = sftp::recursive_delete(&session.sftp, dst_parent, true, None);
+
+    sftp::mkdir(&session.sftp, src).expect("mkdir src");
+    sftp::mkdir(&session.sftp, dst_parent).expect("mkdir dst");
+    sftp::write_file(&session.sftp, &format!("{src}/f.txt"), b"copied").expect("write");
+    sftp::mkdir(&session.sftp, &format!("{src}/nested")).expect("mkdir nested");
+    sftp::write_file(
+        &session.sftp,
+        &format!("{src}/nested/g.txt"),
+        b"nested copy",
+    )
+    .expect("write nested");
+
+    sftp::recursive_copy_remote(&session.sftp, src, dst_parent, "clone").expect("recursive copy");
+
+    assert_eq!(
+        sftp::read_bytes_prefix(&session.sftp, &format!("{dst_parent}/clone/f.txt"), 64)
+            .expect("read copy"),
+        b"copied"
+    );
+    assert_eq!(
+        sftp::read_bytes_prefix(
+            &session.sftp,
+            &format!("{dst_parent}/clone/nested/g.txt"),
+            64
+        )
+        .expect("read nested copy"),
+        b"nested copy"
+    );
+
+    sftp::recursive_delete(&session.sftp, src, true, None).expect("cleanup src");
+    sftp::recursive_delete(&session.sftp, dst_parent, true, None).expect("cleanup dst");
+}
+
+#[test]
+#[ignore]
+fn sftp_large_file_round_trip() {
+    // Bigger than one SFTP chunk, so this exercises the pipelined read/write
+    // path rather than a single request.
+    let session = connect_localhost();
+    let path = "/tmp/fileman_sftp_test_large";
+    let _ = sftp::recursive_delete(&session.sftp, path, false, None);
+
+    let data: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+    sftp::write_file(&session.sftp, path, &data).expect("write large");
+
+    let back = sftp::read_file_full(&session.sftp, path).expect("read large");
+    assert_eq!(back.len(), data.len(), "size should round trip");
+    assert_eq!(back, data, "contents should round trip");
+
+    sftp::recursive_delete(&session.sftp, path, false, None).expect("cleanup");
 }
