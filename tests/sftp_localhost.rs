@@ -499,6 +499,9 @@ fn sftp_reconnects_after_the_session_drops() {
     let start = || {
         Command::new("/usr/sbin/sshd")
             .args(["-p", &PORT.to_string(), "-o", &format!("PidFile={PIDFILE}")])
+            // Without privileges it cannot read the host keys and says so;
+            // that is the skip path, not something to print in a test log.
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)

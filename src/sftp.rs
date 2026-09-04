@@ -240,7 +240,7 @@ pub fn read_directory_streaming(
     let remote_path = if path.is_empty() { "/" } else { path };
     let handle = conn
         .open_dir(remote_path)
-        .map_err(|e| (format!("opendir {remote_path}: {e}"), e.fatal))?;
+        .map_err(|e| (e.message.clone(), e.fatal))?;
 
     // First batch: ".." entry if not at root
     if remote_path != "/" {
@@ -324,9 +324,7 @@ fn join_remote(dir: &str, name: &str) -> String {
 
 /// Lists a directory's raw entries, skipping "." and "..".
 fn list_dir(conn: &Conn, path: &str) -> Result<Vec<ssh::DirItem>, String> {
-    let handle = conn
-        .open_dir(path)
-        .map_err(|e| format!("opendir {path}: {e}"))?;
+    let handle = conn.open_dir(path).map_err(|e| e.message)?;
     let mut all = Vec::new();
     let result = (|| -> Result<(), String> {
         while let Some(items) = conn
@@ -406,7 +404,7 @@ pub fn read_bytes_prefix(conn: &Conn, path: &str, max_bytes: usize) -> Result<Ve
 
 /// Open a remote file as a seekable reader (for streaming preview and archives).
 pub fn open_remote_reader(conn: &Arc<Conn>, path: &str) -> Result<RemoteFile, String> {
-    RemoteFile::open(conn.clone(), path).map_err(|e| format!("open {path}: {e}"))
+    RemoteFile::open(conn.clone(), path).map_err(|e| e.message)
 }
 
 /// Recursively delete a remote path (file or directory).
@@ -422,10 +420,9 @@ pub fn recursive_delete(
             let child_path = join_remote(path, &child.name);
             recursive_delete(conn, &child_path, child.attrs.is_dir(), progress)?;
         }
-        conn.rmdir(path).map_err(|e| format!("rmdir {path}: {e}"))?;
+        conn.rmdir(path).map_err(|e| e.message)?;
     } else {
-        conn.remove(path)
-            .map_err(|e| format!("unlink {path}: {e}"))?;
+        conn.remove(path).map_err(|e| e.message)?;
     }
     if let Some(p) = progress {
         p.add_item();
@@ -435,9 +432,7 @@ pub fn recursive_delete(
 
 /// Write bytes to a remote file (create or overwrite).
 pub fn write_file(conn: &Conn, path: &str, contents: &[u8]) -> Result<(), String> {
-    let handle = conn
-        .open(path, OpenMode::Write)
-        .map_err(|e| format!("create {path}: {e}"))?;
+    let handle = conn.open(path, OpenMode::Write).map_err(|e| e.message)?;
     let result = (|| -> Result<(), String> {
         let mut offset = 0u64;
         for chunk in contents.chunks(ssh::CHUNK) {
@@ -453,7 +448,7 @@ pub fn write_file(conn: &Conn, path: &str, contents: &[u8]) -> Result<(), String
 
 /// Create a remote directory.
 pub fn mkdir(conn: &Conn, path: &str) -> Result<(), String> {
-    conn.mkdir(path).map_err(|e| format!("mkdir {path}: {e}"))
+    conn.mkdir(path).map_err(|e| e.message)
 }
 
 /// Copy a file within the same remote host (read then write).
@@ -469,12 +464,9 @@ pub fn recursive_copy_remote(
     name: &str,
 ) -> Result<(), String> {
     let dst_path = join_remote(dst_dir, name);
-    let stat = conn
-        .stat(src_path)
-        .map_err(|e| format!("stat {src_path}: {e}"))?;
+    let stat = conn.stat(src_path).map_err(|e| e.message)?;
     if stat.is_dir() {
-        conn.mkdir(&dst_path)
-            .map_err(|e| format!("mkdir {dst_path}: {e}"))?;
+        conn.mkdir(&dst_path).map_err(|e| e.message)?;
         for child in list_dir(conn, src_path)? {
             let child_src = join_remote(src_path, &child.name);
             recursive_copy_remote(conn, &child_src, &dst_path, &child.name)?;
@@ -801,8 +793,7 @@ pub fn count_bytes_remote(conn: &Conn, path: &str) -> u64 {
 
 /// Rename a remote file or directory.
 pub fn rename(conn: &Conn, src: &str, dst: &str) -> Result<(), String> {
-    conn.rename(src, dst)
-        .map_err(|e| format!("rename {src} -> {dst}: {e}"))
+    conn.rename(src, dst).map_err(|e| e.message)
 }
 
 /// Copy a remote file to a local path.
@@ -831,7 +822,7 @@ pub fn copy_remote_to_local_progress(
     let inner = || -> Result<(), String> {
         let handle = conn
             .open(remote_path, OpenMode::Read)
-            .map_err(|e| format!("open remote {remote_path}: {e}"))?;
+            .map_err(|e| e.message)?;
         let copied = (|| -> Result<u64, String> {
             let mut local_file = std::fs::File::create(local_dst)
                 .map_err(|e| format!("create local {}: {e}", local_dst.display()))?;

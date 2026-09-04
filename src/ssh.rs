@@ -209,7 +209,7 @@ impl Reply {
 
 /// A status reply is the server refusing one request, not a broken session.
 fn status_err(what: &str, code: StatusCode) -> SshError {
-    SshError::op(format!("{what}: {code:?}"))
+    SshError::op(format!("{what}: {code}"))
 }
 
 /// A live connection to one host.
@@ -379,7 +379,7 @@ impl Conn {
             // Plain rename, which fails rather than replacing an existing
             // destination. File operations are not meant to clobber.
             s.sftp.rename(from, to).map_err(sftp_err)?;
-            s.reply()?.into_status(&format!("rename {from}"))
+            s.reply()?.into_status(&format!("rename {from} -> {to}"))
         })
     }
 
