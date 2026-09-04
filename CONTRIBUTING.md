@@ -186,17 +186,15 @@ errors when ignored:
 - Every channel half, stderr included, has to be read. An abandoned half stalls
   the whole session once the peer fills it, not just that stream.
 
-sunset also has no way to send a channel EOF — it only sends one in reply to
-the peer's — so a remote command cannot be told that its stdin has ended.
-Anything shaped like `tar xf -` would wait forever. Directory uploads
-therefore stage the archive into a temp file next to the destination over SFTP
-and then extract it, rather than piping it in. If sunset gains a client-side
-EOF, `ssh::Conn::exec_stream` can grow a stdin half again and those paths can
-go back to streaming.
+A command that reads its input to end-of-file needs to be told when that is,
+which `ExecStream::finish_input` does via sunset's `send_eof`. Without it
+`tar xf -` waits forever rather than failing, so a streamed upload that hangs
+is usually a missing `finish_input`.
 
 Exit statuses are reported by sunset as a session-wide event that cannot be
-tied back to a particular channel, so commands run through `exec_checked` are
-judged by what they wrote to stderr instead.
+tied back to a particular channel, so a command's success is judged by what it
+wrote to stderr instead — `exec_checked` for captured commands, and the stderr
+that `ExecStream::wait` returns for streamed ones.
 
 Integration tests run against a real sshd on localhost; see Testing above and
 the `sftp` job in CI.

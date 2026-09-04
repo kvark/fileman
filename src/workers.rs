@@ -1610,7 +1610,7 @@ fn run_remote_search(
 
     // Streamed rather than captured: a search over a big tree can print for a
     // long time, and results should appear as they arrive.
-    let mut channel = match locked.sftp.exec_stream(&cmd) {
+    let mut channel = match locked.sftp.exec_stream(&cmd, crate::ssh::Stdin::Closed) {
         Ok(ch) => ch,
         Err(e) => {
             let _ = result_tx.send(SearchEvent::Error {

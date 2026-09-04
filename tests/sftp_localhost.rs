@@ -424,3 +424,24 @@ fn sftp_large_file_round_trip() {
 
     sftp::recursive_delete(&session.sftp, path, false, None).expect("cleanup");
 }
+
+#[test]
+#[ignore]
+fn sftp_read_empty_directory() {
+    // A directory with no entries of its own still has "." and ".." over
+    // SFTP, so the listing should come back empty rather than failing.
+    let session = connect_localhost();
+    let dir = "/tmp/fileman_sftp_test_empty";
+    let _ = sftp::recursive_delete(&session.sftp, dir, true, None);
+    sftp::mkdir(&session.sftp, dir).expect("mkdir");
+
+    let entries = sftp::read_directory(&session.sftp, "localhost", dir).expect("read empty dir");
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .filter(|n| *n != "..")
+        .collect();
+    assert!(names.is_empty(), "empty dir should list nothing: {names:?}");
+
+    sftp::recursive_delete(&session.sftp, dir, true, None).expect("cleanup");
+}
