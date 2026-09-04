@@ -208,9 +208,25 @@ status and usually misses it. `check_exec` then judges by that status, and
 falls back to stderr only when a server sends none — going by stderr alone
 fails a copy over any warning the command prints while still succeeding.
 
+A command's output is held to a high-water mark and the rest left on the
+channel, so the peer's window throttles it. Discarding the excess instead is
+what a fixed cap did, and it corrupted any directory copy whose tar ran past
+it. A capture that nothing drains until the command ends is still bounded, but
+fails rather than returning a short answer.
+
 Authentication offers ssh-agent keys first and then key files. `sunset::agent`
-is the agent protocol; `src/ssh/agent.rs` is the Unix socket under it, so on
-Windows — where an agent is a named pipe — key files are the only option.
+is the agent protocol and `src/ssh/agent.rs` is the transport under it — a Unix
+socket, or the OpenSSH named pipe on Windows, which is the only part that
+differs.
+
+A connection dropped by a sleep or a network change is only discovered when
+something is next asked of it. `Conn::with_retry` dials again and repeats the
+request, so a listing after a drop simply works instead of erroring and needing
+a reconnect and a renavigation. Only read-only requests take that path: a fatal
+error means no reply was seen, so repeating a mutation could report "already
+exists" for work that in fact succeeded. `Conn::with` is the plain version for
+everything else, including anything holding a `HandleId`, which dies with the
+session it came from.
 
 Integration tests run against a real sshd on localhost; see Testing above and
 the `sftp` job in CI.

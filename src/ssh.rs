@@ -34,7 +34,6 @@ use sunset::{ChanData, ChanHandle, CliEvent, Event, Runner, SignKey};
 use sunset_sftp::client::{MAX_READ_LEN, MAX_WRITE_LEN, SftpEvent, SftpRunner, pflags};
 use sunset_sftp::protocol::{Attrs, StatusCode};
 
-#[cfg(unix)]
 mod agent;
 pub mod knownhosts;
 
@@ -45,8 +44,13 @@ const SFTP_BUF: usize = 8192;
 pub const CHUNK: usize = 256 * 1024;
 /// Socket read size.
 const SOCK_BUF: usize = 32 * 1024;
-/// Bound on a buffered capture, so a runaway command cannot exhaust memory.
-const MAX_EXEC_OUTPUT: usize = 64 * 1024 * 1024;
+/// How much of a command's output to hold before leaving the rest on the
+/// channel. The peer's window then throttles it, rather than us discarding
+/// what does not fit.
+const EXEC_HIGH_WATER: usize = 1024 * 1024;
+/// Bound on a command whose output is captured whole, since nothing drains it
+/// until the command ends. Exceeding it fails rather than truncating.
+const MAX_EXEC_CAPTURE: usize = 64 * 1024 * 1024;
 
 /// A remote file or directory handle, addressed by id so callers never hold
 /// the server's opaque bytes.
@@ -216,6 +220,9 @@ fn status_err(what: &str, code: StatusCode) -> SshError {
 pub struct Conn {
     session: Mutex<Session>,
     alive: Arc<AtomicBool>,
+    /// Kept so a dropped connection can be rebuilt without the caller
+    /// having to notice, reconnect, and navigate back to where it was.
+    params: ConnectParams,
     pub host: String,
     pub home_dir: Option<String>,
 }
@@ -228,18 +235,12 @@ impl Conn {
 
     /// Runs `f` against the locked session, retiring the connection if it
     /// turns out to be broken.
+    ///
+    /// For anything naming a [`HandleId`]: the handle belongs to this session,
+    /// so a reconnect would leave it addressing nothing. Those report the
+    /// failure and let the caller open again.
     fn with<T>(&self, f: impl FnOnce(&mut Session) -> SshResult<T>) -> SshResult<T> {
-        if !self.is_alive() {
-            return Err(SshError::fatal("SSH connection closed"));
-        }
-        let mut s = match self.session.lock() {
-            Ok(s) => s,
-            // A panic while holding it leaves the runners mid-packet.
-            Err(_) => {
-                self.alive.store(false, Ordering::Relaxed);
-                return Err(SshError::fatal("SSH session poisoned"));
-            }
-        };
+        let mut s = self.lock()?;
         let r = f(&mut s);
         if let Err(ref e) = r
             && e.fatal
@@ -249,29 +250,84 @@ impl Conn {
         r
     }
 
+    /// Runs `f`, and if the connection turns out to have died, dials again
+    /// and runs it once more.
+    ///
+    /// A connection dropped by a sleep or a network change is only discovered
+    /// when something is next asked of it, which would otherwise surface as an
+    /// error the user has to clear by reconnecting by hand.
+    ///
+    /// Only for operations that change nothing. A fatal error means no reply
+    /// was seen, so a mutation may or may not have been applied, and running
+    /// it again would report a confusing "already exists" or "no such file"
+    /// for work that in fact succeeded.
+    fn with_retry<T>(&self, f: impl Fn(&mut Session) -> SshResult<T>) -> SshResult<T> {
+        let mut s = self.lock()?;
+        let first = f(&mut s);
+        let Err(e) = first else {
+            return first;
+        };
+        if !e.fatal {
+            return Err(e);
+        }
+
+        log::info!("reconnecting to {}: {e}", self.host);
+        match open_session(&self.params) {
+            Ok(fresh) => {
+                // Handles from the old session die with it; nothing outside
+                // holds one across a call that reconnects.
+                *s = fresh;
+                let again = f(&mut s);
+                if let Err(ref e) = again
+                    && e.fatal
+                {
+                    self.alive.store(false, Ordering::Relaxed);
+                }
+                again
+            }
+            Err(reconnect_err) => {
+                self.alive.store(false, Ordering::Relaxed);
+                log::warn!("reconnecting to {} failed: {reconnect_err}", self.host);
+                // The original failure is the useful one to report.
+                Err(e)
+            }
+        }
+    }
+
+    fn lock(&self) -> SshResult<std::sync::MutexGuard<'_, Session>> {
+        if !self.is_alive() {
+            return Err(SshError::fatal("SSH connection closed"));
+        }
+        self.session.lock().map_err(|_| {
+            // A panic while holding it leaves the runners mid-packet.
+            self.alive.store(false, Ordering::Relaxed);
+            SshError::fatal("SSH session poisoned")
+        })
+    }
+
     pub fn realpath(&self, path: &str) -> SshResult<String> {
-        self.with(|s| {
+        self.with_retry(|s| {
             s.sftp.realpath(path).map_err(sftp_err)?;
             s.one_name(&format!("realpath {path}"))
         })
     }
 
     pub fn readlink(&self, path: &str) -> SshResult<String> {
-        self.with(|s| {
+        self.with_retry(|s| {
             s.sftp.readlink(path).map_err(sftp_err)?;
             s.one_name(&format!("readlink {path}"))
         })
     }
 
     pub fn stat(&self, path: &str) -> SshResult<FileAttrs> {
-        self.with(|s| {
+        self.with_retry(|s| {
             s.sftp.stat(path).map_err(sftp_err)?;
             s.attrs_reply(&format!("stat {path}"))
         })
     }
 
     pub fn lstat(&self, path: &str) -> SshResult<FileAttrs> {
-        self.with(|s| {
+        self.with_retry(|s| {
             s.sftp.lstat(path).map_err(sftp_err)?;
             s.attrs_reply(&format!("lstat {path}"))
         })
@@ -328,7 +384,7 @@ impl Conn {
     }
 
     pub fn open_dir(&self, path: &str) -> SshResult<HandleId> {
-        self.with(|s| {
+        self.with_retry(|s| {
             s.sftp.opendir(path).map_err(sftp_err)?;
             let what = format!("opendir {path}");
             match s.reply()? {
@@ -359,7 +415,9 @@ impl Conn {
     }
 
     pub fn open(&self, path: &str, mode: OpenMode) -> SshResult<HandleId> {
-        self.with(|s| {
+        // Opening for reading is free to repeat; opening for writing
+        // truncates, so it is not.
+        let run = |s: &mut Session| {
             let flags = match mode {
                 OpenMode::Read => pflags::READ,
                 OpenMode::Write => pflags::WRITE | pflags::CREAT | pflags::TRUNC,
@@ -372,7 +430,11 @@ impl Conn {
                 Reply::Handle(h) => Ok(s.store_handle(h)),
                 other => Err(handle_err(&what, other)),
             }
-        })
+        };
+        match mode {
+            OpenMode::Read => self.with_retry(run),
+            OpenMode::Write => self.with(run),
+        }
     }
 
     pub fn read_at(&self, handle: HandleId, offset: u64, len: usize) -> SshResult<Vec<u8>> {
@@ -399,18 +461,26 @@ impl Conn {
         self.with(|s| {
             let id = s.start_exec(cmd)?;
             let mut out = ExecOutput::default();
-            loop {
-                let done = s.pump_exec(id)?;
+            let r = loop {
+                let done = match s.pump_exec(id) {
+                    Ok(d) => d,
+                    Err(e) => break Err(e),
+                };
                 let e = s.exec_mut(id)?;
                 out.stdout.append(&mut e.out);
                 out.stderr.append(&mut e.err);
+                if out.stdout.len() + out.stderr.len() > MAX_EXEC_CAPTURE {
+                    break Err(SshError::op(format!(
+                        "command produced more than {MAX_EXEC_CAPTURE} bytes"
+                    )));
+                }
                 if done {
                     out.exit = e.exit.clone();
-                    break;
+                    break Ok(());
                 }
-            }
+            };
             s.finish_exec(id);
-            Ok(out)
+            r.map(|()| out)
         })
     }
 
@@ -496,7 +566,6 @@ struct Session {
     /// Auth material, consumed during the handshake.
     keys: Vec<SignKey>,
     /// Signs for any key the agent holds, rather than a file we loaded.
-    #[cfg(unix)]
     agent: Option<agent::AgentClient>,
     user: String,
     host: String,
@@ -606,23 +675,13 @@ impl Session {
                         r.map_err(ssh_err)?
                     }
                     Event::Cli(CliEvent::AgentSign(req)) => {
-                        #[cfg(unix)]
-                        {
-                            let a = self.agent.as_mut().ok_or_else(|| {
-                                SshError::fatal("agent signature wanted without an agent")
-                            })?;
-                            let key = req.key().map_err(ssh_err)?;
-                            let msg = req.message().map_err(ssh_err)?;
-                            let sig = a.sign_auth(key, &msg).map_err(ssh_err)?;
-                            req.signed(&sig).map_err(ssh_err)?;
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = req;
-                            return Err(SshError::fatal(
-                                "ssh-agent is not supported on this platform",
-                            ));
-                        }
+                        let a = self.agent.as_mut().ok_or_else(|| {
+                            SshError::fatal("agent signature wanted without an agent")
+                        })?;
+                        let key = req.key().map_err(ssh_err)?;
+                        let msg = req.message().map_err(ssh_err)?;
+                        let sig = a.sign_auth(key, &msg).map_err(ssh_err)?;
+                        req.signed(&sig).map_err(ssh_err)?;
                     }
                     Event::Cli(CliEvent::Authenticated) => {
                         self.authenticated = true;
@@ -682,6 +741,16 @@ impl Session {
         for id in ids {
             let mut buf = [0u8; SOCK_BUF];
             loop {
+                // Stop once enough is buffered and let the peer's window hold
+                // the rest on the channel. Discarding it instead would corrupt
+                // a stream the caller is still reading.
+                if self
+                    .execs
+                    .get(&id)
+                    .is_some_and(|e| e.out.len() + e.err.len() >= EXEC_HIGH_WATER)
+                {
+                    break;
+                }
                 let read = {
                     let Session {
                         ref mut ssh,
@@ -723,9 +792,7 @@ impl Session {
                     ChanData::Stderr => &mut e.err,
                     _ => &mut e.out,
                 };
-                if sink.len() + n <= MAX_EXEC_OUTPUT {
-                    sink.extend_from_slice(&buf[..n]);
-                }
+                sink.extend_from_slice(&buf[..n]);
             }
             let closed = {
                 let Session {
@@ -1231,6 +1298,28 @@ pub struct ConnectParams {
 
 /// Opens a connection, blocking until the SFTP subsystem is ready.
 pub fn connect(params: ConnectParams) -> SshResult<Conn> {
+    let mut session = open_session(&params)?;
+
+    // The remote home directory, if the server will tell us.
+    let home_dir = match session.sftp.realpath(".") {
+        Ok(_) => session.one_name("realpath .").ok(),
+        Err(_) => None,
+    };
+
+    Ok(Conn {
+        session: Mutex::new(session),
+        alive: Arc::new(AtomicBool::new(true)),
+        host: params.host.clone(),
+        home_dir,
+        params,
+    })
+}
+
+/// Dials, authenticates, and gets the SFTP subsystem talking.
+///
+/// Separate from [`connect()`] so a dropped connection can be rebuilt in
+/// place without the caller knowing.
+fn open_session(params: &ConnectParams) -> SshResult<Session> {
     let addr = format!("{}:{}", params.hostname, params.port);
     let sock = TcpStream::connect(&addr)
         .map_err(|e| SshError::fatal(format!("TCP connect to {addr}: {e}")))?;
@@ -1252,18 +1341,15 @@ pub fn connect(params: ConnectParams) -> SshResult<Conn> {
         next_handle: 0,
         inbuf: Vec::new(),
         in_pos: 0,
-        keys: Vec::new(),
-        #[cfg(unix)]
+        keys: load_identities(&params.identity_files),
         agent: None,
-        user: params.user,
+        user: params.user.clone(),
         host: params.host.clone(),
         port: params.port,
         authenticated: false,
     };
 
-    session.keys = load_identities(&params.identity_files);
     // Agent keys are offered first, matching ssh(1).
-    #[cfg(unix)]
     if params.use_agent {
         session.agent = load_agent(&mut session.keys);
     }
@@ -1283,19 +1369,7 @@ pub fn connect(params: ConnectParams) -> SshResult<Conn> {
         Reply::Version => (),
         other => return Err(handle_err("SFTP handshake", other)),
     }
-
-    // The remote home directory, if the server will tell us.
-    let home_dir = match session.sftp.realpath(".") {
-        Ok(_) => session.one_name("realpath .").ok(),
-        Err(_) => None,
-    };
-
-    Ok(Conn {
-        session: Mutex::new(session),
-        alive: Arc::new(AtomicBool::new(true)),
-        host: params.host,
-        home_dir,
-    })
+    Ok(session)
 }
 
 /// Keeps the OS probing, so a connection dropped by a sleep or a network
@@ -1324,10 +1398,9 @@ fn set_keepalive(sock: &TcpStream) {
     set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
 }
 
-/// Connects to `$SSH_AUTH_SOCK` and appends the keys it holds.
-#[cfg(unix)]
+/// Connects to the running agent and appends the keys it holds.
 fn load_agent(keys: &mut Vec<SignKey>) -> Option<agent::AgentClient> {
-    let sock = std::env::var("SSH_AUTH_SOCK").ok()?;
+    let sock = agent::address()?;
     let mut a = match agent::AgentClient::new(&sock) {
         Ok(a) => a,
         Err(e) => {
