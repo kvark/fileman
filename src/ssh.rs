@@ -193,11 +193,13 @@ enum Job {
         cmd: String,
         reply: Reply<ExecOutput>,
     },
-    /// Run a command, streaming its stdout back so a large transfer does not
-    /// have to be buffered whole.
+    /// Run a command, streaming stdin in and stdout out so a large transfer
+    /// does not have to be buffered whole. The reply carries its stderr.
     ExecStream {
         cmd: String,
+        stdin: Option<tmpsc::Receiver<Vec<u8>>>,
         stdout: tmpsc::Sender<io::Result<Vec<u8>>>,
+        reply: Reply<Vec<u8>>,
     },
 }
 
@@ -355,17 +357,26 @@ impl Conn {
         })
     }
 
-    /// Starts a command whose stdout is streamed through the returned reader.
+    /// Starts a command, streaming its stdout through the returned reader.
     ///
-    /// There is deliberately no stdin: sunset only sends a channel EOF in
-    /// reply to the peer's, so there is no way to tell a remote command that
-    /// its input has ended. Anything that would need `cmd < stdin` has to
-    /// stage its input in a file instead.
-    pub fn exec_stream(&self, cmd: &str) -> SshResult<ExecStream> {
+    /// With [`Stdin::Piped`] the stream is also an [`io::Write`] feeding the
+    /// command's input; [`ExecStream::finish_input`] then signals end of input,
+    /// which is what `tar xf -` waits for.
+    pub fn exec_stream(&self, cmd: &str, stdin: Stdin) -> SshResult<ExecStream> {
         let (out_tx, out_rx) = tmpsc::channel(4);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let (in_tx, in_rx) = match stdin {
+            Stdin::Piped => {
+                let (t, r) = tmpsc::channel(4);
+                (Some(t), Some(r))
+            }
+            Stdin::Closed => (None, None),
+        };
         let job = Job::ExecStream {
             cmd: cmd.to_string(),
+            stdin: in_rx,
             stdout: out_tx,
+            reply: done_tx,
         };
         if self.tx.send(job).is_err() {
             self.alive.store(false, Ordering::Relaxed);
@@ -373,17 +384,51 @@ impl Conn {
         }
         Ok(ExecStream {
             stdout: out_rx,
+            stdin: in_tx,
+            done: done_rx,
             pending: Vec::new(),
             pos: 0,
         })
     }
 }
 
-/// The local end of a streamed command's stdout.
+/// Whether a streamed command is given an input pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stdin {
+    Piped,
+    Closed,
+}
+
+/// The local end of a streamed command.
 pub struct ExecStream {
     stdout: tmpsc::Receiver<io::Result<Vec<u8>>>,
+    stdin: Option<tmpsc::Sender<Vec<u8>>>,
+    done: mpsc::Receiver<SshResult<Vec<u8>>>,
     pending: Vec<u8>,
     pos: usize,
+}
+
+impl ExecStream {
+    /// Signals end of input, so a command reading its stdin to EOF can finish.
+    pub fn finish_input(&mut self) {
+        self.stdin = None;
+    }
+
+    /// Waits for the command to finish, returning whatever it wrote to stderr.
+    ///
+    /// Any stdout still buffered is drained first: the connection task blocks
+    /// while handing output over, so waiting without draining would deadlock.
+    pub fn wait(mut self) -> SshResult<Vec<u8>> {
+        self.stdin = None;
+        while let Some(chunk) = self.stdout.blocking_recv() {
+            if matches!(chunk, Ok(ref c) if c.is_empty()) {
+                break;
+            }
+        }
+        self.done
+            .recv()
+            .unwrap_or_else(|_| Err(SshError::fatal("SSH connection closed")))
+    }
 }
 
 impl io::Read for ExecStream {
@@ -406,6 +451,22 @@ impl io::Read for ExecStream {
         buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
+    }
+}
+
+impl io::Write for ExecStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let tx = self
+            .stdin
+            .as_ref()
+            .ok_or_else(|| io::Error::other("exec stdin is closed"))?;
+        tx.blocking_send(buf.to_vec())
+            .map_err(|_| io::Error::other("exec stdin closed by remote"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -964,10 +1025,18 @@ async fn run_job<'g, R, W>(
             let r = exec_capture(ssh, opened, pending, &cmd).await;
             let _ = reply.send(r);
         }
-        Job::ExecStream { cmd, stdout } => {
-            if let Err(e) = exec_stream(ssh, opened, pending, &cmd, stdout.clone()).await {
-                let _ = stdout.send(Err(io::Error::other(e.message))).await;
+        Job::ExecStream {
+            cmd,
+            stdin,
+            stdout,
+            reply,
+        } => {
+            let r = exec_stream(ssh, opened, pending, &cmd, stdin, stdout.clone()).await;
+            if let Err(ref e) = r {
+                // Surface it on the reader too, which may be blocked on it.
+                let _ = stdout.send(Err(io::Error::other(e.message.clone()))).await;
             }
+            let _ = reply.send(r);
         }
     }
 }
@@ -1040,10 +1109,28 @@ async fn exec_stream<'g>(
     opened: &EmbassyChannel<SunsetRawMutex, Opened<'g>, 4>,
     pending: &Pending<'g>,
     cmd: &str,
+    stdin: Option<tmpsc::Receiver<Vec<u8>>>,
     stdout: tmpsc::Sender<io::Result<Vec<u8>>>,
-) -> SshResult<()> {
+) -> SshResult<Vec<u8>> {
+    use sunset_sftp::embedded_io_async::Write as _;
+
     let (io, err) = start_exec(ssh, opened, pending, cmd).await?;
-    let (mut rx, _tx) = io.split();
+    let (mut rx, mut tx) = io.split();
+
+    let feed = async {
+        if let Some(mut stdin) = stdin {
+            while let Some(chunk) = stdin.recv().await {
+                if tx.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            let _ = tx.flush().await;
+            // Without this a command reading its input to EOF never returns.
+            // The channel stays readable, so it can still reply and exit.
+            let _ = tx.send_eof().await;
+        }
+        core::future::pending::<()>().await
+    };
 
     let pump = async {
         let mut b = vec![0u8; CHUNK];
@@ -1070,16 +1157,30 @@ async fn exec_stream<'g>(
     // stderr is read alongside so it can never stall the session, but it is
     // not something to wait for: it only reaches EOF once the channel closes,
     // which is what `pump` is already detecting.
+    let collected = RefCell::new(Vec::new());
     let watch_stderr = async {
-        drain(err).await;
+        if let Some(mut e) = err {
+            let mut b = [0u8; 4096];
+            loop {
+                match e.read(&mut b).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut c = collected.borrow_mut();
+                        if c.len() + n <= MAX_EXEC_OUTPUT {
+                            c.extend_from_slice(&b[..n]);
+                        }
+                    }
+                }
+            }
+        }
         core::future::pending::<()>().await
     };
 
-    match select(pump, watch_stderr).await {
-        Either::First(()) => Ok(()),
-        // `watch_stderr` never completes on its own.
-        Either::Second(()) => Ok(()),
+    // Only `pump` ever completes; the other two park once their work is done.
+    match select(pump, select(watch_stderr, feed)).await {
+        Either::First(()) | Either::Second(_) => (),
     }
+    Ok(collected.into_inner())
 }
 
 async fn drain(r: Option<impl sunset_sftp::embedded_io_async::Read>) -> Vec<u8> {

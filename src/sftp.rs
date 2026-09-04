@@ -556,7 +556,9 @@ pub fn copy_remote_dir_to_local_via_tar(
         sh_quote(src_parent),
         sh_quote(src_name)
     );
-    let stream = conn.exec_stream(&src_cmd).map_err(|e| e.message)?;
+    let stream = conn
+        .exec_stream(&src_cmd, ssh::Stdin::Closed)
+        .map_err(|e| e.message)?;
 
     let reader = TrackedReader {
         inner: io::BufReader::with_capacity(1 << 20, stream),
@@ -584,37 +586,6 @@ pub fn copy_remote_dir_to_local_via_tar(
     Ok(())
 }
 
-/// An `io::Write` that appends to a remote file over SFTP.
-struct RemoteWriter<'a> {
-    conn: &'a Conn,
-    handle: ssh::HandleId,
-    offset: u64,
-}
-
-impl io::Write for RemoteWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.conn
-            .write_at(self.handle, self.offset, buf.to_vec())
-            .map_err(io::Error::other)?;
-        self.offset += buf.len() as u64;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Picks a temp path next to the destination, on the same filesystem so the
-/// extract does not cross devices.
-fn temp_archive_path(dst_dir: &str) -> String {
-    // Unique enough for concurrent transfers from one process.
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    format!("{}/.fileman-{pid}-{n}.tar", dst_dir.trim_end_matches('/'))
-}
-
 /// Runs a command that should print nothing, treating any stderr as failure.
 ///
 /// sunset surfaces a channel's exit status as a session-wide event that cannot
@@ -622,7 +593,11 @@ fn temp_archive_path(dst_dir: &str) -> String {
 /// command's stderr rather than its exit code.
 fn exec_checked(conn: &Conn, cmd: &str, what: &str) -> Result<(), String> {
     let out = conn.exec(cmd).map_err(|e| format!("{what}: {e}"))?;
-    let tail = String::from_utf8_lossy(&out.stderr);
+    check_stderr(&out.stderr, what)
+}
+
+fn check_stderr(stderr: &[u8], what: &str) -> Result<(), String> {
+    let tail = String::from_utf8_lossy(stderr);
     let tail = tail.trim();
     if tail.is_empty() {
         Ok(())
@@ -631,55 +606,40 @@ fn exec_checked(conn: &Conn, cmd: &str, what: &str) -> Result<(), String> {
     }
 }
 
-/// Streams a tar archive into a temp file on the remote, then extracts it.
+/// Feeds a tar archive into a remote `tar x` and reports what it complained about.
 ///
-/// The archive is staged rather than piped into `tar xf -` because sunset
-/// cannot signal end-of-input on a channel, so a remote command that reads
-/// its stdin to EOF would never return. The temp file lives beside the
-/// destination and is removed whether or not the extract succeeds.
-fn extract_staged_archive(
+/// `write_archive` writes the archive; closing the input afterwards is what
+/// lets the remote tar finish, so it happens whether or not writing succeeded.
+fn pipe_archive_to_tar(
     conn: &Conn,
     dst_dir: &str,
-    tar_flag: &str,
-    write_archive: impl FnOnce(&mut RemoteWriter<'_>) -> io::Result<()>,
+    tar_flags: &str,
+    write_archive: impl FnOnce(&mut ssh::ExecStream) -> io::Result<()>,
 ) -> Result<(), String> {
-    let tmp = temp_archive_path(dst_dir);
-    let handle = conn
-        .open(&tmp, OpenMode::Write)
-        .map_err(|e| format!("create {tmp}: {e}"))?;
+    let cmd = format!("tar {tar_flags} -C {}", sh_quote(dst_dir));
+    let mut stream = conn
+        .exec_stream(&cmd, ssh::Stdin::Piped)
+        .map_err(|e| e.message)?;
 
-    let staged = {
-        let mut w = RemoteWriter {
-            conn,
-            handle,
-            offset: 0,
-        };
-        write_archive(&mut w)
-    };
-    let closed = conn.close(handle).map_err(|e| format!("close {tmp}: {e}"));
+    let written = write_archive(&mut stream);
+    // Signals end of input, so the remote tar can finish and exit.
+    stream.finish_input();
+    let stderr = stream.wait();
 
-    let cleanup = |e: String| -> String {
-        let _ = conn.remove(&tmp);
-        e
-    };
-
-    match staged {
+    match written {
         Ok(()) => {}
-        Err(e) if is_cancel_err(&e) => return Err(cleanup("Cancelled".to_string())),
-        Err(e) => return Err(cleanup(format!("staging archive: {e}"))),
+        Err(e) if is_cancel_err(&e) => return Err("Cancelled".to_string()),
+        Err(e) => return Err(format!("tar create: {e}")),
     }
-    if let Err(e) = closed {
-        return Err(cleanup(e));
-    }
-
-    let cmd = format!("tar {tar_flag} {} -C {}", sh_quote(&tmp), sh_quote(dst_dir));
-    let result = exec_checked(conn, &cmd, "remote tar");
-    let _ = conn.remove(&tmp);
-    result
+    check_stderr(
+        &stderr.map_err(|e| format!("remote tar: {e}"))?,
+        "remote tar",
+    )
 }
 
 /// Copy a local directory tree to a remote path.
-/// Creates the tar archive with the Rust `tar` crate and extracts it remotely.
+/// Creates the tar archive with the Rust `tar` crate, extracts it remotely
+/// via `tar xf -`.
 pub fn copy_local_dir_to_remote_via_tar(
     src_path: &std::path::Path,
     conn: &Conn,
@@ -692,9 +652,9 @@ pub fn copy_local_dir_to_remote_via_tar(
         .and_then(|s| s.to_str())
         .unwrap_or("dir");
 
-    extract_staged_archive(conn, dst_dir, "xf", |remote| {
+    pipe_archive_to_tar(conn, dst_dir, "xf -", |stream| {
         let mut writer = TrackedWriter {
-            inner: io::BufWriter::with_capacity(1 << 20, remote),
+            inner: io::BufWriter::with_capacity(1 << 20, stream),
             cancel,
             progress,
         };
@@ -775,12 +735,13 @@ pub fn copy_cross_host_via_tar(
         sh_quote(src_parent),
         sh_quote(src_name)
     );
-    let mut src = src_conn.exec_stream(&src_cmd).map_err(|e| e.message)?;
+    let mut src = src_conn
+        .exec_stream(&src_cmd, ssh::Stdin::Closed)
+        .map_err(|e| e.message)?;
 
-    // Relay the compressed stream into a staging file on the destination,
-    // then extract it there.
-    extract_staged_archive(dst_conn, dst_dir, "xzf", |remote| {
-        let mut out = io::BufWriter::with_capacity(1 << 20, remote);
+    // Relay the compressed stream straight into the destination's tar.
+    pipe_archive_to_tar(dst_conn, dst_dir, "xzf -", |stream| {
+        let mut out = io::BufWriter::with_capacity(1 << 20, stream);
         let mut buf = vec![0u8; 256 * 1024];
         loop {
             if cancel.load(Ordering::Relaxed) {

@@ -55,9 +55,9 @@ syntect = { version = "5", default-features = false, features = ["default-syntax
 memchr = "2.7"
 encoding_rs = "0.8"
 chardetng = "0.1"
-sunset = { git = "https://github.com/navigato-rs/sunset", rev = "65c607a", features = ["std", "openssh-key", "rsa", "ecdsa256"] }
-sunset-async = { git = "https://github.com/navigato-rs/sunset", rev = "65c607a", features = ["std", "tokio", "multi-thread"] }
-sunset-sftp = { git = "https://github.com/navigato-rs/sunset", rev = "65c607a" }
+sunset = { git = "https://github.com/navigato-rs/sunset", rev = "dc6b961", features = ["std", "openssh-key", "rsa", "ecdsa256"] }
+sunset-async = { git = "https://github.com/navigato-rs/sunset", rev = "dc6b961", features = ["std", "tokio", "multi-thread"] }
+sunset-sftp = { git = "https://github.com/navigato-rs/sunset", rev = "dc6b961" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time"] }
 embassy-sync = "0.8"
 embassy-futures = "0.1"
@@ -73,7 +73,7 @@ semver = { version = "1", optional = true }
 libc = "0.2"
 users = "0.11"
 # Only for its ssh-agent client: stdasync is Unix-only (UnixStream, signal::unix).
-sunset-stdasync = { git = "https://github.com/navigato-rs/sunset", rev = "65c607a" }
+sunset-stdasync = { git = "https://github.com/navigato-rs/sunset", rev = "dc6b961" }
 
 # For showing a fatal-error MessageBox when GPU init fails. Windows GUI
 # subsystem apps have no attached stderr, so without this the user just
