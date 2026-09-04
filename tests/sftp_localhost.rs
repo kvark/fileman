@@ -445,3 +445,125 @@ fn sftp_read_empty_directory() {
 
     sftp::recursive_delete(&session.sftp, dir, true, None).expect("cleanup");
 }
+
+#[test]
+#[ignore]
+fn sftp_tar_copy_larger_than_the_exec_buffer() {
+    // A directory copy streams a tar through an exec channel. Output past a
+    // fixed cap used to be discarded outright, which corrupted the archive.
+    // Nothing is discarded now: the transport stops reading at a high-water
+    // mark and lets the peer's window hold the rest. This is several times
+    // that mark, so it covers the handover repeatedly.
+    use std::sync::atomic::AtomicBool;
+
+    let session = connect_localhost();
+    let remote_dir = "/tmp/fileman_sftp_test_bigtar";
+    let _ = sftp::recursive_delete(&session.sftp, remote_dir, true, None);
+    sftp::mkdir(&session.sftp, remote_dir).expect("mkdir");
+
+    // Not compressible, so the tar really is this big on the wire.
+    let big: Vec<u8> = (0..8_000_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    sftp::write_file(&session.sftp, &format!("{remote_dir}/big.bin"), &big).expect("write big");
+
+    let local = std::env::temp_dir().join("fileman_bigtar_dst");
+    let _ = std::fs::remove_dir_all(&local);
+    std::fs::create_dir_all(&local).expect("create local dir");
+
+    let cancel = AtomicBool::new(false);
+    sftp::copy_remote_dir_to_local_via_tar(&session.sftp, remote_dir, &local, "out", &cancel, None)
+        .expect("tar copy down");
+
+    let got = std::fs::read(local.join("out/big.bin")).expect("read copied file");
+    assert_eq!(got.len(), big.len(), "size should survive the copy");
+    assert!(got == big, "contents should survive the copy");
+
+    let _ = std::fs::remove_dir_all(&local);
+    sftp::recursive_delete(&session.sftp, remote_dir, true, None).expect("cleanup");
+}
+
+/// Kills an established session and checks that the next operation dials
+/// again by itself.
+///
+/// Needs to run its own sshd so it can kill sessions without disturbing
+/// anything else; skipped where it cannot start one.
+#[test]
+#[ignore]
+fn sftp_reconnects_after_the_session_drops() {
+    use std::process::Command;
+
+    const PORT: u16 = 2222;
+    const PIDFILE: &str = "/tmp/fileman-test-sshd.pid";
+
+    let start = || {
+        Command::new("/usr/sbin/sshd")
+            .args(["-p", &PORT.to_string(), "-o", &format!("PidFile={PIDFILE}")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    let listener = || {
+        std::fs::read_to_string(PIDFILE)
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    // Killing the listener's children ends the session while leaving the
+    // server up, which is what a sleep or a network blip looks like.
+    let drop_session = || {
+        if let Some(pid) = listener() {
+            let _ = Command::new("pkill").args(["-9", "-P", &pid]).status();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    };
+    let stop = || {
+        if let Some(pid) = listener() {
+            let _ = Command::new("pkill").args(["-9", "-P", &pid]).status();
+            let _ = Command::new("kill").args(["-9", &pid]).status();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    };
+
+    stop();
+    if !start() {
+        eprintln!("cannot start an sshd of our own, skipping");
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let conn = fileman::ssh::connect(fileman::ssh::ConnectParams {
+        host: "localhost".into(),
+        hostname: "127.0.0.1".into(),
+        port: PORT,
+        user: std::env::var("USER").unwrap_or_else(|_| "root".into()),
+        identity_files: vec![format!("{home}/.ssh/id_ed25519")],
+        use_agent: false,
+    })
+    .expect("connect");
+    assert!(conn.stat("/tmp").expect("stat before").is_dir());
+
+    drop_session();
+
+    // No reconnect step and no renavigation, just the next request. Only
+    // read-only requests dial again themselves; everything else works
+    // afterwards because one of them has healed the connection.
+    assert!(
+        conn.stat("/tmp").expect("stat should reconnect").is_dir(),
+        "a dropped session should be dialled again"
+    );
+    conn.open_dir("/tmp")
+        .expect("opendir on the fresh connection");
+    assert_eq!(
+        conn.exec("echo hi")
+            .expect("exec on the fresh connection")
+            .exit,
+        Some(fileman::ssh::ExitStatus::Code(0))
+    );
+    assert!(conn.is_alive(), "reconnecting should keep it usable");
+
+    // With the server gone for good it should give up rather than hang.
+    stop();
+    assert!(conn.stat("/tmp").is_err(), "no server means an error");
+    assert!(!conn.is_alive(), "and the connection is retired");
+}

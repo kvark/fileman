@@ -5,8 +5,12 @@
 ## Features
 - Remote browsing now uses the pure-Rust sunset SSH stack instead of libssh2,
   removing the OpenSSL build dependency and the async runtime with it
+- ssh-agent authentication now works on Windows
 
 ### Fixes
+- A dropped SSH connection is re-established on the next request, instead of
+  erroring and needing a manual reconnect and renavigation
+- Remote directory copies no longer truncate past 64 MB
 - Remote directory copies no longer fail when the remote command only warns:
   success is judged by its exit status
 - macOS releases are signed with Developer ID and notarized, so the app opens

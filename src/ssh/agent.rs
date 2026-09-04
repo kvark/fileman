@@ -1,26 +1,74 @@
 //! A blocking ssh-agent client.
 //!
-//! `sunset::agent` is the protocol; this is the socket under it. Unix only:
-//! an agent on Windows is a named pipe rather than a Unix socket, so there
-//! key files are the only option.
+//! `sunset::agent` is the protocol; this is the transport under it. That split
+//! is what lets Windows work at all: an agent there is a named pipe rather
+//! than a Unix socket, and only the connecting differs.
 
 use std::io::{Read as _, Write as _};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use sunset::{AuthSigMsg, Error, OwnedSig, Result, SignKey, agent};
 
+/// The agent's end of the connection.
+///
+/// A Windows named pipe is opened as a file and speaks the same protocol, so
+/// everything above this is shared.
+#[cfg(unix)]
+type Transport = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type Transport = std::fs::File;
+
+/// Where the agent listens when the environment does not say.
+///
+/// Windows OpenSSH uses a fixed pipe name rather than `$SSH_AUTH_SOCK`.
+#[cfg(windows)]
+const DEFAULT_PIPE: &str = r"\.\pipe\openssh-ssh-agent";
+
+/// The address of a running agent, or `None` if there is nothing to try.
+pub fn address() -> Option<String> {
+    if let Ok(s) = std::env::var("SSH_AUTH_SOCK") {
+        return Some(s);
+    }
+    #[cfg(windows)]
+    {
+        Some(DEFAULT_PIPE.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn open(path: &Path) -> Result<Transport, std::io::Error> {
+    #[cfg(unix)]
+    {
+        Transport::connect(path)
+    }
+    #[cfg(windows)]
+    {
+        // A named pipe is opened for reading and writing like a file; it
+        // must not be created if the agent is not running.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+    }
+}
+
 /// A connection to a running ssh-agent.
 pub struct AgentClient {
-    conn: UnixStream,
+    conn: Transport,
     buf: Vec<u8>,
 }
 
 impl AgentClient {
-    /// Connects to the agent listening on `path`, usually `$SSH_AUTH_SOCK`.
+    /// Connects to the agent listening on `path`.
+    ///
+    /// On Unix that is `$SSH_AUTH_SOCK`; on Windows the OpenSSH agent's pipe.
+    /// See [`address()`].
     pub fn new(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         Ok(Self {
-            conn: UnixStream::connect(path)?,
+            conn: open(path.as_ref())?,
             buf: Vec::new(),
         })
     }
