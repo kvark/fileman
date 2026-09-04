@@ -1362,7 +1362,6 @@ dependencies = [
  "sha1",
  "sunset",
  "sunset-sftp",
- "sunset-sshwire-derive",
  "syntect",
  "tar",
  "toml 0.8.23",
@@ -3925,7 +3924,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sunset"
 version = "0.6.0"
-source = "git+https://github.com/navigato-rs/sunset?rev=c245252#c245252510336572c0d3ab5fce29850996e53c22"
+source = "git+https://github.com/navigato-rs/sunset?rev=d60be9f#d60be9ff9bf7b6abf1d34972ff29a6b4b258a2f4"
 dependencies = [
  "aes",
  "ascii",
@@ -3956,7 +3955,7 @@ dependencies = [
 [[package]]
 name = "sunset-sftp"
 version = "0.2.0"
-source = "git+https://github.com/navigato-rs/sunset?rev=c245252#c245252510336572c0d3ab5fce29850996e53c22"
+source = "git+https://github.com/navigato-rs/sunset?rev=d60be9f#d60be9ff9bf7b6abf1d34972ff29a6b4b258a2f4"
 dependencies = [
  "log",
  "num_enum",
@@ -3968,7 +3967,7 @@ dependencies = [
 [[package]]
 name = "sunset-sshwire-derive"
 version = "0.3.0"
-source = "git+https://github.com/navigato-rs/sunset?rev=c245252#c245252510336572c0d3ab5fce29850996e53c22"
+source = "git+https://github.com/navigato-rs/sunset?rev=d60be9f#d60be9ff9bf7b6abf1d34972ff29a6b4b258a2f4"
 dependencies = [
  "virtue",
 ]
