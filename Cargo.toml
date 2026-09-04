@@ -55,13 +55,10 @@ syntect = { version = "5", default-features = false, features = ["default-syntax
 memchr = "2.7"
 encoding_rs = "0.8"
 chardetng = "0.1"
-sunset = { git = "https://github.com/navigato-rs/sunset", rev = "dc6b961", features = ["std", "openssh-key", "rsa", "ecdsa256"] }
-sunset-async = { git = "https://github.com/navigato-rs/sunset", rev = "dc6b961", features = ["std", "tokio", "multi-thread"] }
-sunset-sftp = { git = "https://github.com/navigato-rs/sunset", rev = "dc6b961" }
-tokio = { version = "1", features = ["rt", "net", "sync"] }
-embassy-sync = "0.8"
-embassy-futures = "0.1"
-critical-section = { version = "1.1", features = ["std"] }
+sunset = { git = "https://github.com/navigato-rs/sunset", rev = "c245252", features = ["std", "openssh-key", "rsa", "ecdsa256"] }
+# Without the `async` feature this is the SFTP protocol on its own, which is
+# what a blocking transport wants; it pulls in no executor.
+sunset-sftp = { git = "https://github.com/navigato-rs/sunset", rev = "c245252", default-features = false }
 sha1 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
@@ -72,8 +69,8 @@ semver = { version = "1", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 users = "0.11"
-# Only for its ssh-agent client: stdasync is Unix-only (UnixStream, signal::unix).
-sunset-stdasync = { git = "https://github.com/navigato-rs/sunset", rev = "dc6b961" }
+# For the in-tree ssh-agent client's wire types.
+sunset-sshwire-derive = { git = "https://github.com/navigato-rs/sunset", rev = "c245252" }
 
 # For showing a fatal-error MessageBox when GPU init fails. Windows GUI
 # subsystem apps have no attached stderr, so without this the user just

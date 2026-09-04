@@ -4,7 +4,7 @@
 
 ## Features
 - Remote browsing now uses the pure-Rust sunset SSH stack instead of libssh2,
-  removing the OpenSSL build dependency
+  removing the OpenSSL build dependency and the async runtime with it
 
 ### Fixes
 - macOS releases are signed with Developer ID and notarized, so the app opens
