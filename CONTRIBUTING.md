@@ -190,28 +190,27 @@ hang rather than an error when ignored:
   drain a channel, and spinning there would never let it.
 - Channel data has to be moved out by hand. Nothing else will do it, and the
   peer stops sending once the window it gave us goes unacknowledged.
-- `SftpRunner::input_buf` asks for exactly the bytes it wants next, so it is
+- `SftpRunner::want_buf` asks for exactly the bytes it wants next, so it is
   filled from the channel rather than read past.
 
-Two more traps worth knowing. `read_channel_either` does not report EOF the way
-`read_channel` does, so a finished command is detected with `is_channel_eof`
-instead. And requests are sized by `MAX_READ_LEN` and `MAX_WRITE_LEN`: a larger
-SFTP packet than the protocol requires servers to accept gets the channel
-closed rather than an error back.
+Reads and writes are sized by `MAX_READ_LEN` and `MAX_WRITE_LEN`. The runner
+refuses anything longer, since a bigger SFTP packet than servers are required
+to accept gets the channel closed rather than answered.
 
 A command reading its input to end-of-file needs to be told when that is, which
 `ExecStream::finish_input` does via sunset's `send_eof`. Without it `tar xf -`
 waits forever, so a streamed upload that hangs is usually a missing
 `finish_input`.
 
-Exit statuses are reported by sunset as a session-wide event that cannot be
-tied back to a particular channel, so a command's success is judged by what it
-wrote to stderr instead — `exec_checked` for captured commands, and the stderr
-that `ExecStream::wait` returns for streamed ones.
+A command's exit status arrives as a channel request around the channel's EOF,
+so `Exec::done` waits for the close as well: stopping at EOF alone races the
+status and usually misses it. `check_exec` then judges by that status, and
+falls back to stderr only when a server sends none — going by stderr alone
+fails a copy over any warning the command prints while still succeeding.
 
-Authentication offers ssh-agent keys first and then key files. The agent client
-is in-tree because `sunset-stdasync`'s is async and Unix-only; ours is only the
-latter, so on Windows key files are the only option.
+Authentication offers ssh-agent keys first and then key files. `sunset::agent`
+is the agent protocol; `src/ssh/agent.rs` is the Unix socket under it, so on
+Windows — where an agent is a named pipe — key files are the only option.
 
 Integration tests run against a real sshd on localhost; see Testing above and
 the `sftp` job in CI.

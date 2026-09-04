@@ -17,7 +17,7 @@
 //!   channel rather than looping.
 //! - Channel data has to be moved out by hand; nothing else will do it, and
 //!   the peer stops sending once its window is unacknowledged.
-//! - `SftpRunner::input_buf` asks for exactly the bytes it wants next, so it
+//! - `SftpRunner::want_buf` asks for exactly the bytes it wants next, so it
 //!   must be filled from the channel rather than read past.
 
 use std::{
@@ -144,11 +144,39 @@ impl std::error::Error for SshError {}
 
 pub type SshResult<T> = Result<T, SshError>;
 
+/// How a remote command finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitStatus {
+    Code(u32),
+    Signal(String),
+}
+
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Code(c) => write!(f, "exit status {c}"),
+            Self::Signal(ref s) => write!(f, "killed by {s}"),
+        }
+    }
+}
+
 /// Captured result of a command run over exec.
 #[derive(Debug, Clone, Default)]
 pub struct ExecOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// How it finished, when the server said. Servers are not obliged to.
+    pub exit: Option<ExitStatus>,
+}
+
+impl ExecOutput {
+    /// Whether the command reported failure.
+    ///
+    /// A server that sends no exit status leaves this false, so a caller that
+    /// needs to know should look at stderr as well.
+    pub fn failed(&self) -> bool {
+        !matches!(self.exit, None | Some(ExitStatus::Code(0)))
+    }
 }
 
 /// An SFTP reply, with nothing borrowed from the runner.
@@ -377,6 +405,7 @@ impl Conn {
                 out.stdout.append(&mut e.out);
                 out.stderr.append(&mut e.err);
                 if done {
+                    out.exit = e.exit.clone();
                     break;
                 }
             }
@@ -427,7 +456,21 @@ struct Exec {
     err: Vec<u8>,
     /// Set once the channel will produce nothing more.
     eof: bool,
+    /// Set once the peer has closed the channel, which is what follows the
+    /// exit status. Waiting for it is how the status is not missed.
+    closed: bool,
     sent_eof: bool,
+    exit: Option<ExitStatus>,
+}
+
+impl Exec {
+    /// Whether the command is finished and its result is in.
+    ///
+    /// EOF alone is too early: the exit status is a channel request that
+    /// arrives around it, so a caller stopping at EOF sees no status at all.
+    fn done(&self) -> bool {
+        self.eof && (self.exit.is_some() || self.closed)
+    }
 }
 
 /// What a freshly opened channel should be asked to run.
@@ -593,7 +636,20 @@ impl Session {
                             None => (),
                         }
                     }
-                    Event::Cli(CliEvent::SessionExit(_)) | Event::Cli(CliEvent::Banner(_)) => (),
+                    Event::Cli(CliEvent::SessionExit(e)) => {
+                        // The event says which channel it belongs to, so it
+                        // can be attributed with several commands running.
+                        let status = match e.exit {
+                            sunset::SessionExit::Status(c) => ExitStatus::Code(c),
+                            sunset::SessionExit::Signal(ref s) => {
+                                ExitStatus::Signal(s.signal.to_string())
+                            }
+                        };
+                        if let Some(x) = self.execs.values_mut().find(|x| x.chan.num() == e.num) {
+                            x.exit = Some(status);
+                        }
+                    }
+                    Event::Cli(CliEvent::Banner(_)) => (),
                     Event::Cli(CliEvent::Defunct) => {
                         return Err(SshError::fatal("SSH connection closed"));
                     }
@@ -671,6 +727,17 @@ impl Session {
                     sink.extend_from_slice(&buf[..n]);
                 }
             }
+            let closed = {
+                let Session {
+                    ref ssh, ref execs, ..
+                } = *self;
+                execs
+                    .get(&id)
+                    .is_some_and(|e| ssh.is_channel_closed(&e.chan))
+            };
+            if closed && let Ok(e) = self.exec_mut(id) {
+                e.closed = true;
+            }
         }
 
         // Then SFTP, filling exactly what the runner asks for next.
@@ -679,7 +746,7 @@ impl Session {
         };
         let r = (|| -> SshResult<()> {
             while !self.sftp.has_event() {
-                let dest = self.sftp.input_buf();
+                let dest = self.sftp.want_buf();
                 if dest.is_empty() {
                     break;
                 }
@@ -897,7 +964,9 @@ impl Session {
                 out: Vec::new(),
                 err: Vec::new(),
                 eof: false,
+                closed: false,
                 sent_eof: false,
+                exit: None,
             },
         );
         // Get the request onto the wire before returning.
@@ -912,7 +981,7 @@ impl Session {
         let mut done = false;
         self.pump(|s| {
             let e = s.exec_mut(id)?;
-            if e.eof {
+            if e.done() {
                 done = true;
                 return Ok(true);
             }
@@ -994,22 +1063,25 @@ impl ExecStream {
         }
     }
 
-    /// Waits for the command to finish, returning whatever it wrote to stderr.
-    pub fn wait(mut self) -> SshResult<Vec<u8>> {
+    /// Waits for the command to finish, reporting how it went.
+    ///
+    /// Stdout is discarded: a caller that wants it reads the stream instead.
+    pub fn wait(mut self) -> SshResult<ExecOutput> {
         self.finish_input();
         let id = self.id;
         self.conn.with(|s| {
-            let mut err = Vec::new();
+            let mut out = ExecOutput::default();
             loop {
                 let done = s.pump_exec(id)?;
                 let e = s.exec_mut(id)?;
                 e.out.clear();
-                err.append(&mut e.err);
+                out.stderr.append(&mut e.err);
                 if done {
+                    out.exit = e.exit.clone();
                     break;
                 }
             }
-            Ok(err)
+            Ok(out)
         })
     }
 }

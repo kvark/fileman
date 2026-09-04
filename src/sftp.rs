@@ -593,16 +593,27 @@ pub fn copy_remote_dir_to_local_via_tar(
 /// command's stderr rather than its exit code.
 fn exec_checked(conn: &Conn, cmd: &str, what: &str) -> Result<(), String> {
     let out = conn.exec(cmd).map_err(|e| format!("{what}: {e}"))?;
-    check_stderr(&out.stderr, what)
+    check_exec(&out, what)
 }
 
-fn check_stderr(stderr: &[u8], what: &str) -> Result<(), String> {
-    let tail = String::from_utf8_lossy(stderr);
+/// Judges a finished command by its exit status, and by stderr only when the
+/// server did not send one.
+///
+/// Going by stderr alone would fail a copy over any warning the command
+/// printed while still succeeding.
+fn check_exec(out: &ssh::ExecOutput, what: &str) -> Result<(), String> {
+    let tail = String::from_utf8_lossy(&out.stderr);
     let tail = tail.trim();
-    if tail.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("{what}: {tail}"))
+    match out.exit {
+        Some(ref status) if out.failed() => {
+            if tail.is_empty() {
+                Err(format!("{what}: {status}"))
+            } else {
+                Err(format!("{what}: {status}: {tail}"))
+            }
+        }
+        None if !tail.is_empty() => Err(format!("{what}: {tail}")),
+        _ => Ok(()),
     }
 }
 
@@ -624,15 +635,15 @@ fn pipe_archive_to_tar(
     let written = write_archive(&mut stream);
     // Signals end of input, so the remote tar can finish and exit.
     stream.finish_input();
-    let stderr = stream.wait();
+    let outcome = stream.wait();
 
     match written {
         Ok(()) => {}
         Err(e) if is_cancel_err(&e) => return Err("Cancelled".to_string()),
         Err(e) => return Err(format!("tar create: {e}")),
     }
-    check_stderr(
-        &stderr.map_err(|e| format!("remote tar: {e}"))?,
+    check_exec(
+        &outcome.map_err(|e| format!("remote tar: {e}"))?,
         "remote tar",
     )
 }

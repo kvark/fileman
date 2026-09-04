@@ -7,6 +7,8 @@
   removing the OpenSSL build dependency and the async runtime with it
 
 ### Fixes
+- Remote directory copies no longer fail when the remote command only warns:
+  success is judged by its exit status
 - macOS releases are signed with Developer ID and notarized, so the app opens
   without a Gatekeeper warning
 
