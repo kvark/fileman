@@ -1,24 +1,22 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 (4 Sep 2026)
 
-## Features
-- Remote browsing now uses the pure-Rust sunset SSH stack instead of libssh2,
-  removing the OpenSSL build dependency and the async runtime with it
-- ssh-agent authentication now works on Windows
+### Features
+- Pure-Rust SSH stack, replacing libssh2 — no OpenSSL, no async runtime
+- ssh-agent authentication on Windows
+- Dropped SSH connections re-establish themselves on the next request
+- macOS builds are signed and notarized, so they open without a Gatekeeper warning
 
 ### Fixes
-- A dropped SSH connection is re-established on the next request, instead of
-  erroring and needing a manual reconnect and renavigation
-- Remote directory copies no longer truncate past 64 MB
-- Remote directory copies no longer fail when the remote command only warns:
-  success is judged by its exit status
-- macOS releases are signed with Developer ID and notarized, so the app opens
-  without a Gatekeeper warning
+- Wheel scrolling settles instead of bouncing back to the selection
+- Dialogs are no longer dimmed by their own overlay
+- Remote directory copies past 64 MB no longer corrupt
+- Remote copies no longer fail when the command only writes a warning
 
 ## v0.3.4 (30 Aug 2026)
 
-## Features
+### Features
 - In-app settings
 - Breadcrumb path and per-panel status line
 - Removable drives in Go To
@@ -33,7 +31,7 @@
 
 ## v0.3.3 (26 Apr 2026)
 
-## Features
+### Features
 - Improved "Go To" menu with grouped remote and local destinations
 - Automatic whitespace display on selection only
 - Editor mode now covers the whole window

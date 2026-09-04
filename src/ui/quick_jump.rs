@@ -26,7 +26,7 @@ pub fn draw_quick_jump(
     let qj = app.quick_jump_mut()?;
 
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "quick_jump_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "quick_jump_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
@@ -37,6 +37,7 @@ pub fn draw_quick_jump(
     let prev_input = qj.input.clone();
 
     egui::Window::new("Go To")
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)

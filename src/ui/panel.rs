@@ -339,7 +339,6 @@ pub fn draw_panel(
         mut selected_label,
         mut loading,
         loading_progress,
-        top_index,
     ) = {
         let panel = app.panel(panel_side);
         let browser = panel.browser();
@@ -368,7 +367,6 @@ pub fn draw_panel(
             selected_label,
             browser.load.is_loading() || browser.progress_override.is_some(),
             browser.load.progress().or(browser.progress_override),
-            browser.top_index,
         )
     };
 
@@ -703,28 +701,13 @@ pub fn draw_panel(
                             let total_height = (row_height * entries_len as f32
                                 - ui.spacing().item_spacing.y)
                                 .max(0.0);
-                            let ensure_visible = selected_index < top_index
-                                || selected_index >= top_index.saturating_add(rows);
-                            let center_offset = (list_height - row_height) * 0.5;
-                            let mut target =
-                                if ensure_visible || scroll_mode == ScrollMode::ForceActive {
-                                    selected_index as f32 * row_height - center_offset
-                                } else {
-                                    0.0
-                                };
-                            if total_height > list_height {
-                                let max_offset = (total_height - list_height).max(0.0);
-                                if target < 0.0 {
-                                    target = 0.0;
-                                } else if target > max_offset {
-                                    target = max_offset;
-                                }
-                            } else {
-                                target = 0.0;
-                            }
-                            if ensure_visible || scroll_mode == ScrollMode::ForceActive {
-                                scroll_target = Some(target);
-                            }
+                            scroll_target = list_scroll_target(
+                                scroll_mode,
+                                selected_index,
+                                row_height,
+                                total_height,
+                                list_height,
+                            );
                         }
 
                         ui.allocate_ui_with_layout(
@@ -1160,4 +1143,80 @@ pub fn draw_panel(
     }
 
     rows
+}
+
+/// Where the list should be scrolled to, or `None` to leave it where it is.
+///
+/// Only a selection or directory change moves the view. Scrolling with the
+/// wheel leaves the selection behind, and pulling it back into sight then
+/// would fight the wheel: every notch up was undone on the next frame, so the
+/// list bounced and never reached the top.
+fn list_scroll_target(
+    mode: ScrollMode,
+    selected_index: usize,
+    row_height: f32,
+    total_height: f32,
+    list_height: f32,
+) -> Option<f32> {
+    if mode != ScrollMode::ForceActive {
+        return None;
+    }
+    if total_height <= list_height {
+        return Some(0.0);
+    }
+    let center_offset = (list_height - row_height) * 0.5;
+    let max_offset = (total_height - list_height).max(0.0);
+    Some((selected_index as f32 * row_height - center_offset).clamp(0.0, max_offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROW: f32 = 20.0;
+    const LIST: f32 = 200.0;
+    // 100 rows, so there is plenty to scroll through.
+    const TOTAL: f32 = ROW * 100.0;
+
+    #[test]
+    fn a_wheel_scroll_is_left_alone() {
+        // The selection has not moved, so neither should the view, however far
+        // from the selection the user has scrolled.
+        assert_eq!(
+            list_scroll_target(ScrollMode::Default, 50, ROW, TOTAL, LIST),
+            None
+        );
+        assert_eq!(
+            list_scroll_target(ScrollMode::Default, 0, ROW, TOTAL, LIST),
+            None
+        );
+    }
+
+    #[test]
+    fn a_moved_selection_is_brought_into_view() {
+        let target = list_scroll_target(ScrollMode::ForceActive, 50, ROW, TOTAL, LIST)
+            .expect("selection moved, so the view should follow");
+        // Centred on the selection.
+        assert!((target - (50.0 * ROW - (LIST - ROW) * 0.5)).abs() < 0.5);
+    }
+
+    #[test]
+    fn the_view_stays_within_the_list() {
+        let top = list_scroll_target(ScrollMode::ForceActive, 0, ROW, TOTAL, LIST).unwrap();
+        assert_eq!(top, 0.0, "the first row cannot scroll above the top");
+        let bottom = list_scroll_target(ScrollMode::ForceActive, 99, ROW, TOTAL, LIST).unwrap();
+        assert_eq!(
+            bottom,
+            TOTAL - LIST,
+            "the last row cannot scroll past the end"
+        );
+    }
+
+    #[test]
+    fn a_list_that_fits_never_scrolls() {
+        assert_eq!(
+            list_scroll_target(ScrollMode::ForceActive, 3, ROW, ROW * 4.0, LIST),
+            Some(0.0)
+        );
+    }
 }
