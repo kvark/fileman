@@ -1331,7 +1331,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "fileman"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",

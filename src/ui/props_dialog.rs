@@ -15,7 +15,7 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
         return;
     };
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "props_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "props_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
@@ -56,6 +56,7 @@ pub fn draw_props_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
     let mut action: Option<(&'static str, bool)> = None;
 
     egui::Window::new("Properties")
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .fixed_size(egui::Vec2::new(480.0, 300.0))

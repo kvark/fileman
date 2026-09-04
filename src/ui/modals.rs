@@ -14,7 +14,7 @@ pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
     let (title, body) = pending_op_text(&op);
     let colors = app.theme.colors();
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "confirm_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "confirm_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
@@ -30,6 +30,7 @@ pub fn draw_confirmation(ctx: &egui::Context, app: &mut app_state::AppState) {
     let overwrite = !collisions.is_empty();
 
     egui::Window::new(title)
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -122,7 +123,7 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
 
     let colors = app.theme.colors();
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "progress_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "progress_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
@@ -130,6 +131,7 @@ pub fn draw_progress_modal(ctx: &egui::Context, app: &app_state::AppState) {
     );
 
     egui::Window::new("Working")
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .default_width(420.0)
@@ -216,7 +218,7 @@ pub fn draw_discard_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
         return;
     };
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "discard_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "discard_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
@@ -225,6 +227,7 @@ pub fn draw_discard_modal(ctx: &egui::Context, app: &mut app_state::AppState) {
 
     let mut action: Option<bool> = None;
     egui::Window::new("Discard changes?")
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .fixed_size(egui::Vec2::new(360.0, 140.0))

@@ -27,7 +27,7 @@ pub fn draw_settings(
 
     // Background overlay
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "settings_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "settings_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
@@ -35,6 +35,7 @@ pub fn draw_settings(
     );
 
     egui::Window::new("Settings")
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .default_width(520.0)

@@ -1504,13 +1504,14 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
 
 fn draw_connecting_modal(ctx: &egui::Context, host: &str) {
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "connecting_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "connecting_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
         egui::Color32::from_black_alpha(160),
     );
     egui::Window::new("Connecting")
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1524,13 +1525,14 @@ fn draw_connecting_modal(ctx: &egui::Context, host: &str) {
 
 fn draw_error_modal(ctx: &egui::Context, message: &str) {
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "error_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "error_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
         egui::Color32::from_black_alpha(160),
     );
     egui::Window::new("Error")
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1549,7 +1551,7 @@ fn draw_error_modal(ctx: &egui::Context, message: &str) {
 
 fn draw_elevation_modal(ctx: &egui::Context, message: &str) -> Option<bool> {
     let screen = ctx.content_rect();
-    let overlay_layer = egui::LayerId::new(egui::Order::Foreground, "elevation_overlay".into());
+    let overlay_layer = egui::LayerId::new(egui::Order::Middle, "elevation_overlay".into());
     ctx.layer_painter(overlay_layer).rect_filled(
         screen,
         egui::CornerRadius::ZERO,
@@ -1557,6 +1559,7 @@ fn draw_elevation_modal(ctx: &egui::Context, message: &str) -> Option<bool> {
     );
     let mut result = None;
     egui::Window::new("Permission Denied")
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
