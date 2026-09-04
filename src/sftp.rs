@@ -542,7 +542,7 @@ fn split_remote(path: &str) -> (&str, &str) {
 /// Copy a remote directory tree to a local path.
 /// Runs `tar cf -` on the remote via SSH exec, extracts locally with the Rust `tar` crate.
 pub fn copy_remote_dir_to_local_via_tar(
-    conn: &Conn,
+    conn: &Arc<Conn>,
     src_path: &str,
     dst_dir: &std::path::Path,
     name: &str,
@@ -611,7 +611,7 @@ fn check_stderr(stderr: &[u8], what: &str) -> Result<(), String> {
 /// `write_archive` writes the archive; closing the input afterwards is what
 /// lets the remote tar finish, so it happens whether or not writing succeeded.
 fn pipe_archive_to_tar(
-    conn: &Conn,
+    conn: &Arc<Conn>,
     dst_dir: &str,
     tar_flags: &str,
     write_archive: impl FnOnce(&mut ssh::ExecStream) -> io::Result<()>,
@@ -642,7 +642,7 @@ fn pipe_archive_to_tar(
 /// via `tar xf -`.
 pub fn copy_local_dir_to_remote_via_tar(
     src_path: &std::path::Path,
-    conn: &Conn,
+    conn: &Arc<Conn>,
     dst_dir: &str,
     cancel: &AtomicBool,
     progress: Option<&crate::core::TransferProgress>,
@@ -718,9 +718,9 @@ pub fn count_bytes_local(path: &std::path::Path) -> u64 {
 /// Copy a file or directory tree between two different remote hosts using a single
 /// `tar cf -` → relay → `tar xf -` stream.  This avoids per-file SFTP round-trips.
 pub fn copy_cross_host_via_tar(
-    src_conn: &Conn,
+    src_conn: &Arc<Conn>,
     src_path: &str,
-    dst_conn: &Conn,
+    dst_conn: &Arc<Conn>,
     dst_dir: &str,
     name: &str,
     cancel: &AtomicBool,

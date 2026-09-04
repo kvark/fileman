@@ -22,8 +22,9 @@ Ensure `cargo fmt` is ran and `cargo clippy` is clean.
 - `src/input.rs` — keyboard handling
 - `src/ui/` — UI components (panel, preview, help)
 - `src/image_decode.rs` — image decoding (including animated GIF)
-- `src/ssh.rs` — SSH transport: connection thread, auth, blocking bridge over sunset
+- `src/ssh.rs` — SSH transport: blocking session driving sunset's sans-io runners
 - `src/ssh/knownhosts.rs` — `known_hosts` parsing and host-key policy
+- `src/ssh/agent.rs` — blocking ssh-agent client (Unix only)
 - `src/sftp.rs` — remote file operations built on `src/ssh.rs`
 - `src/replay.rs` — replay case data structures and assertion types
 - `src/replay_runner.rs` — headless replay executor and assertion logic
@@ -172,29 +173,45 @@ sort settings. Inspect it to determine the right assertion values for a new test
 ## SSH
 
 Remote browsing runs on [sunset](https://github.com/navigato-rs/sunset), a
-pure-Rust SSH implementation. It is async and wants one task driving each
-connection, while the rest of FileMan is blocking and thread-per-operation, so
-`src/ssh.rs` owns that boundary: each host gets a thread running a
-current-thread tokio runtime, and `ssh::Conn` is a blocking handle that sends
-jobs to it. Nothing above `src/ssh.rs` sees a future.
+pure-Rust SSH implementation. Both layers used here are sans-io: `sunset::Runner`
+is the SSH protocol and `SftpRunner` is SFTP on top of it, and neither does IO
+of its own, so `src/ssh.rs` drives them straight from a blocking socket. There
+is no executor and no background thread — an `ssh::Conn` is a `Mutex` around
+the session, and whichever worker thread calls in does the pumping itself.
+That is why nothing in the dependency tree is async.
 
-Two properties of sunset shape the code, and both cause hangs rather than
-errors when ignored:
+Four properties of the runners shape that loop, and every one of them causes a
+hang rather than an error when ignored:
 
-- A channel is only usable once its `SessionOpened` event has been answered
-  with the subsystem or command it should run.
-- Every channel half, stderr included, has to be read. An abandoned half stalls
-  the whole session once the peer fills it, not just that stream.
+- An event borrows the runner, so anything needing the runner again has to wait
+  until that borrow ends.
+- The SSH runner stops accepting socket input while a payload is waiting to be
+  collected, so `Session::feed` returns instead of looping: only the caller can
+  drain a channel, and spinning there would never let it.
+- Channel data has to be moved out by hand. Nothing else will do it, and the
+  peer stops sending once the window it gave us goes unacknowledged.
+- `SftpRunner::input_buf` asks for exactly the bytes it wants next, so it is
+  filled from the channel rather than read past.
 
-A command that reads its input to end-of-file needs to be told when that is,
-which `ExecStream::finish_input` does via sunset's `send_eof`. Without it
-`tar xf -` waits forever rather than failing, so a streamed upload that hangs
-is usually a missing `finish_input`.
+Two more traps worth knowing. `read_channel_either` does not report EOF the way
+`read_channel` does, so a finished command is detected with `is_channel_eof`
+instead. And requests are sized by `MAX_READ_LEN` and `MAX_WRITE_LEN`: a larger
+SFTP packet than the protocol requires servers to accept gets the channel
+closed rather than an error back.
+
+A command reading its input to end-of-file needs to be told when that is, which
+`ExecStream::finish_input` does via sunset's `send_eof`. Without it `tar xf -`
+waits forever, so a streamed upload that hangs is usually a missing
+`finish_input`.
 
 Exit statuses are reported by sunset as a session-wide event that cannot be
 tied back to a particular channel, so a command's success is judged by what it
 wrote to stderr instead — `exec_checked` for captured commands, and the stderr
 that `ExecStream::wait` returns for streamed ones.
+
+Authentication offers ssh-agent keys first and then key files. The agent client
+is in-tree because `sunset-stdasync`'s is async and Unix-only; ours is only the
+latter, so on Windows key files are the only option.
 
 Integration tests run against a real sshd on localhost; see Testing above and
 the `sftp` job in CI.

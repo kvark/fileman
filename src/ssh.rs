@@ -1,53 +1,55 @@
 //! SSH transport built on sunset.
 //!
-//! The rest of the app is thread-per-operation and blocking, while sunset is
-//! async and wants a single task driving one connection. This module owns that
-//! mismatch: each host gets a thread running a current-thread tokio runtime,
-//! and [`Conn`] is a blocking handle that ships [`Job`]s to it and waits for
-//! the reply. Nothing above this module sees a future.
+//! Both sunset layers used here are sans-io: `sunset::Runner` is the SSH
+//! protocol and `SftpRunner` is SFTP on top of it, and neither does any IO of
+//! its own. That suits FileMan, which is blocking and thread-per-operation, so
+//! this module drives them straight from a blocking socket. There is no
+//! executor and no background thread: a [`Conn`] is a `Mutex` around the
+//! session, and whichever worker thread calls in does the pumping itself.
 //!
-//! Two rules of sunset shape the design:
+//! Four properties of the runners shape the loop, and all of them cause a
+//! hang rather than an error when ignored:
 //!
-//! - A channel is only usable once its `SessionOpened` event has been answered
-//!   with the subsystem or command it should run, so channels are parked in
-//!   `pending` until the progress loop hands them over.
-//! - Every channel half, stderr included, has to be drained or the whole
-//!   session stalls once the peer fills that pipe.
+//! - An event borrows the runner, so anything that needs the runner again has
+//!   to wait until that borrow ends.
+//! - The SSH runner stops accepting socket input while a payload is waiting to
+//!   be collected, so [`Session::feed`] must return and let the caller drain a
+//!   channel rather than looping.
+//! - Channel data has to be moved out by hand; nothing else will do it, and
+//!   the peer stops sending once its window is unacknowledged.
+//! - `SftpRunner::input_buf` asks for exactly the bytes it wants next, so it
+//!   must be filled from the channel rather than read past.
 
 use std::{
-    cell::{Cell, RefCell},
     collections::HashMap,
-    io,
+    io::{self, Read as _, Write as _},
+    net::TcpStream,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
 };
 
-use embassy_futures::select::{Either, select};
-use embassy_sync::channel::Channel as EmbassyChannel;
-use sunset::{CliEvent, SignKey};
-use sunset_async::{ChanIn, ChanInOut, ProgressHolder, SSHClient, SunsetRawMutex};
-use sunset_sftp::client::{RemoteHandle, SftpClient};
-use sunset_sftp::embedded_io_async::Read as _;
-use sunset_sftp::protocol::Attrs;
-use tokio::sync::mpsc as tmpsc;
+use sunset::{ChanData, ChanHandle, CliEvent, Event, Runner, SignKey};
+use sunset_sftp::client::{MAX_READ_LEN, MAX_WRITE_LEN, SftpEvent, SftpRunner, pflags};
+use sunset_sftp::protocol::{Attrs, StatusCode};
 
+#[cfg(unix)]
+mod agent;
 pub mod knownhosts;
 
-/// Encoding buffer for the SFTP client. Sized for long paths and long name
-/// replies rather than the embedded default.
+/// One encoded request, and the largest reply part that has to be buffered.
 const SFTP_BUF: usize = 8192;
-/// Read/write chunk for file transfers. The client splits this into protocol
-/// sized requests and pipelines them, so a large chunk costs about one round
-/// trip instead of one per request.
+/// Read/write chunk for file transfers. The runner splits this into protocol
+/// sized requests, so a large chunk costs fewer round trips.
 pub const CHUNK: usize = 256 * 1024;
+/// Socket read size.
+const SOCK_BUF: usize = 32 * 1024;
 /// Bound on a buffered capture, so a runaway command cannot exhaust memory.
 const MAX_EXEC_OUTPUT: usize = 64 * 1024 * 1024;
 
-/// A remote file or directory handle, addressed by id so the sync side never
-/// holds a borrow into the connection task.
+/// A remote file or directory handle, addressed by id so callers never hold
+/// the server's opaque bytes.
 pub type HandleId = u64;
 
 /// Metadata for one directory entry, decoupled from sunset's borrowed types.
@@ -98,6 +100,13 @@ pub enum OpenMode {
     Write,
 }
 
+/// Whether a streamed command is given an input pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stdin {
+    Piped,
+    Closed,
+}
+
 /// An error from the remote side.
 ///
 /// `fatal` marks the ones that mean the connection itself is gone, which the
@@ -135,74 +144,6 @@ impl std::error::Error for SshError {}
 
 pub type SshResult<T> = Result<T, SshError>;
 
-type Reply<T> = mpsc::SyncSender<SshResult<T>>;
-
-/// One unit of work for the connection task.
-///
-/// Each carries the sender its result goes back on; the caller blocks on the
-/// matching receiver.
-enum Job {
-    Realpath(String, Reply<String>),
-    Stat {
-        path: String,
-        follow: bool,
-        reply: Reply<FileAttrs>,
-    },
-    SetStat {
-        path: String,
-        attrs: FileAttrs,
-        reply: Reply<()>,
-    },
-    ReadLink(String, Reply<String>),
-    Symlink {
-        target: String,
-        link: String,
-        reply: Reply<()>,
-    },
-    OpenDir(String, Reply<HandleId>),
-    /// One server batch of directory entries. `None` means the listing ended.
-    ReadDir(HandleId, Reply<Option<Vec<DirItem>>>),
-    Open {
-        path: String,
-        mode: OpenMode,
-        reply: Reply<HandleId>,
-    },
-    Read {
-        handle: HandleId,
-        offset: u64,
-        len: usize,
-        reply: Reply<Vec<u8>>,
-    },
-    Write {
-        handle: HandleId,
-        offset: u64,
-        data: Vec<u8>,
-        reply: Reply<()>,
-    },
-    Close(HandleId, Reply<()>),
-    MkDir(String, Reply<()>),
-    RmDir(String, Reply<()>),
-    Remove(String, Reply<()>),
-    Rename {
-        from: String,
-        to: String,
-        reply: Reply<()>,
-    },
-    /// Run a command and capture its output.
-    Exec {
-        cmd: String,
-        reply: Reply<ExecOutput>,
-    },
-    /// Run a command, streaming stdin in and stdout out so a large transfer
-    /// does not have to be buffered whole. The reply carries its stderr.
-    ExecStream {
-        cmd: String,
-        stdin: Option<tmpsc::Receiver<Vec<u8>>>,
-        stdout: tmpsc::Sender<io::Result<Vec<u8>>>,
-        reply: Reply<Vec<u8>>,
-    },
-}
-
 /// Captured result of a command run over exec.
 #[derive(Debug, Clone, Default)]
 pub struct ExecOutput {
@@ -210,150 +151,237 @@ pub struct ExecOutput {
     pub stderr: Vec<u8>,
 }
 
+/// An SFTP reply, with nothing borrowed from the runner.
+#[derive(Debug)]
+enum Reply {
+    Version,
+    Handle(Vec<u8>),
+    Attrs(FileAttrs),
+    Status(StatusCode),
+    Data(usize),
+    NameStart(u32),
+    Name(String, FileAttrs),
+    NameEnd,
+}
+
+impl Reply {
+    /// The status of a request whose only answer is a status.
+    fn into_status(self, what: &str) -> SshResult<()> {
+        match self {
+            Reply::Status(StatusCode::SSH_FX_OK) => Ok(()),
+            Reply::Status(c) => Err(status_err(what, c)),
+            other => Err(SshError::fatal(format!("{what}: unexpected {other:?}"))),
+        }
+    }
+}
+
+/// A status reply is the server refusing one request, not a broken session.
+fn status_err(what: &str, code: StatusCode) -> SshError {
+    SshError::op(format!("{what}: {code:?}"))
+}
+
 /// A live connection to one host.
 ///
-/// Dropping the handle shuts the connection thread down.
+/// Operations take the lock for their duration, so the connection is used by
+/// one caller at a time. That matches how the app already serialises a host's
+/// session, and is what the single set of runners requires.
 pub struct Conn {
-    tx: tmpsc::UnboundedSender<Job>,
+    session: Mutex<Session>,
     alive: Arc<AtomicBool>,
     pub host: String,
     pub home_dir: Option<String>,
 }
 
 impl Conn {
-    /// True while the connection task is still running.
+    /// True until an operation has failed in a way that ends the connection.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
 
-    /// Sends a job and blocks for its reply.
-    fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Job) -> SshResult<T> {
-        // Capacity one, so the connection task never blocks handing a reply
-        // back to a caller that has given up.
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        if self.tx.send(make(reply_tx)).is_err() {
-            self.alive.store(false, Ordering::Relaxed);
+    /// Runs `f` against the locked session, retiring the connection if it
+    /// turns out to be broken.
+    fn with<T>(&self, f: impl FnOnce(&mut Session) -> SshResult<T>) -> SshResult<T> {
+        if !self.is_alive() {
             return Err(SshError::fatal("SSH connection closed"));
         }
-        match reply_rx.recv() {
-            Ok(r) => {
-                if let Err(ref e) = r
-                    && e.fatal
-                {
-                    self.alive.store(false, Ordering::Relaxed);
-                }
-                r
-            }
+        let mut s = match self.session.lock() {
+            Ok(s) => s,
+            // A panic while holding it leaves the runners mid-packet.
             Err(_) => {
                 self.alive.store(false, Ordering::Relaxed);
-                Err(SshError::fatal("SSH connection closed"))
+                return Err(SshError::fatal("SSH session poisoned"));
             }
+        };
+        let r = f(&mut s);
+        if let Err(ref e) = r
+            && e.fatal
+        {
+            self.alive.store(false, Ordering::Relaxed);
         }
+        r
     }
 
     pub fn realpath(&self, path: &str) -> SshResult<String> {
-        self.call(|reply| Job::Realpath(path.to_string(), reply))
-    }
-
-    pub fn stat(&self, path: &str) -> SshResult<FileAttrs> {
-        self.call(|reply| Job::Stat {
-            path: path.to_string(),
-            follow: true,
-            reply,
-        })
-    }
-
-    pub fn lstat(&self, path: &str) -> SshResult<FileAttrs> {
-        self.call(|reply| Job::Stat {
-            path: path.to_string(),
-            follow: false,
-            reply,
-        })
-    }
-
-    pub fn set_stat(&self, path: &str, attrs: FileAttrs) -> SshResult<()> {
-        self.call(|reply| Job::SetStat {
-            path: path.to_string(),
-            attrs,
-            reply,
+        self.with(|s| {
+            s.sftp.realpath(path).map_err(sftp_err)?;
+            s.one_name(&format!("realpath {path}"))
         })
     }
 
     pub fn readlink(&self, path: &str) -> SshResult<String> {
-        self.call(|reply| Job::ReadLink(path.to_string(), reply))
+        self.with(|s| {
+            s.sftp.readlink(path).map_err(sftp_err)?;
+            s.one_name(&format!("readlink {path}"))
+        })
+    }
+
+    pub fn stat(&self, path: &str) -> SshResult<FileAttrs> {
+        self.with(|s| {
+            s.sftp.stat(path).map_err(sftp_err)?;
+            s.attrs_reply(&format!("stat {path}"))
+        })
+    }
+
+    pub fn lstat(&self, path: &str) -> SshResult<FileAttrs> {
+        self.with(|s| {
+            s.sftp.lstat(path).map_err(sftp_err)?;
+            s.attrs_reply(&format!("lstat {path}"))
+        })
+    }
+
+    pub fn set_stat(&self, path: &str, attrs: FileAttrs) -> SshResult<()> {
+        self.with(|s| {
+            let a = Attrs {
+                permissions: attrs.permissions,
+                mtime: attrs.mtime,
+                atime: attrs.mtime,
+                ..Attrs::default()
+            };
+            s.sftp.setstat(path, &a).map_err(sftp_err)?;
+            s.reply()?.into_status(&format!("setstat {path}"))
+        })
     }
 
     pub fn symlink(&self, target: &str, link: &str) -> SshResult<()> {
-        self.call(|reply| Job::Symlink {
-            target: target.to_string(),
-            link: link.to_string(),
-            reply,
+        self.with(|s| {
+            s.sftp.symlink(target, link).map_err(sftp_err)?;
+            s.reply()?.into_status(&format!("symlink {link}"))
+        })
+    }
+
+    pub fn mkdir(&self, path: &str) -> SshResult<()> {
+        self.with(|s| {
+            s.sftp.mkdir(path, &Attrs::default()).map_err(sftp_err)?;
+            s.reply()?.into_status(&format!("mkdir {path}"))
+        })
+    }
+
+    pub fn rmdir(&self, path: &str) -> SshResult<()> {
+        self.with(|s| {
+            s.sftp.rmdir(path).map_err(sftp_err)?;
+            s.reply()?.into_status(&format!("rmdir {path}"))
+        })
+    }
+
+    pub fn remove(&self, path: &str) -> SshResult<()> {
+        self.with(|s| {
+            s.sftp.remove(path).map_err(sftp_err)?;
+            s.reply()?.into_status(&format!("remove {path}"))
+        })
+    }
+
+    pub fn rename(&self, from: &str, to: &str) -> SshResult<()> {
+        self.with(|s| {
+            // Plain rename, which fails rather than replacing an existing
+            // destination. File operations are not meant to clobber.
+            s.sftp.rename(from, to).map_err(sftp_err)?;
+            s.reply()?.into_status(&format!("rename {from}"))
         })
     }
 
     pub fn open_dir(&self, path: &str) -> SshResult<HandleId> {
-        self.call(|reply| Job::OpenDir(path.to_string(), reply))
+        self.with(|s| {
+            s.sftp.opendir(path).map_err(sftp_err)?;
+            let what = format!("opendir {path}");
+            match s.reply()? {
+                Reply::Handle(h) => Ok(s.store_handle(h)),
+                other => Err(handle_err(&what, other)),
+            }
+        })
     }
 
+    /// One server batch of directory entries. `None` means the listing ended.
     pub fn read_dir(&self, handle: HandleId) -> SshResult<Option<Vec<DirItem>>> {
-        self.call(|reply| Job::ReadDir(handle, reply))
+        self.with(|s| {
+            let h = s.handle(handle)?;
+            s.sftp.readdir(&h).map_err(sftp_err)?;
+            let mut items = Vec::new();
+            loop {
+                match s.reply()? {
+                    Reply::NameStart(n) => items.reserve(n as usize),
+                    Reply::Name(name, attrs) => items.push(DirItem { name, attrs }),
+                    Reply::NameEnd => return Ok(Some(items)),
+                    // EOF ends the listing rather than failing it.
+                    Reply::Status(StatusCode::SSH_FX_EOF) => return Ok(None),
+                    Reply::Status(c) => return Err(status_err("readdir", c)),
+                    other => return Err(handle_err("readdir", other)),
+                }
+            }
+        })
     }
 
     pub fn open(&self, path: &str, mode: OpenMode) -> SshResult<HandleId> {
-        self.call(|reply| Job::Open {
-            path: path.to_string(),
-            mode,
-            reply,
+        self.with(|s| {
+            let flags = match mode {
+                OpenMode::Read => pflags::READ,
+                OpenMode::Write => pflags::WRITE | pflags::CREAT | pflags::TRUNC,
+            };
+            s.sftp
+                .open(path, flags, &Attrs::default())
+                .map_err(sftp_err)?;
+            let what = format!("open {path}");
+            match s.reply()? {
+                Reply::Handle(h) => Ok(s.store_handle(h)),
+                other => Err(handle_err(&what, other)),
+            }
         })
     }
 
     pub fn read_at(&self, handle: HandleId, offset: u64, len: usize) -> SshResult<Vec<u8>> {
-        self.call(|reply| Job::Read {
-            handle,
-            offset,
-            len,
-            reply,
-        })
+        self.with(|s| s.read_at(handle, offset, len))
     }
 
     pub fn write_at(&self, handle: HandleId, offset: u64, data: Vec<u8>) -> SshResult<()> {
-        self.call(|reply| Job::Write {
-            handle,
-            offset,
-            data,
-            reply,
-        })
+        self.with(|s| s.write_at(handle, offset, &data))
     }
 
     pub fn close(&self, handle: HandleId) -> SshResult<()> {
-        self.call(|reply| Job::Close(handle, reply))
-    }
-
-    pub fn mkdir(&self, path: &str) -> SshResult<()> {
-        self.call(|reply| Job::MkDir(path.to_string(), reply))
-    }
-
-    pub fn rmdir(&self, path: &str) -> SshResult<()> {
-        self.call(|reply| Job::RmDir(path.to_string(), reply))
-    }
-
-    pub fn remove(&self, path: &str) -> SshResult<()> {
-        self.call(|reply| Job::Remove(path.to_string(), reply))
-    }
-
-    pub fn rename(&self, from: &str, to: &str) -> SshResult<()> {
-        self.call(|reply| Job::Rename {
-            from: from.to_string(),
-            to: to.to_string(),
-            reply,
+        self.with(|s| {
+            let Some(h) = s.handles.remove(&handle) else {
+                // Closing twice is not worth surfacing.
+                return Ok(());
+            };
+            s.sftp.close(&h).map_err(sftp_err)?;
+            s.reply()?.into_status("close")
         })
     }
 
     /// Runs a command, returning its captured output.
     pub fn exec(&self, cmd: &str) -> SshResult<ExecOutput> {
-        self.call(|reply| Job::Exec {
-            cmd: cmd.to_string(),
-            reply,
+        self.with(|s| {
+            let id = s.start_exec(cmd)?;
+            let mut out = ExecOutput::default();
+            loop {
+                let done = s.pump_exec(id)?;
+                let e = s.exec_mut(id)?;
+                out.stdout.append(&mut e.out);
+                out.stderr.append(&mut e.err);
+                if done {
+                    break;
+                }
+            }
+            s.finish_exec(id);
+            Ok(out)
         })
     }
 
@@ -362,48 +390,597 @@ impl Conn {
     /// With [`Stdin::Piped`] the stream is also an [`io::Write`] feeding the
     /// command's input; [`ExecStream::finish_input`] then signals end of input,
     /// which is what `tar xf -` waits for.
-    pub fn exec_stream(&self, cmd: &str, stdin: Stdin) -> SshResult<ExecStream> {
-        let (out_tx, out_rx) = tmpsc::channel(4);
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let (in_tx, in_rx) = match stdin {
-            Stdin::Piped => {
-                let (t, r) = tmpsc::channel(4);
-                (Some(t), Some(r))
-            }
-            Stdin::Closed => (None, None),
-        };
-        let job = Job::ExecStream {
-            cmd: cmd.to_string(),
-            stdin: in_rx,
-            stdout: out_tx,
-            reply: done_tx,
-        };
-        if self.tx.send(job).is_err() {
-            self.alive.store(false, Ordering::Relaxed);
-            return Err(SshError::fatal("SSH connection closed"));
-        }
+    pub fn exec_stream(self: &Arc<Self>, cmd: &str, stdin: Stdin) -> SshResult<ExecStream> {
+        let id = self.with(|s| s.start_exec(cmd))?;
         Ok(ExecStream {
-            stdout: out_rx,
-            stdin: in_tx,
-            done: done_rx,
+            conn: self.clone(),
+            id,
+            stdin,
+            eof: false,
             pending: Vec::new(),
             pos: 0,
         })
     }
 }
 
-/// Whether a streamed command is given an input pipe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stdin {
-    Piped,
-    Closed,
+fn handle_err(what: &str, got: Reply) -> SshError {
+    match got {
+        Reply::Status(c) => status_err(what, c),
+        other => SshError::fatal(format!("{what}: unexpected {other:?}")),
+    }
+}
+
+/// Maps an SFTP-level failure onto our error type. These come from the
+/// protocol machinery rather than the server, so the session is in doubt.
+fn sftp_err(e: sunset_sftp::error::SftpError) -> SshError {
+    SshError::fatal(format!("SFTP: {e}"))
+}
+
+fn ssh_err(e: sunset::Error) -> SshError {
+    SshError::fatal(format!("SSH: {e}"))
+}
+
+/// A command running on its own channel.
+struct Exec {
+    chan: ChanHandle,
+    out: Vec<u8>,
+    err: Vec<u8>,
+    /// Set once the channel will produce nothing more.
+    eof: bool,
+    sent_eof: bool,
+}
+
+/// What a freshly opened channel should be asked to run.
+enum Want {
+    Sftp,
+    Exec(String),
+}
+
+struct Session {
+    sock: TcpStream,
+    ssh: Runner<'static, sunset::Client>,
+    sftp: SftpRunner<SFTP_BUF, SFTP_BUF>,
+    sftp_chan: Option<ChanHandle>,
+    /// Channels opened but not yet answered with their request.
+    wanted: HashMap<u32, Want>,
+    execs: HashMap<u64, Exec>,
+    next_exec: u64,
+    handles: HashMap<HandleId, Vec<u8>>,
+    next_handle: HandleId,
+    /// Socket bytes the SSH runner has not accepted yet.
+    inbuf: Vec<u8>,
+    in_pos: usize,
+    /// Auth material, consumed during the handshake.
+    keys: Vec<SignKey>,
+    /// Signs for any key the agent holds, rather than a file we loaded.
+    #[cfg(unix)]
+    agent: Option<agent::AgentClient>,
+    user: String,
+    host: String,
+    port: u16,
+    authenticated: bool,
+}
+
+impl Session {
+    fn store_handle(&mut self, h: Vec<u8>) -> HandleId {
+        self.next_handle += 1;
+        self.handles.insert(self.next_handle, h);
+        self.next_handle
+    }
+
+    fn handle(&self, id: HandleId) -> SshResult<Vec<u8>> {
+        self.handles
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| SshError::op("stale remote handle"))
+    }
+
+    fn exec_mut(&mut self, id: u64) -> SshResult<&mut Exec> {
+        self.execs
+            .get_mut(&id)
+            .ok_or_else(|| SshError::op("stale exec channel"))
+    }
+
+    // --- transport ---
+
+    /// Pushes everything the SSH runner has queued out to the socket.
+    fn flush(&mut self) -> SshResult<()> {
+        loop {
+            let out = self.ssh.output_buf();
+            if out.is_empty() {
+                return Ok(());
+            }
+            let n = self
+                .sock
+                .write(out)
+                .map_err(|e| SshError::fatal(format!("socket write: {e}")))?;
+            if n == 0 {
+                return Err(SshError::fatal("connection closed while writing"));
+            }
+            self.ssh.consume_output(n);
+        }
+    }
+
+    /// Hands the SSH runner as much of the socket as it will take.
+    ///
+    /// Anything it will not accept yet stays buffered for the next call. The
+    /// runner stops accepting while a payload waits to be collected, so this
+    /// returns instead of looping: only the caller can drain a channel, and
+    /// spinning here would never let it.
+    fn feed(&mut self) -> SshResult<()> {
+        if self.in_pos == self.inbuf.len() {
+            if !self.ssh.is_input_ready() {
+                return Ok(());
+            }
+            let mut buf = [0u8; SOCK_BUF];
+            let n = self
+                .sock
+                .read(&mut buf)
+                .map_err(|e| SshError::fatal(format!("socket read: {e}")))?;
+            if n == 0 {
+                return Err(SshError::fatal("connection closed by peer"));
+            }
+            self.inbuf.clear();
+            self.inbuf.extend_from_slice(&buf[..n]);
+            self.in_pos = 0;
+        }
+        let took = self
+            .ssh
+            .input(&self.inbuf[self.in_pos..])
+            .map_err(ssh_err)?;
+        self.in_pos += took;
+        Ok(())
+    }
+
+    /// Answers auth and channel events until the runner has nothing to say.
+    fn events(&mut self) -> SshResult<()> {
+        loop {
+            // The event borrows the runner, so anything needing the runner
+            // itself is deferred until the borrow ends.
+            let mut open_sftp = false;
+            let mut idle = false;
+            {
+                let ev = self.ssh.progress().map_err(ssh_err)?;
+                match ev {
+                    Event::Cli(CliEvent::Hostkey(h)) => {
+                        let key = h.hostkey().map_err(ssh_err)?;
+                        match knownhosts::verify(&self.host, self.port, &key) {
+                            Ok(()) => h.accept().map_err(ssh_err)?,
+                            Err(e) => {
+                                let _ = h.reject();
+                                return Err(SshError::fatal(e));
+                            }
+                        }
+                    }
+                    Event::Cli(CliEvent::Username(u)) => u.username(&self.user).map_err(ssh_err)?,
+                    // There is no terminal to prompt on, so skip rather than hang.
+                    Event::Cli(CliEvent::Password(p)) => p.skip().map_err(ssh_err)?,
+                    Event::Cli(CliEvent::Pubkey(p)) => {
+                        let r = match self.keys.pop() {
+                            Some(k) => p.pubkey(k),
+                            None => p.skip(),
+                        };
+                        r.map_err(ssh_err)?
+                    }
+                    Event::Cli(CliEvent::AgentSign(req)) => {
+                        #[cfg(unix)]
+                        {
+                            let a = self.agent.as_mut().ok_or_else(|| {
+                                SshError::fatal("agent signature wanted without an agent")
+                            })?;
+                            let key = req.key().map_err(ssh_err)?;
+                            let msg = req.message().map_err(ssh_err)?;
+                            let sig = a.sign_auth(key, &msg).map_err(ssh_err)?;
+                            req.signed(&sig).map_err(ssh_err)?;
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = req;
+                            return Err(SshError::fatal(
+                                "ssh-agent is not supported on this platform",
+                            ));
+                        }
+                    }
+                    Event::Cli(CliEvent::Authenticated) => {
+                        self.authenticated = true;
+                        open_sftp = self.sftp_chan.is_none();
+                    }
+                    Event::Cli(CliEvent::SessionOpened(mut o)) => {
+                        let num = o.channel().0;
+                        match self.wanted.remove(&num) {
+                            Some(Want::Sftp) => o.subsystem("sftp").map_err(ssh_err)?,
+                            Some(Want::Exec(ref cmd)) => o.exec(cmd).map_err(ssh_err)?,
+                            None => (),
+                        }
+                    }
+                    Event::Cli(CliEvent::SessionExit(_)) | Event::Cli(CliEvent::Banner(_)) => (),
+                    Event::Cli(CliEvent::Defunct) => {
+                        return Err(SshError::fatal("SSH connection closed"));
+                    }
+                    Event::Cli(CliEvent::PollAgain) | Event::Progressed => (),
+                    Event::None => idle = true,
+                    Event::Serv(_) => {
+                        return Err(SshError::fatal("server event on a client session"));
+                    }
+                }
+            }
+            if open_sftp {
+                let ch = self.ssh.open_client_session().map_err(ssh_err)?;
+                self.wanted.insert(ch.num().0, Want::Sftp);
+                self.sftp_chan = Some(ch);
+            }
+            if idle {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Moves waiting channel data where it belongs: SFTP replies into the SFTP
+    /// runner, command output into that command's buffers.
+    ///
+    /// Nothing else moves it, and the peer stops sending once the window it
+    /// has given us is unacknowledged, so this has to run every time round.
+    fn drain_channels(&mut self) -> SshResult<()> {
+        // Commands first: their buffers always have room, so this cannot stall.
+        let ids: Vec<u64> = self.execs.keys().copied().collect();
+        for id in ids {
+            let mut buf = [0u8; SOCK_BUF];
+            loop {
+                let read = {
+                    let Session {
+                        ref mut ssh,
+                        ref execs,
+                        ..
+                    } = *self;
+                    let Some(e) = execs.get(&id) else { break };
+                    ssh.read_channel_either(&e.chan, &mut buf)
+                };
+                let (n, dt) = match read {
+                    Ok(v) => v,
+                    Err(sunset::Error::ChannelEOF) => {
+                        self.exec_mut(id)?.eof = true;
+                        break;
+                    }
+                    Err(e) => return Err(ssh_err(e)),
+                };
+                if n == 0 {
+                    // Nothing waiting. `read_channel_either` does not report
+                    // EOF of its own accord, so ask the channel directly:
+                    // without this a finished command never looks finished.
+                    let ended = {
+                        let Session {
+                            ref mut ssh,
+                            ref execs,
+                            ..
+                        } = *self;
+                        execs.get(&id).is_none_or(|e| {
+                            ssh.is_channel_eof(&e.chan) || ssh.is_channel_closed(&e.chan)
+                        })
+                    };
+                    if ended && let Ok(e) = self.exec_mut(id) {
+                        e.eof = true;
+                    }
+                    break;
+                }
+                let e = self.exec_mut(id)?;
+                let sink = match dt {
+                    ChanData::Stderr => &mut e.err,
+                    _ => &mut e.out,
+                };
+                if sink.len() + n <= MAX_EXEC_OUTPUT {
+                    sink.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
+
+        // Then SFTP, filling exactly what the runner asks for next.
+        let Some(chan) = self.sftp_chan.take() else {
+            return Ok(());
+        };
+        let r = (|| -> SshResult<()> {
+            while !self.sftp.has_event() {
+                let dest = self.sftp.input_buf();
+                if dest.is_empty() {
+                    break;
+                }
+                let n = match self.ssh.read_channel(&chan, ChanData::Normal, dest) {
+                    Ok(n) => n,
+                    Err(sunset::Error::ChannelEOF) => {
+                        return Err(SshError::fatal("SFTP channel closed"));
+                    }
+                    Err(e) => return Err(ssh_err(e)),
+                };
+                if n == 0 {
+                    break;
+                }
+                self.sftp.input_done(n).map_err(sftp_err)?;
+            }
+            Ok(())
+        })();
+        self.sftp_chan = Some(chan);
+        r
+    }
+
+    /// Sends whatever the SFTP runner has queued, with `payload` for a write.
+    fn sftp_send(&mut self, payload: &[u8]) -> SshResult<()> {
+        let Some(chan) = self.sftp_chan.take() else {
+            return Err(SshError::fatal("no SFTP channel"));
+        };
+        let r = (|| -> SshResult<()> {
+            loop {
+                let out = self.sftp.output_buf();
+                if out.is_empty() {
+                    break;
+                }
+                let n = self
+                    .ssh
+                    .write_channel(&chan, ChanData::Normal, out)
+                    .map_err(ssh_err)?;
+                if n == 0 {
+                    // The window is full; let the peer catch up.
+                    self.flush()?;
+                    self.feed()?;
+                    self.events()?;
+                    continue;
+                }
+                self.sftp.consume_output(n);
+            }
+            // A write's payload follows its header, straight from the caller.
+            if let Some(len) = self.sftp.send_data() {
+                let mut sent = 0;
+                while sent < len {
+                    let n = self
+                        .ssh
+                        .write_channel(&chan, ChanData::Normal, &payload[sent..len])
+                        .map_err(ssh_err)?;
+                    if n == 0 {
+                        self.flush()?;
+                        self.feed()?;
+                        self.events()?;
+                        continue;
+                    }
+                    sent += n;
+                }
+                self.sftp.data_sent(len);
+            }
+            self.flush()
+        })();
+        self.sftp_chan = Some(chan);
+        r
+    }
+
+    /// Runs the connection until `done` is satisfied.
+    fn pump(&mut self, mut done: impl FnMut(&mut Self) -> SshResult<bool>) -> SshResult<()> {
+        loop {
+            self.events()?;
+            self.drain_channels()?;
+            self.flush()?;
+            if done(self)? {
+                return Ok(());
+            }
+            self.feed()?;
+        }
+    }
+
+    /// Waits for the next SFTP reply.
+    fn reply(&mut self) -> SshResult<Reply> {
+        self.sftp_send(&[])?;
+        self.pump(|s| Ok(s.sftp.has_event()))?;
+        let ev = self
+            .sftp
+            .event()
+            .ok_or_else(|| SshError::fatal("SFTP reply vanished"))?;
+        Ok(match ev {
+            SftpEvent::Version { .. } => Reply::Version,
+            SftpEvent::Handle { handle, .. } => Reply::Handle(handle.to_vec()),
+            SftpEvent::Attrs { attrs, .. } => Reply::Attrs(FileAttrs::from(&attrs)),
+            SftpEvent::Status { code, .. } => Reply::Status(code),
+            SftpEvent::Data { len, .. } => Reply::Data(len),
+            SftpEvent::NameStart { count, .. } => Reply::NameStart(count),
+            SftpEvent::Name {
+                filename, attrs, ..
+            } => Reply::Name(
+                String::from_utf8_lossy(filename).into_owned(),
+                FileAttrs::from(&attrs),
+            ),
+            SftpEvent::NameEnd { .. } => Reply::NameEnd,
+        })
+    }
+
+    /// A reply that should be a single attributes record.
+    fn attrs_reply(&mut self, what: &str) -> SshResult<FileAttrs> {
+        match self.reply()? {
+            Reply::Attrs(a) => Ok(a),
+            other => Err(handle_err(what, other)),
+        }
+    }
+
+    /// A reply that should be a one-entry name list, as realpath and readlink
+    /// both answer.
+    fn one_name(&mut self, what: &str) -> SshResult<String> {
+        let mut found = None;
+        loop {
+            match self.reply()? {
+                Reply::NameStart(_) => (),
+                Reply::Name(n, _) => found = found.or(Some(n)),
+                Reply::NameEnd => {
+                    return found.ok_or_else(|| SshError::op(format!("{what}: no name returned")));
+                }
+                Reply::Status(c) => return Err(status_err(what, c)),
+                other => return Err(handle_err(what, other)),
+            }
+        }
+    }
+
+    // --- file data ---
+
+    fn read_at(&mut self, handle: HandleId, offset: u64, len: usize) -> SshResult<Vec<u8>> {
+        let h = self.handle(handle)?;
+        // One request per call: the runner encodes exactly what is asked for,
+        // and a server may refuse anything past the protocol's packet size.
+        let want = len.min(MAX_READ_LEN as usize) as u32;
+        self.sftp.read(&h, offset, want).map_err(sftp_err)?;
+        match self.reply()? {
+            Reply::Data(n) => {
+                let mut out = vec![0u8; n];
+                self.take_file_data(&mut out)?;
+                Ok(out)
+            }
+            // End of file, reported as a status rather than an empty read.
+            Reply::Status(StatusCode::SSH_FX_EOF) => Ok(Vec::new()),
+            Reply::Status(c) => Err(status_err("read", c)),
+            other => Err(handle_err("read", other)),
+        }
+    }
+
+    /// Takes file data straight off the channel, never through the runner.
+    fn take_file_data(&mut self, dest: &mut [u8]) -> SshResult<()> {
+        let Some(chan) = self.sftp_chan.take() else {
+            return Err(SshError::fatal("no SFTP channel"));
+        };
+        let mut got = 0;
+        let r = (|| -> SshResult<()> {
+            while got < dest.len() {
+                let n = match self
+                    .ssh
+                    .read_channel(&chan, ChanData::Normal, &mut dest[got..])
+                {
+                    Ok(n) => n,
+                    Err(sunset::Error::ChannelEOF) => {
+                        return Err(SshError::fatal("SFTP channel closed mid-transfer"));
+                    }
+                    Err(e) => return Err(ssh_err(e)),
+                };
+                if n == 0 {
+                    self.events()?;
+                    self.flush()?;
+                    self.feed()?;
+                    continue;
+                }
+                got += n;
+            }
+            Ok(())
+        })();
+        self.sftp_chan = Some(chan);
+        r?;
+        self.sftp.data_taken(dest.len());
+        Ok(())
+    }
+
+    fn write_at(&mut self, handle: HandleId, offset: u64, data: &[u8]) -> SshResult<()> {
+        let h = self.handle(handle)?;
+        let mut sent = 0u64;
+        // Split to the largest request a server has to accept; a bigger packet
+        // gets the channel closed rather than an error.
+        for part in data.chunks(MAX_WRITE_LEN as usize) {
+            self.sftp
+                .write(&h, offset + sent, part.len())
+                .map_err(sftp_err)?;
+            self.sftp_send(part)?;
+            self.reply()?.into_status("write")?;
+            sent += part.len() as u64;
+        }
+        Ok(())
+    }
+
+    // --- exec ---
+
+    fn start_exec(&mut self, cmd: &str) -> SshResult<u64> {
+        let ch = self.ssh.open_client_session().map_err(ssh_err)?;
+        self.next_exec += 1;
+        let id = self.next_exec;
+        self.wanted.insert(ch.num().0, Want::Exec(cmd.to_string()));
+        self.execs.insert(
+            id,
+            Exec {
+                chan: ch,
+                out: Vec::new(),
+                err: Vec::new(),
+                eof: false,
+                sent_eof: false,
+            },
+        );
+        // Get the request onto the wire before returning.
+        self.events()?;
+        self.flush()?;
+        Ok(id)
+    }
+
+    /// Runs the connection until the command has output or has finished.
+    /// Returns true once nothing more will arrive.
+    fn pump_exec(&mut self, id: u64) -> SshResult<bool> {
+        let mut done = false;
+        self.pump(|s| {
+            let e = s.exec_mut(id)?;
+            if e.eof {
+                done = true;
+                return Ok(true);
+            }
+            Ok(!e.out.is_empty() || !e.err.is_empty())
+        })?;
+        Ok(done)
+    }
+
+    fn write_exec(&mut self, id: u64, data: &[u8]) -> SshResult<()> {
+        let mut sent = 0;
+        while sent < data.len() {
+            let n = {
+                let Session {
+                    ref mut ssh,
+                    ref execs,
+                    ..
+                } = *self;
+                let e = execs
+                    .get(&id)
+                    .ok_or_else(|| SshError::op("stale exec channel"))?;
+                match ssh.write_channel(&e.chan, ChanData::Normal, &data[sent..]) {
+                    Ok(n) => n,
+                    Err(sunset::Error::ChannelEOF) => {
+                        return Err(SshError::op("command closed its input"));
+                    }
+                    Err(e) => return Err(ssh_err(e)),
+                }
+            };
+            if n == 0 {
+                // The window is full; let the peer catch up.
+                self.flush()?;
+                self.feed()?;
+                self.events()?;
+                self.drain_channels()?;
+                continue;
+            }
+            sent += n;
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn eof_exec(&mut self, id: u64) -> SshResult<()> {
+        let Some(e) = self.execs.get(&id) else {
+            return Ok(());
+        };
+        if e.sent_eof {
+            return Ok(());
+        }
+        let chan = &e.chan;
+        self.ssh.send_channel_eof(chan).map_err(ssh_err)?;
+        self.exec_mut(id)?.sent_eof = true;
+        self.flush()
+    }
+
+    fn finish_exec(&mut self, id: u64) {
+        if let Some(e) = self.execs.remove(&id) {
+            let _ = self.ssh.channel_done(e.chan);
+        }
+    }
 }
 
 /// The local end of a streamed command.
 pub struct ExecStream {
-    stdout: tmpsc::Receiver<io::Result<Vec<u8>>>,
-    stdin: Option<tmpsc::Sender<Vec<u8>>>,
-    done: mpsc::Receiver<SshResult<Vec<u8>>>,
+    conn: Arc<Conn>,
+    id: u64,
+    stdin: Stdin,
+    eof: bool,
     pending: Vec<u8>,
     pos: usize,
 }
@@ -411,41 +988,50 @@ pub struct ExecStream {
 impl ExecStream {
     /// Signals end of input, so a command reading its stdin to EOF can finish.
     pub fn finish_input(&mut self) {
-        self.stdin = None;
+        if self.stdin == Stdin::Piped {
+            let _ = self.conn.with(|s| s.eof_exec(self.id));
+            self.stdin = Stdin::Closed;
+        }
     }
 
     /// Waits for the command to finish, returning whatever it wrote to stderr.
-    ///
-    /// Any stdout still buffered is drained first: the connection task blocks
-    /// while handing output over, so waiting without draining would deadlock.
     pub fn wait(mut self) -> SshResult<Vec<u8>> {
-        self.stdin = None;
-        while let Some(chunk) = self.stdout.blocking_recv() {
-            if matches!(chunk, Ok(ref c) if c.is_empty()) {
-                break;
+        self.finish_input();
+        let id = self.id;
+        self.conn.with(|s| {
+            let mut err = Vec::new();
+            loop {
+                let done = s.pump_exec(id)?;
+                let e = s.exec_mut(id)?;
+                e.out.clear();
+                err.append(&mut e.err);
+                if done {
+                    break;
+                }
             }
-        }
-        self.done
-            .recv()
-            .unwrap_or_else(|_| Err(SshError::fatal("SSH connection closed")))
+            Ok(err)
+        })
     }
 }
 
 impl io::Read for ExecStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         while self.pos == self.pending.len() {
-            match self.stdout.blocking_recv() {
-                Some(Ok(chunk)) => {
-                    self.pending = chunk;
-                    self.pos = 0;
-                    if self.pending.is_empty() {
-                        return Ok(0);
-                    }
-                }
-                Some(Err(e)) => return Err(e),
-                // The task dropped the sender: end of output.
-                None => return Ok(0),
+            if self.eof {
+                return Ok(0);
             }
+            let id = self.id;
+            let (chunk, done) = self
+                .conn
+                .with(|s| {
+                    let done = s.pump_exec(id)?;
+                    let e = s.exec_mut(id)?;
+                    Ok((std::mem::take(&mut e.out), done))
+                })
+                .map_err(io::Error::other)?;
+            self.pending = chunk;
+            self.pos = 0;
+            self.eof = done;
         }
         let n = (self.pending.len() - self.pos).min(buf.len());
         buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
@@ -456,17 +1042,28 @@ impl io::Read for ExecStream {
 
 impl io::Write for ExecStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let tx = self
-            .stdin
-            .as_ref()
-            .ok_or_else(|| io::Error::other("exec stdin is closed"))?;
-        tx.blocking_send(buf.to_vec())
-            .map_err(|_| io::Error::other("exec stdin closed by remote"))?;
+        if self.stdin != Stdin::Piped {
+            return Err(io::Error::other("exec stdin is closed"));
+        }
+        let id = self.id;
+        self.conn
+            .with(|s| s.write_exec(id, buf))
+            .map_err(io::Error::other)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+impl Drop for ExecStream {
+    fn drop(&mut self) {
+        let id = self.id;
+        let _ = self.conn.with(|s| {
+            s.finish_exec(id);
+            Ok(())
+        });
     }
 }
 
@@ -560,653 +1157,123 @@ pub struct ConnectParams {
     pub use_agent: bool,
 }
 
-/// Opens a connection, blocking until authentication completes.
+/// Opens a connection, blocking until the SFTP subsystem is ready.
 pub fn connect(params: ConnectParams) -> SshResult<Conn> {
-    let (job_tx, job_rx) = tmpsc::unbounded_channel::<Job>();
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<SshResult<Option<String>>>(1);
-    let alive = Arc::new(AtomicBool::new(true));
+    let addr = format!("{}:{}", params.hostname, params.port);
+    let sock = TcpStream::connect(&addr)
+        .map_err(|e| SshError::fatal(format!("TCP connect to {addr}: {e}")))?;
+    // SFTP alternates a small request with a large reply. Without this, Nagle
+    // holds each request back until the peer's delayed ACK.
+    let _ = sock.set_nodelay(true);
+    #[cfg(unix)]
+    set_keepalive(&sock);
 
-    let host = params.host.clone();
-    let thread_alive = alive.clone();
-    std::thread::Builder::new()
-        .name(format!("ssh-{host}"))
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(SshError::fatal(format!(
-                        "tokio runtime for {}: {e}",
-                        params.host
-                    ))));
-                    return;
-                }
-            };
-            rt.block_on(run_connection(params, job_rx, ready_tx));
-            thread_alive.store(false, Ordering::Relaxed);
-        })
-        .map_err(|e| SshError::fatal(format!("spawning SSH thread: {e}")))?;
+    let mut session = Session {
+        sock,
+        ssh: Runner::new_client_owned(),
+        sftp: SftpRunner::new(),
+        sftp_chan: None,
+        wanted: HashMap::new(),
+        execs: HashMap::new(),
+        next_exec: 0,
+        handles: HashMap::new(),
+        next_handle: 0,
+        inbuf: Vec::new(),
+        in_pos: 0,
+        keys: Vec::new(),
+        #[cfg(unix)]
+        agent: None,
+        user: params.user,
+        host: params.host.clone(),
+        port: params.port,
+        authenticated: false,
+    };
 
-    let home_dir = ready_rx
-        .recv()
-        .map_err(|_| SshError::fatal("SSH connection thread stopped"))??;
+    session.keys = load_identities(&params.identity_files);
+    // Agent keys are offered first, matching ssh(1).
+    #[cfg(unix)]
+    if params.use_agent {
+        session.agent = load_agent(&mut session.keys);
+    }
+
+    // Handshake, authentication, and the subsystem request.
+    session.pump(|s| Ok(s.sftp_chan.is_some() && s.wanted.is_empty()))?;
+    if !session.authenticated {
+        return Err(SshError::fatal(format!(
+            "Authentication failed for {}@{addr}. Ensure a usable key is \
+             available in ~/.ssh or given by IdentityFile.",
+            session.user
+        )));
+    }
+
+    session.sftp.init().map_err(sftp_err)?;
+    match session.reply()? {
+        Reply::Version => (),
+        other => return Err(handle_err("SFTP handshake", other)),
+    }
+
+    // The remote home directory, if the server will tell us.
+    let home_dir = match session.sftp.realpath(".") {
+        Ok(_) => session.one_name("realpath .").ok(),
+        Err(_) => None,
+    };
 
     Ok(Conn {
-        tx: job_tx,
-        alive,
-        host,
+        session: Mutex::new(session),
+        alive: Arc::new(AtomicBool::new(true)),
+        host: params.host,
         home_dir,
     })
 }
 
-/// What a freshly opened session channel should be asked to run.
-#[derive(Clone, Debug)]
-enum ChanKind {
-    Sftp,
-    Exec(String),
+/// Keeps the OS probing, so a connection dropped by a sleep or a network
+/// change is noticed rather than hanging on a read that never returns.
+#[cfg(unix)]
+fn set_keepalive(sock: &TcpStream) {
+    use std::os::fd::AsRawFd as _;
+    let fd = sock.as_raw_fd();
+    let set = |level: libc::c_int, name: libc::c_int, val: libc::c_int| unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    #[cfg(target_os = "macos")]
+    const KEEPIDLE: libc::c_int = libc::TCP_KEEPALIVE;
+    #[cfg(not(target_os = "macos"))]
+    const KEEPIDLE: libc::c_int = libc::TCP_KEEPIDLE;
+    // Probe after 15s idle, every 5s, giving up after 3 failures.
+    set(libc::IPPROTO_TCP, KEEPIDLE, 15);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
 }
 
-/// A session channel with its stderr half, parked until `SessionOpened`.
-type Opened<'g> = (ChanKind, ChanInOut<'g>, Option<ChanIn<'g>>);
-type Pending<'g> = RefCell<HashMap<u32, Opened<'g>>>;
-type Ready = Cell<Option<mpsc::SyncSender<SshResult<Option<String>>>>>;
-
-async fn run_connection(
-    params: ConnectParams,
-    job_rx: tmpsc::UnboundedReceiver<Job>,
-    ready_tx: mpsc::SyncSender<SshResult<Option<String>>>,
-) {
-    let addr = format!("{}:{}", params.hostname, params.port);
-    let stream = match tokio::net::TcpStream::connect(&addr).await {
-        Ok(s) => s,
+/// Connects to `$SSH_AUTH_SOCK` and appends the keys it holds.
+#[cfg(unix)]
+fn load_agent(keys: &mut Vec<SignKey>) -> Option<agent::AgentClient> {
+    let sock = std::env::var("SSH_AUTH_SOCK").ok()?;
+    let mut a = match agent::AgentClient::new(&sock) {
+        Ok(a) => a,
         Err(e) => {
-            let _ = ready_tx.send(Err(SshError::fatal(format!("TCP connect to {addr}: {e}"))));
-            return;
+            log::warn!("opening ssh-agent at {sock}: {e}");
+            return None;
         }
     };
-    // SFTP alternates a small request with a large reply. Without this, Nagle
-    // holds each request back until the peer's delayed ACK.
-    let _ = stream.set_nodelay(true);
-    let mut stream = stream;
-    let (mut rsock, mut wsock) = stream.split();
-
-    let ssh = SSHClient::new_owned();
-    let ssh_fut = ssh.run_tokio(&mut rsock, &mut wsock);
-
-    let opened: EmbassyChannel<SunsetRawMutex, Opened, 4> = EmbassyChannel::new();
-    let pending: Pending = RefCell::new(HashMap::new());
-    let ready: Ready = Cell::new(Some(ready_tx));
-
-    let session = async {
-        let driver = drive_events(&ssh, &params, &opened, &pending);
-        let worker = serve_jobs(&ssh, &opened, &pending, job_rx, &ready);
-        match select(driver, worker).await {
-            Either::First(r) | Either::Second(r) => r,
+    match a.keys() {
+        // Keys are offered by popping from the end, so the agent's go last.
+        Ok(ks) => {
+            keys.extend(ks);
+            Some(a)
         }
-    };
-
-    let outcome = match select(ssh_fut, session).await {
-        Either::First(Ok(())) => Err(SshError::fatal("SSH connection closed")),
-        Either::First(Err(e)) => Err(SshError::fatal(format!("SSH connection: {e}"))),
-        Either::Second(r) => r,
-    };
-
-    // If we never got as far as reporting readiness, the caller is still
-    // blocked on it.
-    if let Some(tx) = ready.take() {
-        let _ = tx.send(match outcome {
-            Err(e) => Err(e),
-            Ok(()) => Err(SshError::fatal("SSH session ended before authentication")),
-        });
-    }
-}
-
-/// Answers authentication and channel-open events for the life of the session.
-async fn drive_events<'g>(
-    ssh: &'g SSHClient<'static>,
-    params: &ConnectParams,
-    opened: &EmbassyChannel<SunsetRawMutex, Opened<'g>, 4>,
-    pending: &Pending<'g>,
-) -> SshResult<()> {
-    let mut keys = load_identities(&params.identity_files);
-    #[cfg(unix)]
-    let mut agent = if params.use_agent {
-        agent::load(&mut keys).await
-    } else {
-        None
-    };
-
-    loop {
-        let mut ph = ProgressHolder::new();
-        let ev = match ssh.progress(&mut ph).await {
-            Ok(ev) => ev,
-            Err(e) => return Err(SshError::fatal(format!("SSH session: {e}"))),
-        };
-        match ev {
-            CliEvent::Hostkey(h) => {
-                let key = h
-                    .hostkey()
-                    .map_err(|e| SshError::fatal(format!("reading host key: {e}")))?;
-                match knownhosts::verify(&params.host, params.port, &key) {
-                    Ok(()) => h
-                        .accept()
-                        .map_err(|e| SshError::fatal(format!("accepting host key: {e}")))?,
-                    Err(e) => {
-                        let _ = h.reject();
-                        return Err(SshError::fatal(e));
-                    }
-                }
-            }
-            CliEvent::Username(u) => u
-                .username(&params.user)
-                .map_err(|e| SshError::fatal(format!("sending username: {e}")))?,
-            CliEvent::Password(p) => {
-                // There is no terminal to prompt on, so skip rather than hang.
-                p.skip()
-                    .map_err(|e| SshError::fatal(format!("skipping password auth: {e}")))?
-            }
-            CliEvent::Pubkey(p) => {
-                let r = match keys.pop() {
-                    Some(k) => p.pubkey(k),
-                    None => p.skip(),
-                };
-                r.map_err(|e| SshError::fatal(format!("offering public key: {e}")))?
-            }
-            CliEvent::AgentSign(req) => {
-                #[cfg(unix)]
-                {
-                    let a = agent.as_mut().ok_or_else(|| {
-                        SshError::fatal("agent signature requested without an agent")
-                    })?;
-                    let key = req
-                        .key()
-                        .map_err(|e| SshError::fatal(format!("agent key: {e}")))?;
-                    let msg = req
-                        .message()
-                        .map_err(|e| SshError::fatal(format!("agent message: {e}")))?;
-                    let sig = a
-                        .sign_auth(key, &msg)
-                        .await
-                        .map_err(|e| SshError::fatal(format!("agent signing: {e}")))?;
-                    req.signed(&sig)
-                        .map_err(|e| SshError::fatal(format!("agent signature: {e}")))?;
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = req;
-                    return Err(SshError::fatal(
-                        "ssh-agent is not supported on this platform",
-                    ));
-                }
-            }
-            CliEvent::Authenticated => {
-                // Dropped so the client is usable for opening a channel.
-                drop(ph);
-                let (io, err) = ssh
-                    .open_session_nopty()
-                    .await
-                    .map_err(|e| SshError::fatal(format!("opening SFTP channel: {e}")))?;
-                pending
-                    .borrow_mut()
-                    .insert(io.num().0, (ChanKind::Sftp, io, Some(err)));
-            }
-            CliEvent::SessionOpened(mut opener) => {
-                let num = opener.channel().0;
-                let entry = pending.borrow_mut().remove(&num);
-                let Some((kind, io, err)) = entry else {
-                    continue;
-                };
-                let r = match kind {
-                    ChanKind::Sftp => opener.subsystem("sftp"),
-                    ChanKind::Exec(ref cmd) => opener.exec(cmd),
-                };
-                r.map_err(|e| SshError::fatal(format!("channel request: {e}")))?;
-                // Only usable once the request above has been sent.
-                opened.send((kind, io, err)).await;
-            }
-            CliEvent::SessionExit(_) | CliEvent::Banner(_) | CliEvent::PollAgain => (),
-            CliEvent::Defunct => return Err(SshError::fatal("SSH connection closed")),
+        Err(e) => {
+            log::warn!("listing ssh-agent keys: {e}");
+            None
         }
     }
-}
-
-/// Runs the SFTP subsystem and serves jobs until the handle is dropped.
-async fn serve_jobs<'g>(
-    ssh: &'g SSHClient<'static>,
-    opened: &EmbassyChannel<SunsetRawMutex, Opened<'g>, 4>,
-    pending: &Pending<'g>,
-    mut job_rx: tmpsc::UnboundedReceiver<Job>,
-    ready: &Ready,
-) -> SshResult<()> {
-    let (_kind, io, err) = opened.receive().await;
-    let (rx, tx) = io.split();
-    let mut client: SftpClient<_, _, SFTP_BUF> = SftpClient::new(rx, tx);
-
-    let work = async {
-        client
-            .init()
-            .await
-            .map_err(|e| SshError::fatal(format!("SFTP handshake: {e}")))?;
-
-        let mut buf = [0u8; SFTP_BUF];
-        let home = client
-            .realpath(".", &mut buf)
-            .await
-            .ok()
-            .map(|p| String::from_utf8_lossy(p).into_owned());
-
-        if let Some(tx) = ready.take() {
-            let _ = tx.send(Ok(home));
-        }
-
-        let mut state = Handles::default();
-        while let Some(job) = job_rx.recv().await {
-            run_job(&mut client, ssh, opened, pending, job, &mut state).await;
-        }
-        // Every handle dropped: the app is done with this host.
-        Ok(())
-    };
-
-    // The subsystem's stderr still has to be drained or the session stalls.
-    match select(work, drain(err)).await {
-        Either::First(r) => r,
-        Either::Second(_) => Err(SshError::fatal("SFTP channel closed")),
-    }
-}
-
-/// Open remote handles, keyed by the id the sync side holds.
-#[derive(Default)]
-struct Handles {
-    map: HashMap<HandleId, RemoteHandle>,
-    next: HandleId,
-}
-
-impl Handles {
-    fn insert(&mut self, h: RemoteHandle) -> HandleId {
-        self.next += 1;
-        self.map.insert(self.next, h);
-        self.next
-    }
-
-    fn get(&self, id: HandleId) -> SshResult<&RemoteHandle> {
-        self.map
-            .get(&id)
-            .ok_or_else(|| SshError::op("stale remote handle"))
-    }
-}
-
-/// Maps an SFTP-level failure onto our error type.
-///
-/// Anything that is not a status reply from the server means the transport is
-/// in doubt, so it is reported as fatal and the session gets torn down.
-fn sftp_err(op: &str, e: sunset_sftp::error::SftpError) -> SshError {
-    use sunset_sftp::error::SftpError;
-    let message = format!("{op}: {e}");
-    match e {
-        // A status reply is the server refusing this one request (no such
-        // file, permission denied); the session itself is fine.
-        SftpError::FileServerError(_) | SftpError::NoRoom | SftpError::BadHandle => {
-            SshError::op(message)
-        }
-        // Anything else means the transport or the protocol state is in doubt.
-        _ => SshError::fatal(message),
-    }
-}
-
-async fn run_job<'g, R, W>(
-    client: &mut SftpClient<R, W, SFTP_BUF>,
-    ssh: &'g SSHClient<'static>,
-    opened: &EmbassyChannel<SunsetRawMutex, Opened<'g>, 4>,
-    pending: &Pending<'g>,
-    job: Job,
-    state: &mut Handles,
-) where
-    R: sunset_sftp::embedded_io_async::Read,
-    W: sunset_sftp::embedded_io_async::Write,
-{
-    match job {
-        Job::Realpath(path, reply) => {
-            let mut buf = [0u8; SFTP_BUF];
-            let r = client
-                .realpath(&path, &mut buf)
-                .await
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .map_err(|e| sftp_err(&format!("realpath {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::Stat {
-            path,
-            follow,
-            reply,
-        } => {
-            let r = if follow {
-                client.stat(&path).await
-            } else {
-                client.lstat(&path).await
-            };
-            let r = r
-                .map(|a| FileAttrs::from(&a))
-                .map_err(|e| sftp_err(&format!("stat {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::SetStat { path, attrs, reply } => {
-            let a = Attrs {
-                permissions: attrs.permissions,
-                mtime: attrs.mtime,
-                atime: attrs.mtime,
-                ..Attrs::default()
-            };
-            let r = client
-                .setstat(&path, &a)
-                .await
-                .map_err(|e| sftp_err(&format!("setstat {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::ReadLink(path, reply) => {
-            let mut buf = [0u8; SFTP_BUF];
-            let r = client
-                .readlink(&path, &mut buf)
-                .await
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .map_err(|e| sftp_err(&format!("readlink {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::Symlink {
-            target,
-            link,
-            reply,
-        } => {
-            let r = client
-                .symlink(&target, &link)
-                .await
-                .map_err(|e| sftp_err(&format!("symlink {link}"), e));
-            let _ = reply.send(r);
-        }
-        Job::OpenDir(path, reply) => {
-            let r = client
-                .opendir(&path)
-                .await
-                .map(|h| state.insert(h))
-                .map_err(|e| sftp_err(&format!("opendir {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::ReadDir(id, reply) => {
-            let r = read_dir_batch(client, state, id).await;
-            let _ = reply.send(r);
-        }
-        Job::Open { path, mode, reply } => {
-            let r = match mode {
-                OpenMode::Read => client.open_read(&path).await,
-                OpenMode::Write => client.create(&path).await,
-            };
-            let r = r
-                .map(|h| state.insert(h))
-                .map_err(|e| sftp_err(&format!("open {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::Read {
-            handle,
-            offset,
-            len,
-            reply,
-        } => {
-            let r = match state.get(handle) {
-                Ok(h) => {
-                    let mut buf = vec![0u8; len.min(CHUNK)];
-                    match client.read(h, offset, &mut buf).await {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Ok(buf)
-                        }
-                        Err(e) => Err(sftp_err("read", e)),
-                    }
-                }
-                Err(e) => Err(e),
-            };
-            let _ = reply.send(r);
-        }
-        Job::Write {
-            handle,
-            offset,
-            data,
-            reply,
-        } => {
-            let r = match state.get(handle) {
-                Ok(h) => client
-                    .write(h, offset, &data)
-                    .await
-                    .map_err(|e| sftp_err("write", e)),
-                Err(e) => Err(e),
-            };
-            let _ = reply.send(r);
-        }
-        Job::Close(id, reply) => {
-            let r = match state.map.remove(&id) {
-                Some(h) => client.close(&h).await.map_err(|e| sftp_err("close", e)),
-                // Already gone: closing twice is not an error worth surfacing.
-                None => Ok(()),
-            };
-            let _ = reply.send(r);
-        }
-        Job::MkDir(path, reply) => {
-            let r = client
-                .mkdir(&path, &Attrs::default())
-                .await
-                .map_err(|e| sftp_err(&format!("mkdir {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::RmDir(path, reply) => {
-            let r = client
-                .rmdir(&path)
-                .await
-                .map_err(|e| sftp_err(&format!("rmdir {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::Remove(path, reply) => {
-            let r = client
-                .remove(&path)
-                .await
-                .map_err(|e| sftp_err(&format!("remove {path}"), e));
-            let _ = reply.send(r);
-        }
-        Job::Rename { from, to, reply } => {
-            // posix-rename replaces the destination, which is what the app
-            // expects of a move. Fall back where the server lacks it.
-            let r = if client.extensions().posix_rename {
-                client.posix_rename(&from, &to).await
-            } else {
-                client.rename(&from, &to).await
-            };
-            let _ = reply.send(r.map_err(|e| sftp_err(&format!("rename {from}"), e)));
-        }
-        Job::Exec { cmd, reply } => {
-            let r = exec_capture(ssh, opened, pending, &cmd).await;
-            let _ = reply.send(r);
-        }
-        Job::ExecStream {
-            cmd,
-            stdin,
-            stdout,
-            reply,
-        } => {
-            let r = exec_stream(ssh, opened, pending, &cmd, stdin, stdout.clone()).await;
-            if let Err(ref e) = r {
-                // Surface it on the reader too, which may be blocked on it.
-                let _ = stdout.send(Err(io::Error::other(e.message.clone()))).await;
-            }
-            let _ = reply.send(r);
-        }
-    }
-}
-
-async fn read_dir_batch<R, W>(
-    client: &mut SftpClient<R, W, SFTP_BUF>,
-    state: &Handles,
-    id: HandleId,
-) -> SshResult<Option<Vec<DirItem>>>
-where
-    R: sunset_sftp::embedded_io_async::Read,
-    W: sunset_sftp::embedded_io_async::Write,
-{
-    let handle = state.get(id)?;
-    let Some(mut entries) = client
-        .readdir(handle)
-        .await
-        .map_err(|e| sftp_err("readdir", e))?
-    else {
-        return Ok(None);
-    };
-    let mut out = Vec::new();
-    while let Some(e) = entries
-        .next()
-        .await
-        .map_err(|e| sftp_err("readdir entry", e))?
-    {
-        out.push(DirItem {
-            name: String::from_utf8_lossy(e.filename()).into_owned(),
-            attrs: FileAttrs::from(e.attrs()),
-        });
-    }
-    Ok(Some(out))
-}
-
-/// Opens a channel and asks the progress loop to run `cmd` on it.
-async fn start_exec<'g>(
-    ssh: &'g SSHClient<'static>,
-    opened: &EmbassyChannel<SunsetRawMutex, Opened<'g>, 4>,
-    pending: &Pending<'g>,
-    cmd: &str,
-) -> SshResult<(ChanInOut<'g>, Option<ChanIn<'g>>)> {
-    let (io, err) = ssh
-        .open_session_nopty()
-        .await
-        .map_err(|e| SshError::fatal(format!("opening exec channel: {e}")))?;
-    pending
-        .borrow_mut()
-        .insert(io.num().0, (ChanKind::Exec(cmd.to_string()), io, Some(err)));
-    let (_kind, io, err) = opened.receive().await;
-    Ok((io, err))
-}
-
-async fn exec_capture<'g>(
-    ssh: &'g SSHClient<'static>,
-    opened: &EmbassyChannel<SunsetRawMutex, Opened<'g>, 4>,
-    pending: &Pending<'g>,
-    cmd: &str,
-) -> SshResult<ExecOutput> {
-    let (io, err) = start_exec(ssh, opened, pending, cmd).await?;
-    let (rx, _tx) = io.split();
-    // Both halves have to be read concurrently: the peer can fill either pipe,
-    // and a full one blocks the whole session, not just that stream.
-    let (stdout, stderr) = embassy_futures::join::join(read_to_end(rx), drain(err)).await;
-    Ok(ExecOutput { stdout, stderr })
-}
-
-async fn exec_stream<'g>(
-    ssh: &'g SSHClient<'static>,
-    opened: &EmbassyChannel<SunsetRawMutex, Opened<'g>, 4>,
-    pending: &Pending<'g>,
-    cmd: &str,
-    stdin: Option<tmpsc::Receiver<Vec<u8>>>,
-    stdout: tmpsc::Sender<io::Result<Vec<u8>>>,
-) -> SshResult<Vec<u8>> {
-    use sunset_sftp::embedded_io_async::Write as _;
-
-    let (io, err) = start_exec(ssh, opened, pending, cmd).await?;
-    let (mut rx, mut tx) = io.split();
-
-    let feed = async {
-        if let Some(mut stdin) = stdin {
-            while let Some(chunk) = stdin.recv().await {
-                if tx.write_all(&chunk).await.is_err() {
-                    break;
-                }
-            }
-            let _ = tx.flush().await;
-            // Without this a command reading its input to EOF never returns.
-            // The channel stays readable, so it can still reply and exit.
-            let _ = tx.send_eof().await;
-        }
-        core::future::pending::<()>().await
-    };
-
-    let pump = async {
-        let mut b = vec![0u8; CHUNK];
-        let mut wanted = true;
-        loop {
-            match rx.read(&mut b).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if wanted && stdout.send(Ok(b[..n].to_vec())).await.is_err() {
-                        // The reader gave up early. Keep draining anyway: an
-                        // abandoned channel with unread data never closes, and
-                        // then nothing else on this connection can proceed.
-                        wanted = false;
-                    }
-                }
-                // A closed channel is a normal end of output.
-                Err(_) => break,
-            }
-        }
-        // Signals EOF to the blocking reader.
-        let _ = stdout.send(Ok(Vec::new())).await;
-    };
-
-    // stderr is read alongside so it can never stall the session, but it is
-    // not something to wait for: it only reaches EOF once the channel closes,
-    // which is what `pump` is already detecting.
-    let collected = RefCell::new(Vec::new());
-    let watch_stderr = async {
-        if let Some(mut e) = err {
-            let mut b = [0u8; 4096];
-            loop {
-                match e.read(&mut b).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut c = collected.borrow_mut();
-                        if c.len() + n <= MAX_EXEC_OUTPUT {
-                            c.extend_from_slice(&b[..n]);
-                        }
-                    }
-                }
-            }
-        }
-        core::future::pending::<()>().await
-    };
-
-    // Only `pump` ever completes; the other two park once their work is done.
-    match select(pump, select(watch_stderr, feed)).await {
-        Either::First(()) | Either::Second(_) => (),
-    }
-    Ok(collected.into_inner())
-}
-
-async fn drain(r: Option<impl sunset_sftp::embedded_io_async::Read>) -> Vec<u8> {
-    match r {
-        Some(r) => read_to_end(r).await,
-        // No stderr half: never completes, so it loses every select race.
-        None => core::future::pending().await,
-    }
-}
-
-async fn read_to_end(mut r: impl sunset_sftp::embedded_io_async::Read) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut b = [0u8; 4096];
-    loop {
-        match r.read(&mut b).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if out.len() + n <= MAX_EXEC_OUTPUT {
-                    out.extend_from_slice(&b[..n]);
-                }
-            }
-            // A closed channel is a normal end of output.
-            Err(_) => break,
-        }
-    }
-    out
 }
 
 fn load_identities(paths: &[String]) -> Vec<SignKey> {
@@ -1223,35 +1290,4 @@ fn load_identities(paths: &[String]) -> Vec<SignKey> {
     // Keys are offered by popping from the end, so restore the caller's order.
     keys.reverse();
     keys
-}
-
-#[cfg(unix)]
-mod agent {
-    use sunset::SignKey;
-    use sunset_stdasync::AgentClient;
-
-    /// Loads agent keys, appending them to the keys that will be offered.
-    pub async fn load(keys: &mut Vec<SignKey>) -> Option<AgentClient> {
-        let sock = std::env::var("SSH_AUTH_SOCK").ok()?;
-        let mut agent = match AgentClient::new(sock).await {
-            Ok(a) => a,
-            Err(e) => {
-                log::warn!("opening ssh-agent: {e}");
-                return None;
-            }
-        };
-        match agent.keys().await {
-            Ok(ks) => {
-                // Agent keys are offered first, matching ssh(1).
-                for k in ks {
-                    keys.push(k);
-                }
-                Some(agent)
-            }
-            Err(e) => {
-                log::warn!("listing ssh-agent keys: {e}");
-                None
-            }
-        }
-    }
 }
