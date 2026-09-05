@@ -1167,6 +1167,22 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
         if !removed.is_empty() {
             std::thread::spawn(move || drop(removed));
         }
+        // A dropped session invalidates every listing we cached from that
+        // host before the disconnect. Purge the ancestor caches for the
+        // reconnected hosts on both panels so navigating back triggers a
+        // fresh remote listing instead of restoring stale entries.
+        let stale_hosts: std::collections::HashSet<String> = reconnect_panels
+            .iter()
+            .map(|(_, host, _)| host.clone())
+            .collect();
+        for side in [core::ActivePanel::Left, core::ActivePanel::Right] {
+            let browser = app.panel_mut(side).browser_mut();
+            browser.parent_cache.retain(|cached| {
+                !stale_hosts
+                    .iter()
+                    .any(|host| cached.current_path.starts_with(format!("/sftp/{host}")))
+            });
+        }
         // Automatically reconnect panels that had stale sessions.
         for (side, host, path) in reconnect_panels {
             navigate_sftp(app, &host, &path, side);
