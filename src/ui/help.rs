@@ -19,6 +19,7 @@ pub fn draw_help(
             ("Enter", "Open"),
             ("Shift+Enter", "Open with system default app"),
             ("Ctrl+Shift+O", "Reveal in file manager"),
+            ("Right-click", "Context menu"),
             ("Tab", "Switch panels"),
             ("Ctrl+T", "New tab"),
             ("Ctrl+W", "Close tab"),

@@ -308,6 +308,18 @@ fn draw_file_icon(
     }
 }
 
+/// An action chosen from a row's right-click context menu, dispatched after the
+/// panel finishes drawing (the menu closure can't borrow `app`).
+#[derive(Clone, Copy)]
+enum RowAction {
+    Open,
+    OpenWith,
+    Reveal,
+    Properties,
+    CopyPath,
+    Trash,
+}
+
 pub fn draw_panel(
     ui: &mut egui::Ui,
     app: &mut app_state::AppState,
@@ -373,6 +385,7 @@ pub fn draw_panel(
     let mut rows = 10usize;
     let mut clicked_index: Option<usize> = None;
     let mut open_on_double_click = false;
+    let mut context_action: Option<(usize, RowAction)> = None;
     let mut new_top_index: Option<usize> = None;
     let panel_side_for_closure = panel_side;
 
@@ -775,6 +788,49 @@ pub fn draw_panel(
                                             egui::Vec2::new(ui.available_width(), ROW_HEIGHT),
                                             egui::Sense::click(),
                                         );
+                                        // Right-click context menu (skipped for ".."). Items that
+                                        // need a local path are hidden for remote / in-archive rows.
+                                        if entry.name != ".." {
+                                            let is_fs = matches!(
+                                                entry.location,
+                                                core::EntryLocation::Fs(_)
+                                            );
+                                            response.context_menu(|ui| {
+                                                if ui.button("Open").clicked() {
+                                                    context_action = Some((idx, RowAction::Open));
+                                                    ui.close();
+                                                }
+                                                if ui.button("Open with default app").clicked() {
+                                                    context_action = Some((idx, RowAction::OpenWith));
+                                                    ui.close();
+                                                }
+                                                if is_fs {
+                                                    if ui.button("Reveal in file manager").clicked() {
+                                                        context_action =
+                                                            Some((idx, RowAction::Reveal));
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Properties").clicked() {
+                                                        context_action =
+                                                            Some((idx, RowAction::Properties));
+                                                        ui.close();
+                                                    }
+                                                }
+                                                if ui.button("Copy path").clicked() {
+                                                    context_action =
+                                                        Some((idx, RowAction::CopyPath));
+                                                    ui.close();
+                                                }
+                                                if is_fs {
+                                                    ui.separator();
+                                                    if ui.button("Move to Trash").clicked() {
+                                                        context_action =
+                                                            Some((idx, RowAction::Trash));
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
+                                        }
                                         ui.painter().rect_filled(
                                             rect,
                                             egui::CornerRadius::same(3),
@@ -1122,6 +1178,19 @@ pub fn draw_panel(
         app.select_entry(idx, rows);
         if open_on_double_click {
             open_selected(app);
+        }
+    }
+
+    if let Some((idx, action)) = context_action {
+        app.active_panel = panel_side;
+        app.select_entry(idx, rows);
+        match action {
+            RowAction::Open => open_selected(app),
+            RowAction::OpenWith => crate::input::open_selected_external(app),
+            RowAction::Reveal => crate::input::reveal_selected_in_file_manager(app),
+            RowAction::Properties => crate::input::show_properties_of_selected(app),
+            RowAction::CopyPath => crate::input::copy_selected_paths(app, ui.ctx()),
+            RowAction::Trash => crate::input::trash_selected(app),
         }
     }
 

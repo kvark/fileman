@@ -208,6 +208,221 @@ fn path_to_file_uri(path: &Path) -> String {
     uri
 }
 
+/// The active panel's selected entry, or `None` when the list is empty.
+fn active_selected_entry(app: &app_state::AppState) -> Option<core::DirEntry> {
+    let browser = app.get_active_panel().browser();
+    browser.entries.get(browser.selected_index).cloned()
+}
+
+/// Show the desktop's own "properties" window for the selected local entry.
+pub(crate) fn show_properties_of_selected(app: &mut app_state::AppState) {
+    if !app.allow_external_open {
+        return;
+    }
+    if let Some(core::DirEntry {
+        location: core::EntryLocation::Fs(path),
+        ..
+    }) = active_selected_entry(app)
+        && let Err(err) = show_properties(&path)
+    {
+        app.record_error("properties", err.to_string());
+    }
+}
+
+/// Move the selected local entry to the desktop trash (recoverable), then
+/// reload the panel so the row disappears.
+pub(crate) fn trash_selected(app: &mut app_state::AppState) {
+    let panel = app.active_panel;
+    let Some(entry) = active_selected_entry(app) else {
+        return;
+    };
+    if entry.name == ".." {
+        return;
+    }
+    if let core::EntryLocation::Fs(path) = entry.location {
+        match move_to_trash(&path) {
+            Ok(()) => crate::reload_panel(app, panel),
+            Err(err) => app.record_error("trash", err.to_string()),
+        }
+    }
+}
+
+/// Copy the paths of the marked-or-selected entries to the clipboard.
+pub(crate) fn copy_selected_paths(app: &app_state::AppState, ctx: &egui::Context) {
+    if let Some(text) = build_selected_paths(app) {
+        ctx.copy_text(text);
+    }
+}
+
+fn show_properties(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // The file manager's own properties window, via freedesktop D-Bus.
+        let uri = path_to_file_uri(path);
+        std::process::Command::new("dbus-send")
+            .args([
+                "--session",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItemProperties",
+                &format!("array:string:{uri}"),
+                "string:",
+            ])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("D-Bus ShowItemProperties failed: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Finder\"\nactivate\nopen information window of (POSIX file \"{}\" as alias)\nend tell",
+            applescript_escape(path)
+        );
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Finder Get Info failed: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        shell_properties_dialog(path)?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+fn move_to_trash(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("gio")
+            .arg("trash")
+            .arg(path)
+            .status()
+            .map_err(|e| anyhow::anyhow!("gio trash failed to start: {e}"))?;
+        if !status.success() {
+            anyhow::bail!("could not trash {}", path.display());
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Finder\" to delete POSIX file \"{}\"",
+            applescript_escape(path)
+        );
+        let status = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status()
+            .map_err(|e| anyhow::anyhow!("osascript failed to start: {e}"))?;
+        if !status.success() {
+            anyhow::bail!("could not trash {}", path.display());
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Send to the Recycle Bin via the VisualBasic FileSystem helper — no
+        // extra crate, no FFI.
+        let quoted = path.display().to_string().replace('\'', "''");
+        let func = if path.is_dir() {
+            "DeleteDirectory"
+        } else {
+            "DeleteFile"
+        };
+        let script = format!(
+            "Add-Type -AssemblyName Microsoft.VisualBasic; \
+             [Microsoft.VisualBasic.FileIO.FileSystem]::{func}('{quoted}','OnlyErrorDialogs','SendToRecycleBin')"
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .map_err(|e| anyhow::anyhow!("powershell failed to start: {e}"))?;
+        if !status.success() {
+            anyhow::bail!("could not trash {}", path.display());
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+/// Escape a path for embedding inside an AppleScript double-quoted string.
+#[cfg(target_os = "macos")]
+fn applescript_escape(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Invoke the Windows shell "properties" dialog for `path`.
+#[cfg(target_os = "windows")]
+fn shell_properties_dialog(path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::ptr;
+
+    #[repr(C)]
+    #[allow(non_snake_case, clippy::upper_case_acronyms)]
+    struct SHELLEXECUTEINFOW {
+        cbSize: u32,
+        fMask: u32,
+        hwnd: *mut std::ffi::c_void,
+        lpVerb: *const u16,
+        lpFile: *const u16,
+        lpParameters: *const u16,
+        lpDirectory: *const u16,
+        nShow: i32,
+        hInstApp: *mut std::ffi::c_void,
+        lpIDList: *mut std::ffi::c_void,
+        lpClass: *const u16,
+        hkeyClass: *mut std::ffi::c_void,
+        dwHotKey: u32,
+        hIcon: *mut std::ffi::c_void,
+        hProcess: *mut std::ffi::c_void,
+    }
+
+    unsafe extern "system" {
+        fn ShellExecuteExW(pExecInfo: *mut SHELLEXECUTEINFOW) -> i32;
+    }
+
+    // The "properties" verb needs the id-list flag to open the dialog.
+    const SEE_MASK_INVOKEIDLIST: u32 = 0x0000000C;
+    const SW_SHOW: i32 = 5;
+
+    let to_wide = |s: &std::ffi::OsStr| -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let verb = to_wide(std::ffi::OsStr::new("properties"));
+    let file = to_wide(path.as_os_str());
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST,
+        hwnd: ptr::null_mut(),
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        lpParameters: ptr::null(),
+        lpDirectory: ptr::null(),
+        nShow: SW_SHOW,
+        hInstApp: ptr::null_mut(),
+        lpIDList: ptr::null_mut(),
+        lpClass: ptr::null(),
+        hkeyClass: ptr::null_mut(),
+        dwHotKey: 0,
+        hIcon: ptr::null_mut(),
+        hProcess: ptr::null_mut(),
+    };
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    if ok == 0 {
+        anyhow::bail!("could not open properties for {}", path.display());
+    }
+    Ok(())
+}
+
 fn open_selected_from_to(
     app: &mut app_state::AppState,
     source: core::ActivePanel,
@@ -1485,7 +1700,7 @@ fn handle_inline_rename(app: &mut app_state::AppState, input: &egui::InputState)
 
 /// Build the clipboard text for "copy path" — all marked entries (one per line)
 /// or just the current selection if nothing is marked. `..` is always skipped.
-fn build_selected_paths(app: &app_state::AppState) -> Option<String> {
+pub(crate) fn build_selected_paths(app: &app_state::AppState) -> Option<String> {
     let panel = app.panel(app.active_panel);
     let browser = panel.browser();
     let format_entry = |entry: &core::DirEntry| -> Option<String> {
