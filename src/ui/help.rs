@@ -18,6 +18,7 @@ pub fn draw_help(
         let shortcuts = [
             ("Enter", "Open"),
             ("Shift+Enter", "Open with system default app"),
+            ("Ctrl+Shift+O", "Reveal in file manager"),
             ("Tab", "Switch panels"),
             ("Ctrl+T", "New tab"),
             ("Ctrl+W", "Close tab"),
