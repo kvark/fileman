@@ -1,0 +1,21 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    (key: "select:out"),
+    // Mark "out" and "binary.bin" going down; land on "source.txt".
+    (key: "Down", modifiers: ["Shift"]),
+    (key: "Down", modifiers: ["Shift"]),
+    // Reverse: Shift+Up toggles "source.txt" (marks it) and steps to "binary.bin".
+    (key: "Up", modifiers: ["Shift"]),
+    // Shift+Up toggles "binary.bin" OFF and steps to "out".
+    (key: "Up", modifiers: ["Shift"]),
+  ],
+  asserts: (
+    left_panel: Some((
+      selected: Some("out"),
+      // out (down pass) + source.txt (up pass) marked; binary.bin toggled back off.
+      marked: ["out", "source.txt"],
+    )),
+  ),
+)
