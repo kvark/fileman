@@ -1045,10 +1045,14 @@ fn apply_dir_batch(browser: &mut app_state::BrowserState, batch: core::DirBatch)
             browser.selected_index = 0;
             // loading flag stays true — cleared when the channel disconnects
         }
-        core::DirBatch::ConnectionError(message) => {
-            // Treat identically to Error for display purposes; session eviction is
-            // handled separately in pump_async.
-            apply_dir_batch(browser, core::DirBatch::Error(message));
+        core::DirBatch::ConnectionError(_message) => {
+            // A dropped session is usually transient (sleep, roaming Wi-Fi).
+            // Keep the last-known listing on screen instead of replacing it with
+            // an error, and just stop the spinner. pump_async evicts the session
+            // and auto-reconnects, refreshing this directory in place; a genuine
+            // failure is surfaced only if that reconnect can't re-establish the
+            // session (see the SFTP connect-result handler).
+            browser.load.finish();
             return;
         }
     }
@@ -1374,8 +1378,21 @@ fn pump_async(app: &mut app_state::AppState) -> bool {
                 }
             }
             Err(msg) => {
-                app.sftp_pending_nav = None;
-                app.record_error("sftp", msg);
+                let pending = app.sftp_pending_nav.take();
+                app.record_error("sftp", msg.clone());
+                // The listing was preserved when the session dropped. If this
+                // panel is still showing that remote host, the reconnect just
+                // failed for real — surface the error in the panel now. A failed
+                // fresh connect from a local view only needs the log entry.
+                if let Some((fail_host, _path, panel)) = pending {
+                    let browser = app.panel_mut(panel).browser_mut();
+                    if matches!(
+                        &browser.browser_mode,
+                        core::BrowserMode::Remote { host, .. } if *host == fail_host
+                    ) {
+                        apply_dir_batch(browser, core::DirBatch::Error(msg));
+                    }
+                }
                 // Continue with next queued navigation despite error
                 if let Some((next_host, next_path, next_panel)) = app.sftp_nav_queue.pop_front() {
                     navigate_sftp(app, &next_host, &next_path, next_panel);
@@ -5238,4 +5255,79 @@ fn main() -> anyhow::Result<()> {
         .run_app(&mut app)
         .map_err(|e| anyhow::anyhow!(e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote_browser(names: &[&str]) -> app_state::BrowserState {
+        let entries = names
+            .iter()
+            .map(|name| core::DirEntry {
+                name: (*name).to_string(),
+                is_dir: false,
+                is_symlink: false,
+                link_target: None,
+                location: core::EntryLocation::Remote {
+                    host: "h".to_string(),
+                    path: format!("/{name}"),
+                },
+                size: None,
+                modified: None,
+            })
+            .collect();
+        app_state::BrowserState {
+            browser_mode: core::BrowserMode::Remote {
+                host: "h".to_string(),
+                path: "/dir".to_string(),
+            },
+            current_path: PathBuf::from("/sftp/h/dir"),
+            selected_index: 1,
+            entries,
+            load: app_state::LoadState::Idle,
+            progress_override: None,
+            prefer_select_name: None,
+            top_index: 0,
+            container_root: None,
+            dir_token: 0,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
+            inline_rename: None,
+            sort_mode: core::SortMode::Name,
+            sort_desc: false,
+            watching_archive: None,
+            index_last_seen: 0,
+            marked: std::collections::HashSet::new(),
+            parent_cache: Vec::new(),
+        }
+    }
+
+    // A dropped session must keep the last-known listing on screen so the user
+    // isn't bounced to an error page mid-navigation; the auto-reconnect then
+    // refreshes it in place.
+    #[test]
+    fn connection_error_preserves_the_listing() {
+        let mut browser = remote_browser(&["a.txt", "b.txt", "c.txt"]);
+        apply_dir_batch(
+            &mut browser,
+            core::DirBatch::ConnectionError("timed out".to_string()),
+        );
+        let names: Vec<&str> = browser.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "b.txt", "c.txt"]);
+        assert!(!browser.load.is_loading());
+    }
+
+    // A hard listing error (e.g. permission denied) is different: it replaces
+    // the listing with a single error row, so the failure is visible.
+    #[test]
+    fn hard_error_replaces_the_listing() {
+        let mut browser = remote_browser(&["a.txt", "b.txt"]);
+        apply_dir_batch(
+            &mut browser,
+            core::DirBatch::Error("permission denied".to_string()),
+        );
+        assert!(browser.entries.iter().any(|e| e.name == "permission denied"));
+        assert!(!browser.entries.iter().any(|e| e.name == "a.txt"));
+    }
 }
