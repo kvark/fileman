@@ -81,6 +81,28 @@ pub(crate) fn open_selected_external(app: &mut app_state::AppState) {
     }
 }
 
+/// Reveal the selected entry in the desktop environment's file manager, where
+/// the native right-click context menu is available. Local entries only —
+/// remote and in-archive entries have no path the file manager can show.
+pub(crate) fn reveal_selected_in_file_manager(app: &mut app_state::AppState) {
+    if !app.allow_external_open {
+        return;
+    }
+    let entry = {
+        let panel = app.get_active_panel();
+        let browser = panel.browser();
+        if browser.entries.is_empty() {
+            return;
+        }
+        browser.entries[browser.selected_index].clone()
+    };
+    if let core::EntryLocation::Fs(path) = entry.location
+        && let Err(err) = reveal_in_file_manager(&path)
+    {
+        eprintln!("{err}");
+    }
+}
+
 fn open_with_default_app(path: &Path) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -111,6 +133,79 @@ fn open_with_default_app(path: &Path) -> anyhow::Result<()> {
     }
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Open the platform file manager focused on `path`, selecting the item so the
+/// user can invoke the desktop's own context menu on it.
+fn reveal_in_file_manager(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // explorer.exe returns a non-zero exit code even on success, so spawn
+        // and don't inspect the status.
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to reveal in Explorer: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to reveal in Finder: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Ask the file manager to show and select the item via the freedesktop
+        // D-Bus interface (Nautilus, Dolphin, Nemo, …). Fall back to opening the
+        // containing folder when no such service answers.
+        let uri = path_to_file_uri(path);
+        let shown = std::process::Command::new("dbus-send")
+            .args([
+                "--session",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("array:string:{uri}"),
+                "string:",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !shown {
+            let dir = path.parent().unwrap_or(path);
+            std::process::Command::new("xdg-open")
+                .arg(dir)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("Failed to open containing folder: {e}"))?;
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+/// Percent-encode a filesystem path into a `file://` URI for D-Bus ShowItems.
+#[cfg(target_os = "linux")]
+fn path_to_file_uri(path: &Path) -> String {
+    let mut uri = String::from("file://");
+    for &b in path.to_string_lossy().as_bytes() {
+        match b {
+            b'/' => uri.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                uri.push(b as char)
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri
 }
 
 fn open_selected_from_to(
@@ -342,6 +437,13 @@ pub(crate) fn handle_keyboard(
             i.consume_key(
                 egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
                 egui::Key::C,
+            )
+        });
+    let ctrl_shift_o = !in_edit
+        && ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+                egui::Key::O,
             )
         });
     let ctrl_comma =
@@ -632,6 +734,11 @@ pub(crate) fn handle_keyboard(
     let shift_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
     if shift_enter {
         open_selected_external(app);
+        ctx.request_repaint();
+        return;
+    }
+    if ctrl_shift_o {
+        reveal_selected_in_file_manager(app);
         ctx.request_repaint();
         return;
     }
