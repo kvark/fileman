@@ -1014,7 +1014,23 @@ pub(crate) fn handle_keyboard(
         mode: active_mode, ..
     } = app.panel(app.active_panel);
     let active_is_browser = matches!(active_mode, app_state::PanelMode::Browser);
-    if input.key_pressed(egui::Key::ArrowDown) && active_is_browser {
+    // Whether an arrow key was pressed together with Shift, read from the
+    // event's own modifiers rather than the aggregate InputState.modifiers, so
+    // it holds both in the live app and under the replay harness (which sets
+    // per-event modifiers but leaves the aggregate at NONE).
+    let arrow_shift = |key: egui::Key| {
+        input.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key { key: k, modifiers, pressed: true, .. }
+                if *k == key && modifiers.shift
+            )
+        })
+    };
+    if input.key_pressed(egui::Key::ArrowDown)
+        && active_is_browser
+        && !arrow_shift(egui::Key::ArrowDown)
+    {
         if app.theme_picker_open() {
             app.select_next_theme();
         } else {
@@ -1024,7 +1040,8 @@ pub(crate) fn handle_keyboard(
             }
         }
     }
-    if input.key_pressed(egui::Key::ArrowUp) && active_is_browser {
+    if input.key_pressed(egui::Key::ArrowUp) && active_is_browser && !arrow_shift(egui::Key::ArrowUp)
+    {
         if app.theme_picker_open() {
             app.select_prev_theme();
         } else {
@@ -1032,6 +1049,38 @@ pub(crate) fn handle_keyboard(
             if browser.selected_index > 0 {
                 app.select_entry(browser.selected_index - 1, window_rows);
             }
+        }
+    }
+    // Shift+Up / Shift+Down extend the marked range while moving the cursor:
+    // toggle the current row's mark (skipping ".."), then step in that direction.
+    let shift_down = arrow_shift(egui::Key::ArrowDown);
+    let shift_up = arrow_shift(egui::Key::ArrowUp);
+    if active_is_browser && !app.theme_picker_open() && (shift_down || shift_up) {
+        let down = shift_down;
+        let (mark_name, next_index) = {
+            let browser = app.get_active_panel().browser();
+            let idx = browser.selected_index;
+            let len = browser.entries.len();
+            let mark_name = browser
+                .entries
+                .get(idx)
+                .filter(|e| e.name != "..")
+                .map(|e| e.name.clone());
+            let next_index = if down {
+                (idx + 1 < len).then_some(idx + 1)
+            } else {
+                (idx > 0).then_some(idx - 1)
+            };
+            (mark_name, next_index)
+        };
+        if let Some(name) = mark_name {
+            let browser = app.get_active_panel_mut().browser_mut();
+            if !browser.marked.remove(&name) {
+                browser.marked.insert(name);
+            }
+        }
+        if let Some(next) = next_index {
+            app.select_entry(next, window_rows);
         }
     }
     if (input.key_pressed(egui::Key::Insert) || ctrl_i) && active_is_browser {

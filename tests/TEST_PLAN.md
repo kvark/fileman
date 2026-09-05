@@ -18,6 +18,8 @@ Run one test:  `cargo run --release -- --replay tests/cases/<name>.ron`
 | `navigation.ron` | Cursor Up/Down, Home/End, PageUp/PageDown, Enter to open dir, Backspace to parent |
 | `panels.ron` | Tab panel switching, Ctrl+U panel swap, Ctrl+Right cross-panel navigation |
 | `selection.ron` | Insert to mark, Insert to unmark (toggle) |
+| `selection_shift_range.ron` | Shift+Down extends the marked range while moving |
+| `selection_shift_toggle.ron` | Shift+Up/Down toggles marks, unmarking on reverse |
 | `help.ron` | F1 open help, Escape close help |
 | `preview.ron` | F3 preview with snapshot comparison |
 | `preview_escape.ron` | F3 preview open, Escape close, panel mode assertions |

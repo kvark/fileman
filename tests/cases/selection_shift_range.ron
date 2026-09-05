@@ -1,0 +1,19 @@
+(
+  root: "tests/data/basic",
+  keys: [
+    (key: "Wait"),
+    // Position on the first real entry.
+    (key: "select:out"),
+    // Shift+Down marks the current row and steps down.
+    (key: "Down", modifiers: ["Shift"]),
+    // Now on "binary.bin" — mark it too and step to "source.txt".
+    (key: "Down", modifiers: ["Shift"]),
+  ],
+  asserts: (
+    left_panel: Some((
+      selected: Some("source.txt"),
+      // Both rows we stepped over while holding Shift are marked.
+      marked: ["binary.bin", "out"],
+    )),
+  ),
+)

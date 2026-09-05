@@ -33,6 +33,7 @@ pub fn draw_help(
             ("Shift+F4 / Ctrl+N", "New file"),
             ("F7 / Ctrl+D", "New directory"),
             ("Insert / Ctrl+I", "Mark / unmark"),
+            ("Shift+Up / Shift+Down", "Extend selection"),
             ("Shift+F6 / Ctrl+Shift+M", "Rename"),
             ("F5 / Ctrl+C", "Copy"),
             ("Ctrl+Shift+C", "Copy path to clipboard"),
